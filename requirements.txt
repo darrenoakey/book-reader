@@ -1,0 +1,8 @@
+ebooklib
+beautifulsoup4
+lxml
+claude-agent-sdk
+colorama
+setproctitle
+pytest
+ruff

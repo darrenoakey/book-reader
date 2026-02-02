@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import setproctitle
+
+setproctitle.setproctitle("book-reader")
+
+PROJECT_ROOT = Path(__file__).parent.resolve()
+VENV = PROJECT_ROOT / ".venv"
+VENV_PYTHON = VENV / "bin" / "python"
+VENV_PIP = VENV / "bin" / "pip"
+TEST_OUT = PROJECT_ROOT / "output" / "testing"
+
+
+# ##################################################################
+# ensure venv
+# create virtual environment if it does not exist
+def ensure_venv() -> None:
+    if not VENV_PYTHON.exists():
+        print("Creating virtual environment...")
+        subprocess.call([sys.executable, "-m", "venv", str(VENV)])
+
+
+# ##################################################################
+# run in venv
+# executes a command using the virtual environment python
+def run_venv(cmd: list[str]) -> int:
+    env = os.environ.copy()
+    env["VIRTUAL_ENV"] = str(VENV)
+    env["PATH"] = f"{VENV / 'bin'}:{env.get('PATH', '')}"
+    env["PYTHONPATH"] = str(PROJECT_ROOT)
+    return subprocess.call(cmd, cwd=PROJECT_ROOT, env=env)
+
+
+# ##################################################################
+# command install
+# install dependencies into the virtual environment
+def command_install(args: argparse.Namespace) -> int:
+    ensure_venv()
+    print("Installing dependencies...")
+    rc = run_venv([str(VENV_PIP), "install", "-r", "requirements.txt"])
+    if rc == 0:
+        print("Dependencies installed successfully")
+    return rc
+
+
+# ##################################################################
+# command create
+# run the book-reader pipeline on an epub file
+def command_create(args: argparse.Namespace) -> int:
+    ensure_venv()
+    epub_path = Path(args.epub).resolve()
+    if not epub_path.exists():
+        print(f"Error: EPUB file not found: {epub_path}")
+        return 1
+    code = f'''
+from pathlib import Path
+from src.pipeline import run_pipeline
+run_pipeline(Path("{epub_path}"))
+'''
+    return run_venv([str(VENV_PYTHON), "-c", code])
+
+
+# ##################################################################
+# command test
+# run pytest for a specific test target and log output
+def command_test(args: argparse.Namespace) -> int:
+    ensure_venv()
+    TEST_OUT.mkdir(parents=True, exist_ok=True)
+    target = args.target
+    log = TEST_OUT / (target.replace("/", "_").replace("::", "_") + ".log")
+    cmd = [str(VENV_PYTHON), "-m", "pytest", "-q", target, "--maxfail=1", "--disable-warnings"]
+    with open(log, "w") as f:
+        rc = run_venv(cmd)
+    print(f"Test output written to {log}")
+    return rc
+
+
+# ##################################################################
+# command lint
+# run ruff linter with 120 char line length
+def command_lint(args: argparse.Namespace) -> int:
+    ensure_venv()
+    return run_venv([str(VENV / "bin" / "ruff"), "check", "--line-length", "120", "src/"])
+
+
+# ##################################################################
+# command check
+# run full test suite and quality gates
+def command_check(args: argparse.Namespace) -> int:
+    return subprocess.call(["dazpycheck"], cwd=PROJECT_ROOT)
+
+
+# ##################################################################
+# command step
+# run a single step of the pipeline
+def command_step(args: argparse.Namespace) -> int:
+    ensure_venv()
+    epub_path = Path(args.epub).resolve()
+    if not epub_path.exists():
+        print(f"Error: EPUB file not found: {epub_path}")
+        return 1
+    return run_venv([str(VENV_PYTHON), "-m", "src.step_runner", args.step, str(epub_path)])
+
+
+# ##################################################################
+# main
+# parse arguments and dispatch to the appropriate command handler
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="run", description="Book Reader - EPUB to Audiobook converter")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_install = sub.add_parser("install", help="Install dependencies into venv")
+    p_install.set_defaults(func=command_install)
+
+    p_create = sub.add_parser("create", help="Convert EPUB to audiobook")
+    p_create.add_argument("epub", help="Path to EPUB file")
+    p_create.set_defaults(func=command_create)
+
+    p_test = sub.add_parser("test", help="Run a single test target")
+    p_test.add_argument("target", help="e.g. src/epub_extract_test.py::test_normalize_name")
+    p_test.set_defaults(func=command_test)
+
+    p_lint = sub.add_parser("lint", help="Run linter")
+    p_lint.set_defaults(func=command_lint)
+
+    p_check = sub.add_parser("check", help="Run full suite and gates (dazpycheck)")
+    p_check.set_defaults(func=command_check)
+
+    p_step = sub.add_parser("step", help="Run a single pipeline step")
+    p_step.add_argument("step", choices=["extract", "characters", "voices", "clone", "scripts", "audio", "m4b"])
+    p_step.add_argument("epub", help="Path to EPUB file")
+    p_step.set_defaults(func=command_step)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+# ##################################################################
+# entry point
+# standard python dispatch to main
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

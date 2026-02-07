@@ -2,7 +2,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-PAUSE_BETWEEN_SPEAKERS_SEC = 0.5
 PAUSE_BETWEEN_CHAPTERS_SEC = 3.0
 
 
@@ -81,26 +80,6 @@ def write_chapter_metadata(chapters: list[dict], output_path: Path) -> None:
 
 
 # ##################################################################
-# assemble chapter
-# combine chapter audio files with pauses
-def assemble_chapter(chapter_audio_dir: Path, work_dir: Path) -> tuple[Path, float]:
-    audio_files = sorted(chapter_audio_dir.glob("*.wav"))
-    if not audio_files:
-        raise ValueError(f"No audio files in {chapter_audio_dir}")
-    silence_path = work_dir / "silence.wav"
-    generate_silence(PAUSE_BETWEEN_SPEAKERS_SEC, silence_path)
-    interleaved = []
-    for i, audio_file in enumerate(audio_files):
-        interleaved.append(audio_file)
-        if i < len(audio_files) - 1:
-            interleaved.append(silence_path)
-    output_path = work_dir / f"{chapter_audio_dir.name}.wav"
-    concatenate_audio_files(interleaved, output_path)
-    duration = get_audio_duration(output_path)
-    return output_path, duration
-
-
-# ##################################################################
 # assemble m4b
 # create final m4b audiobook with chapter markers
 def assemble_m4b(output_dir: Path, title: str, author: str) -> Path:
@@ -111,32 +90,30 @@ def assemble_m4b(output_dir: Path, title: str, author: str) -> Path:
     m4b_path = output_dir / f"{book_name}.m4b"
     if m4b_path.exists():
         return m4b_path
-    chapter_dirs = sorted(audio_dir.iterdir())
-    if not chapter_dirs:
-        raise ValueError("No chapter audio directories found")
+    chapter_files = sorted(audio_dir.glob("*.wav"))
+    if not chapter_files:
+        raise ValueError("No chapter audio files found")
     with tempfile.TemporaryDirectory() as tmpdir:
         work_dir = Path(tmpdir)
         chapter_silence_path = work_dir / "chapter_silence.wav"
         generate_silence(PAUSE_BETWEEN_CHAPTERS_SEC, chapter_silence_path)
-        chapter_files = []
+        interleaved = []
         chapter_info = []
         current_time = 0.0
-        for chapter_dir in chapter_dirs:
-            if not chapter_dir.is_dir():
-                continue
-            chapter_path, duration = assemble_chapter(chapter_dir, work_dir)
-            chapter_name = chapter_dir.name.split("-", 1)[-1].replace("_", " ").title()
+        for chapter_file in chapter_files:
+            duration = get_audio_duration(chapter_file)
+            chapter_name = chapter_file.stem.split("-", 1)[-1].replace("_", " ").title()
             chapter_info.append({
                 "title": chapter_name,
                 "start": current_time,
                 "end": current_time + duration,
             })
-            chapter_files.append(chapter_path)
+            interleaved.append(chapter_file)
             current_time += duration
-            chapter_files.append(chapter_silence_path)
+            interleaved.append(chapter_silence_path)
             current_time += PAUSE_BETWEEN_CHAPTERS_SEC
         full_audio_path = work_dir / "full.wav"
-        concatenate_audio_files(chapter_files, full_audio_path)
+        concatenate_audio_files(interleaved, full_audio_path)
         metadata_path = work_dir / "metadata.txt"
         write_chapter_metadata(chapter_info, metadata_path)
         cmd = [

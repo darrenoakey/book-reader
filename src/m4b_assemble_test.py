@@ -47,19 +47,15 @@ def test_generate_silence() -> None:
 
 # ##################################################################
 # test assemble m4b real
-# creates an actual m4b file from test audio
+# creates an actual m4b file from per-chapter audio files
 def test_assemble_m4b_real() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
         output_dir = tmpdir / "test_book"
         audio_dir = output_dir / "audio"
-        ch1_dir = audio_dir / "00-intro"
-        ch2_dir = audio_dir / "01-chapter_one"
-        ch1_dir.mkdir(parents=True)
-        ch2_dir.mkdir(parents=True)
-        create_test_audio(ch1_dir / "0000.wav", 0.5)
-        create_test_audio(ch2_dir / "0000.wav", 0.5)
-        create_test_audio(ch2_dir / "0001.wav", 0.5)
+        audio_dir.mkdir(parents=True)
+        create_test_audio(audio_dir / "00-intro.wav", 0.5)
+        create_test_audio(audio_dir / "01-chapter_one.wav", 1.0)
         m4b_path = assemble_m4b(output_dir, "Test Book", "Test Author")
         assert m4b_path.exists()
         assert m4b_path.suffix == ".m4b"
@@ -77,9 +73,8 @@ def test_assemble_m4b_idempotent() -> None:
         tmpdir = Path(tmpdir)
         output_dir = tmpdir / "test_book"
         audio_dir = output_dir / "audio"
-        ch1_dir = audio_dir / "00-intro"
-        ch1_dir.mkdir(parents=True)
-        create_test_audio(ch1_dir / "0000.wav", 0.5)
+        audio_dir.mkdir(parents=True)
+        create_test_audio(audio_dir / "00-intro.wav", 0.5)
         existing = output_dir / "test_book.m4b"
         existing.write_text("PRESERVED")
         assemble_m4b(output_dir, "Test", "Author")

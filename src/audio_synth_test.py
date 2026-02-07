@@ -1,49 +1,62 @@
+import json
 import subprocess
 import tempfile
 from pathlib import Path
 
-from src.audio_synth import synthesize_line
+from src.audio_synth import synthesize_chapter
 
 
 # ##################################################################
-# test synthesize line real
-# actually synthesizes audio using tts
-def test_synthesize_line_real() -> None:
+# test synthesize chapter real
+# actually synthesizes audio for a chapter using tts multi
+def test_synthesize_chapter_real() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
         output_dir = tmpdir / "output"
         voices_dir = output_dir / "voices"
+        audio_dir = output_dir / "audio"
         voices_dir.mkdir(parents=True)
+        audio_dir.mkdir(parents=True)
         description = "A warm male voice in his thirties. Clear and articulate with slight British accent."
         cmd = [
             str(Path.home() / "src" / "tts" / "run"),
             "export-voice",
-            "test_voice",
+            "test_narrator",
             description,
             "-o", str(voices_dir),
-            "-q", "hq",
+            "-q", "default",
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"Voice export failed: {result.stderr}")
-        audio_path = output_dir / "test.wav"
-        synthesize_line("test_voice", "Hello world. This is a test.", audio_path, voices_dir)
-        assert audio_path.exists()
-        assert audio_path.stat().st_size > 1000
+        script_path = tmpdir / "01-test_chapter.jsonl"
+        lines = [
+            {"test_narrator": "Chapter One. The Beginning."},
+            {"test_narrator": "It was a dark and stormy night."},
+        ]
+        with open(script_path, "w") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+        result_path = synthesize_chapter(script_path, audio_dir, voices_dir)
+        assert result_path.exists()
+        assert result_path.stat().st_size > 1000
+        assert result_path.name == "01-test_chapter.wav"
 
 
 # ##################################################################
-# test synthesize line idempotent
+# test synthesize chapter idempotent
 # verify existing audio is not overwritten
-def test_synthesize_line_idempotent() -> None:
+def test_synthesize_chapter_idempotent() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        output_dir = tmpdir / "output"
-        voices_dir = output_dir / "voices"
-        voices_dir.mkdir(parents=True)
-        existing = output_dir / "existing.wav"
+        audio_dir = tmpdir / "audio"
+        audio_dir.mkdir()
+        voices_dir = tmpdir / "voices"
+        voices_dir.mkdir()
+        script_path = tmpdir / "01-test.jsonl"
+        script_path.write_text('{"narrator": "Hello"}\n')
+        existing = audio_dir / "01-test.wav"
         existing.write_text("PRESERVED")
-        voice_file = voices_dir / "test.voice.zip"
-        voice_file.write_text("dummy")
-        synthesize_line("test", "text", existing, voices_dir)
+        result_path = synthesize_chapter(script_path, audio_dir, voices_dir)
         assert existing.read_text() == "PRESERVED"
+        assert result_path == existing

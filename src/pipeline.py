@@ -92,7 +92,7 @@ def run_pipeline(epub_path: Path) -> Path:
     print_step(7, "Assemble M4B audiobook")
     if is_step_complete(output_dir, "m4b"):
         print_skip("M4B already assembled")
-        m4b_path = output_dir / f"{book_name}.m4b"
+        m4b_path = output_dir / f"{output_dir.name}.m4b"
     else:
         m4b_path = assemble_m4b(output_dir, title, author)
         print_done(f"Created {m4b_path.name}")

@@ -38,13 +38,13 @@ John walked into the room.
 
 John nodded. "Good to see you."
         """.strip())
-        characters = {
-            "narrator": {"name": "Narrator", "bio": "The narrator"},
-            "john": {"name": "John", "bio": "A man"},
-            "mary": {"name": "Mary", "bio": "A woman"},
+        voices = {
+            "narrator": {"description": "The narrator voice"},
+            "john": {"description": "A male voice"},
+            "mary": {"description": "A female voice"},
         }
-        chars_path = output_dir / "characters.json"
-        chars_path.write_text(json.dumps(characters), encoding="utf-8")
+        voices_path = output_dir / "voices.json"
+        voices_path.write_text(json.dumps(voices), encoding="utf-8")
         scripts = generate_scripts_sync(output_dir)
         assert len(scripts) == 2
         intro_script = scripts[0]
@@ -79,8 +79,8 @@ def test_generate_scripts_idempotent() -> None:
         intro.write_text("Test")
         existing = script_dir / "00-intro.jsonl"
         existing.write_text("PRESERVED")
-        characters = {"narrator": {"name": "Narrator", "bio": "Test"}}
-        chars_path = output_dir / "characters.json"
-        chars_path.write_text(json.dumps(characters), encoding="utf-8")
+        voices = {"narrator": {"description": "Test narrator voice"}}
+        voices_path = output_dir / "voices.json"
+        voices_path.write_text(json.dumps(voices), encoding="utf-8")
         generate_scripts_sync(output_dir)
         assert existing.read_text() == "PRESERVED"

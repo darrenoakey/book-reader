@@ -82,7 +82,7 @@ def write_chapter_metadata(chapters: list[dict], output_path: Path) -> None:
 # ##################################################################
 # assemble m4b
 # create final m4b audiobook with chapter markers
-def assemble_m4b(output_dir: Path, title: str, author: str) -> Path:
+def assemble_m4b(output_dir: Path, title: str, author: str, max_chapters: int = 0) -> Path:
     audio_dir = output_dir / "audio"
     if not audio_dir.exists():
         raise ValueError("audio directory not found")
@@ -91,6 +91,8 @@ def assemble_m4b(output_dir: Path, title: str, author: str) -> Path:
     if m4b_path.exists():
         return m4b_path
     chapter_files = sorted(audio_dir.glob("*.wav"))
+    if max_chapters > 0:
+        chapter_files = chapter_files[:max_chapters]
     if not chapter_files:
         raise ValueError("No chapter audio files found")
     with tempfile.TemporaryDirectory() as tmpdir:

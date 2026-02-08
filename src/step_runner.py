@@ -30,7 +30,7 @@ def get_book_info(output_dir: Path) -> tuple[str, str]:
 # ##################################################################
 # run step
 # execute a single pipeline step
-def run_step(step: str, epub_path: Path) -> int:
+def run_step(step: str, epub_path: Path, max_chapters: int = 0) -> int:
     output_dir = get_output_dir(epub_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -68,15 +68,17 @@ def run_step(step: str, epub_path: Path) -> int:
         mark_step_complete(output_dir, "scripts")
 
     elif step == "audio":
-        audio = synthesize_all_chapters(output_dir)
+        audio = synthesize_all_chapters(output_dir, max_chapters=max_chapters)
         print(f"Synthesized {len(audio)} audio segments")
-        mark_step_complete(output_dir, "audio")
+        if max_chapters == 0:
+            mark_step_complete(output_dir, "audio")
 
     elif step == "m4b":
         title, author = get_book_info(output_dir)
-        m4b = assemble_m4b(output_dir, title, author)
+        m4b = assemble_m4b(output_dir, title, author, max_chapters=max_chapters)
         print(f"Created {m4b}")
-        mark_step_complete(output_dir, "m4b")
+        if max_chapters == 0:
+            mark_step_complete(output_dir, "m4b")
 
     else:
         print(f"Unknown step: {step}")
@@ -90,12 +92,13 @@ def run_step(step: str, epub_path: Path) -> int:
 # main
 # entry point for step runner
 def main() -> int:
-    if len(sys.argv) != 3:
-        print("Usage: python -m src.step_runner <step> <epub_path>")
-        return 1
-    step = sys.argv[1]
-    epub_path = Path(sys.argv[2])
-    return run_step(step, epub_path)
+    import argparse
+    parser = argparse.ArgumentParser(prog="step_runner")
+    parser.add_argument("step")
+    parser.add_argument("epub_path")
+    parser.add_argument("--max-chapters", type=int, default=0, help="Limit to first N chapters")
+    args = parser.parse_args()
+    return run_step(args.step, Path(args.epub_path), max_chapters=args.max_chapters)
 
 
 if __name__ == "__main__":

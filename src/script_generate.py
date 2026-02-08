@@ -41,9 +41,12 @@ def parse_jsonl_response(text: str) -> list[dict]:
         line = line.strip()
         if line and line.startswith("{"):
             try:
-                result.append(json.loads(line))
+                entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if "speaker_id" in entry and "text" in entry:
+                entry = {entry["speaker_id"]: entry["text"]}
+            result.append(entry)
     return result
 
 

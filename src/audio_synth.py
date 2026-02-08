@@ -53,7 +53,7 @@ def synthesize_chapter(script_path: Path, audio_dir: Path, voices_dir: Path) -> 
 # ##################################################################
 # synthesize all chapters
 # convert all scripts to audio
-def synthesize_all_chapters(output_dir: Path) -> list[Path]:
+def synthesize_all_chapters(output_dir: Path, max_chapters: int = 0) -> list[Path]:
     script_dir = output_dir / "script"
     audio_dir = output_dir / "audio"
     voices_dir = output_dir / "voices"
@@ -63,6 +63,8 @@ def synthesize_all_chapters(output_dir: Path) -> list[Path]:
         raise ValueError("voices directory not found")
     audio_dir.mkdir(parents=True, exist_ok=True)
     script_files = sorted(script_dir.glob("*.jsonl"))
+    if max_chapters > 0:
+        script_files = script_files[:max_chapters]
     all_created = []
     for script_path in script_files:
         output_path = synthesize_chapter(script_path, audio_dir, voices_dir)

@@ -1,3 +1,4 @@
+import asyncio
 import re
 import unicodedata
 import warnings
@@ -5,6 +6,7 @@ from pathlib import Path
 
 import ebooklib
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
 from ebooklib import epub
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
@@ -62,17 +64,69 @@ def extract_chapter_title(html_content: str) -> str | None:
 
 
 # ##################################################################
-# is content chapter
-# determine if an epub item is likely a content chapter vs front/back matter
-def is_content_chapter(item: epub.EpubHtml, text: str) -> bool:
-    if len(text.strip()) < 500:
-        return False
-    filename = item.get_name().lower()
-    skip_patterns = ["cover", "title", "copyright", "toc", "contents", "dedication", "acknowledge", "about"]
-    for pattern in skip_patterns:
-        if pattern in filename:
-            return False
-    return True
+# is substantial item
+# check if an epub item has enough text to be a chapter
+def is_substantial_item(text: str) -> bool:
+    return len(text.strip()) >= 500
+
+
+# ##################################################################
+# query haiku
+# send a prompt to claude haiku and get text response
+async def query_haiku(prompt: str) -> str:
+    response = ""
+    async for message in query(
+        prompt=prompt,
+        options=ClaudeAgentOptions(
+            allowed_tools=[],
+            permission_mode="bypassPermissions",
+            model="haiku",
+        )
+    ):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    response += block.text
+    return response.strip()
+
+
+# ##################################################################
+# classify is content
+# use haiku to decide if text is book content or front/back matter
+async def classify_is_content(text: str, filename: str) -> bool:
+    preview = text[:1000]
+    prompt = f"""You are classifying sections of an EPUB ebook. Given the filename and the first 1000 characters, decide if this is ACTUAL BOOK CONTENT (a chapter, prologue, epilogue, interlude, or other narrative/story section) or NON-CONTENT (synopsis, blurb, table of contents, copyright, dedication, acknowledgements, about the author, biography, advertisement, or other front/back matter).
+
+Filename: {filename}
+First 1000 characters:
+{preview}
+
+Reply with exactly one word: CONTENT or NONCONTENT"""
+    response = await query_haiku(prompt)
+    return "CONTENT" in response.upper() and "NONCONTENT" not in response.upper()
+
+
+# ##################################################################
+# trim non content
+# scan from front and back using haiku to find where real content starts/ends
+async def trim_non_content(candidates: list[dict]) -> list[dict]:
+    if not candidates:
+        return candidates
+    start = 0
+    for i in range(len(candidates)):
+        is_content = await classify_is_content(candidates[i]["text"], candidates[i]["filename"])
+        if is_content:
+            start = i
+            break
+    else:
+        return []
+    end = len(candidates) - 1
+    for i in range(len(candidates) - 1, start - 1, -1):
+        is_content = await classify_is_content(candidates[i]["text"], candidates[i]["filename"])
+        if is_content:
+            end = i
+            break
+    return candidates[start:end + 1]
 
 
 # ##################################################################
@@ -87,27 +141,42 @@ class ChapterInfo:
 
 
 # ##################################################################
+# collect candidates
+# gather all substantial epub items as candidates for chapter classification
+def collect_candidates(book: epub.EpubBook) -> list[dict]:
+    candidates = []
+    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        html = item.get_content().decode("utf-8", errors="ignore")
+        text = html_to_text(html)
+        if not is_substantial_item(text):
+            continue
+        title = extract_chapter_title(html)
+        candidates.append({
+            "text": text,
+            "html": html,
+            "title": title,
+            "filename": item.get_name(),
+        })
+    return candidates
+
+
+# ##################################################################
 # extract chapters
 # parse epub and return list of chapter info objects
-def extract_chapters(epub_path: Path) -> tuple[str, str, list[ChapterInfo]]:
-    book = epub.read_epub(str(epub_path))
+def extract_chapters(epub_path: Path, book: epub.EpubBook | None = None) -> tuple[str, str, list[ChapterInfo]]:
+    if book is None:
+        book = epub.read_epub(str(epub_path))
     title, author = get_metadata(book)
+    candidates = collect_candidates(book)
+    trimmed = asyncio.run(trim_non_content(candidates))
     chapters = []
-    chapter_num = 0
-    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-        content = item.get_content().decode("utf-8", errors="ignore")
-        text = html_to_text(content)
-        if not is_content_chapter(item, text):
-            continue
-        chapter_num += 1
-        chapter_title = extract_chapter_title(content)
-        if not chapter_title:
-            chapter_title = f"Chapter {chapter_num}"
+    for i, cand in enumerate(trimmed, start=1):
+        chapter_title = cand["title"] if cand["title"] else f"Chapter {i}"
         chapters.append(ChapterInfo(
-            number=chapter_num,
+            number=i,
             title=chapter_title,
-            text=text,
-            original_file=item.get_name(),
+            text=cand["text"],
+            original_file=cand["filename"],
         ))
     return title, author, chapters
 
@@ -134,6 +203,42 @@ def write_chapters(output_dir: Path, title: str, author: str, chapters: list[Cha
 
 
 # ##################################################################
+# extract cover image
+# find and save the cover image from an epub
+def extract_cover_image(book: epub.EpubBook, output_dir: Path) -> Path | None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for ext in ("jpeg", "jpg", "png"):
+        existing = output_dir / f"cover.{ext}"
+        if existing.exists():
+            return existing
+    cover_item = None
+    for item in book.get_items_of_type(ebooklib.ITEM_COVER):
+        cover_item = item
+        break
+    if cover_item is None:
+        cover_item = book.get_item_with_id("cover")
+    if cover_item is None:
+        cover_item = book.get_item_with_id("cover-image")
+    if cover_item is None:
+        for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
+            name = Path(item.get_name()).stem.lower()
+            if "cover" in name:
+                cover_item = item
+                break
+    if cover_item is None:
+        return None
+    content = cover_item.get_content()
+    media_type = getattr(cover_item, "media_type", "") or ""
+    if "png" in media_type:
+        ext = "png"
+    else:
+        ext = "jpeg"
+    cover_path = output_dir / f"cover.{ext}"
+    cover_path.write_bytes(content)
+    return cover_path
+
+
+# ##################################################################
 # get output dir
 # create output directory based on epub filename
 def get_output_dir(epub_path: Path) -> Path:
@@ -145,6 +250,8 @@ def get_output_dir(epub_path: Path) -> Path:
 # extract epub
 # main entry point to extract an epub to chapters directory
 def extract_epub(epub_path: Path, output_dir: Path) -> tuple[str, str, list[Path]]:
-    title, author, chapters = extract_chapters(epub_path)
+    book = epub.read_epub(str(epub_path))
+    extract_cover_image(book, output_dir)
+    title, author, chapters = extract_chapters(epub_path, book)
     written = write_chapters(output_dir, title, author, chapters)
     return title, author, written

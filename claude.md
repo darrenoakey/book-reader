@@ -46,7 +46,22 @@ Haiku sometimes outputs `{"speaker_id": "name", "text": "..."}` instead of `{"na
 Audio synthesis uses `tts multi` per chapter (one subprocess call per chapter, not per line). The multi command handles per-line synthesis and concatenation internally via a work directory.
 
 ### M4B idempotency caveat
-`assemble_m4b` skips if the .m4b file exists. When re-running with different `--max-chapters`, delete the existing .m4b first.
+`assemble_m4b` skips if the .m4b file exists. When re-running with different `--max-chapters`, delete the existing .m4b first. Also delete `chime.wav` if changing the chime, since it's cached.
+
+### Cover art extraction
+`extract_epub` extracts cover image from EPUB to `output/<stem>/cover.jpeg`. Tries ITEM_COVER, `get_item_with_id("cover")`, `get_item_with_id("cover-image")`, then ITEM_IMAGE filename scan. M4B assembly embeds it as `attached_pic` if present.
+
+### Front/back matter detection
+Uses Claude Haiku (via claude-agent-sdk) to classify EPUB sections as content vs non-content. Scans from front until first real content, then from back until last real content. Everything in between is kept. Replaces keyword-based filtering.
+
+### Chapter announcements
+M4B assembly generates a 3-note chime + narrator TTS announcement ("{title}. {chapter name}.") before each chapter except intro. Announcement WAVs are cached in `audio/` as `XX-name.announce.wav`.
+
+### Sample rate consistency (CRITICAL)
+All audio must be 24000 Hz mono to match TTS output. The chime, silence, and concat steps all use `SAMPLE_RATE = 24000`. Mismatched sample rates cause silent/garbled audio when concatenated.
+
+### Duplicate chapter titles
+M4B assembly auto-numbers duplicate titles: "Interlude" → "Interlude 1", "Interlude 2". Single-occurrence titles unchanged.
 
 ## Commands
 

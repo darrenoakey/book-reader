@@ -2,27 +2,15 @@ import asyncio
 import json
 from pathlib import Path
 
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
+from daz_agent_sdk import Tier, agent
 
 
 # ##################################################################
 # query sonnet
 # send a prompt to claude sonnet and get text response
 async def query_sonnet(prompt: str) -> str:
-    response = ""
-    async for message in query(
-        prompt=prompt,
-        options=ClaudeAgentOptions(
-            allowed_tools=[],
-            permission_mode="bypassPermissions",
-            model="sonnet",
-        )
-    ):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    response += block.text
-    return response.strip()
+    response = await agent.ask(prompt, tier=Tier.MID)
+    return response.text.strip()
 
 
 # ##################################################################

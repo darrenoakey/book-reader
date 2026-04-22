@@ -2,27 +2,15 @@ import asyncio
 import json
 from pathlib import Path
 
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
+from daz_agent_sdk import Tier, agent
 
 
 # ##################################################################
 # query haiku
 # send a prompt to claude haiku and get text response
 async def query_haiku(prompt: str) -> str:
-    response = ""
-    async for message in query(
-        prompt=prompt,
-        options=ClaudeAgentOptions(
-            allowed_tools=[],
-            permission_mode="bypassPermissions",
-            model="haiku",
-        )
-    ):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    response += block.text
-    return response.strip()
+    response = await agent.ask(prompt, tier=Tier.LOW)
+    return response.text.strip()
 
 
 # ##################################################################

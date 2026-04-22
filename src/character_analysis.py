@@ -2,7 +2,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
+from daz_agent_sdk import Tier, agent
 
 
 # ##################################################################
@@ -41,20 +41,8 @@ def parse_json_response(text: str) -> dict:
 # query haiku
 # send a prompt to claude haiku and get text response
 async def query_haiku(prompt: str) -> str:
-    response = ""
-    async for message in query(
-        prompt=prompt,
-        options=ClaudeAgentOptions(
-            allowed_tools=[],
-            permission_mode="bypassPermissions",
-            model="haiku",
-        )
-    ):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    response += block.text
-    return response.strip()
+    response = await agent.ask(prompt, tier=Tier.LOW)
+    return response.text.strip()
 
 
 # ##################################################################
@@ -187,20 +175,8 @@ Return ONLY valid JSON:
 
 Each group = same person. IDs not in any group stay as singles."""
 
-    response = ""
-    async for message in query(
-        prompt=prompt,
-        options=ClaudeAgentOptions(
-            allowed_tools=[],
-            permission_mode="bypassPermissions",
-            model="sonnet",
-        )
-    ):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    response += block.text
-    response = response.strip()
+    result_msg = await agent.ask(prompt, tier=Tier.MID)
+    response = result_msg.text.strip()
     result = parse_json_response(response)
     groups = result.get("groups", [])
     if not groups:

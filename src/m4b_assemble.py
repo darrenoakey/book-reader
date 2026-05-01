@@ -1,14 +1,14 @@
-import json
 import subprocess
 import tempfile
 from pathlib import Path
+
+from src.arbiter_tts import tts_clone_to_file
+from src.voice_clone import voice_path
 
 PAUSE_BETWEEN_CHAPTERS_SEC = 3.0
 PAUSE_AFTER_CHIME_SEC = 0.5
 PAUSE_AFTER_ANNOUNCEMENT_SEC = 1.0
 SAMPLE_RATE = 24000
-
-TTS_RUN = Path.home() / "src" / "tts" / "run"
 
 
 # ##################################################################
@@ -63,27 +63,11 @@ def generate_chime(output_path: Path) -> None:
 
 # ##################################################################
 # generate announcement
-# use tts to speak a chapter announcement with the narrator voice
-def generate_announcement(text: str, narrator_voice: Path, output_path: Path) -> None:
+# use arbiter tts-clone with narrator wav to speak a chapter announcement
+def generate_announcement(text: str, narrator_wav: Path, output_path: Path) -> None:
     if output_path.exists():
         return
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        f.write(json.dumps({str(narrator_voice): text}, ensure_ascii=False) + "\n")
-        temp_jsonl = Path(f.name)
-    try:
-        work_dir = output_path.parent / f".work_announce_{output_path.stem}"
-        work_dir.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            str(TTS_RUN), "multi",
-            str(temp_jsonl),
-            "-o", str(output_path),
-            "-w", str(work_dir),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            raise RuntimeError(f"TTS announcement failed: {result.stderr}")
-    finally:
-        temp_jsonl.unlink(missing_ok=True)
+    tts_clone_to_file(narrator_wav, text, output_path)
 
 
 # ##################################################################
@@ -92,9 +76,10 @@ def generate_announcement(text: str, narrator_voice: Path, output_path: Path) ->
 def generate_all_announcements(output_dir: Path, title: str, chapter_files: list[Path]) -> None:
     audio_dir = output_dir / "audio"
     voices_dir = output_dir / "voices"
-    narrator_voice = voices_dir / "narrator.voice.zip"
-    if not narrator_voice.exists():
+    narrator_wav_path = voices_dir / "narrator.wav"
+    if not narrator_wav_path.exists():
         return
+    narrator_wav = voice_path(voices_dir, "narrator")
     chime_path = audio_dir / "chime.wav"
     generate_chime(chime_path)
     for chapter_file in chapter_files:
@@ -105,7 +90,7 @@ def generate_all_announcements(output_dir: Path, title: str, chapter_files: list
         if chapter_name.lower() == "intro":
             continue
         announce_text = f"{title}. {chapter_name}."
-        generate_announcement(announce_text, narrator_voice, announce_path)
+        generate_announcement(announce_text, narrator_wav, announce_path)
 
 
 # ##################################################################

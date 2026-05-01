@@ -3,50 +3,71 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-TTS_RUN = Path.home() / "src" / "tts" / "run"
+from src.arbiter_tts import tts_clone_many
+from src.voice_clone import voice_path
+
+SAMPLE_RATE = 24000
+
+
+# ##################################################################
+# concat wavs
+# concatenate per-line wavs into a single chapter wav at SAMPLE_RATE mono
+def concat_wavs(line_paths: list[Path], output_path: Path) -> None:
+    if not line_paths:
+        raise ValueError("No line files to concatenate")
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        for p in line_paths:
+            f.write(f"file '{p}'\n")
+        list_file = Path(f.name)
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(list_file),
+            "-ar", str(SAMPLE_RATE),
+            "-ac", "1",
+            str(output_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg concat failed: {result.stderr}")
+    finally:
+        list_file.unlink(missing_ok=True)
 
 
 # ##################################################################
 # synthesize chapter
-# convert a chapter script to audio using tts multi command
+# synthesize each script line via arbiter tts-clone, then concatenate
 def synthesize_chapter(script_path: Path, audio_dir: Path, voices_dir: Path) -> Path:
     chapter_name = script_path.stem
     output_path = audio_dir / f"{chapter_name}.wav"
     if output_path.exists():
         return output_path
-    lines = []
+    work_dir = audio_dir / f".lines_{chapter_name}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    jobs = []
+    line_paths: list[Path] = []
     with open(script_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                entry = json.loads(line)
-                speaker = list(entry.keys())[0]
-                text = entry[speaker]
-                voice_path = voices_dir / f"{speaker}.voice.zip"
-                if not voice_path.exists():
-                    raise ValueError(f"Voice file not found for {speaker}: {voice_path}")
-                lines.append({str(voice_path): text})
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        for entry in lines:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        temp_jsonl = Path(f.name)
-    try:
-        work_dir = audio_dir / f".work_{chapter_name}"
-        work_dir.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            str(TTS_RUN),
-            "multi",
-            str(temp_jsonl),
-            "-o", str(output_path),
-            "-w", str(work_dir),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-        if result.returncode != 0:
-            raise RuntimeError(f"TTS multi failed for {chapter_name}: {result.stderr}")
-        if not output_path.exists():
-            raise RuntimeError(f"Audio file not created: {output_path}")
-    finally:
-        temp_jsonl.unlink(missing_ok=True)
+        for idx, raw in enumerate(f):
+            raw = raw.strip()
+            if not raw:
+                continue
+            entry = json.loads(raw)
+            speaker = list(entry.keys())[0]
+            text = entry[speaker]
+            ref_wav = voice_path(voices_dir, speaker)
+            line_path = work_dir / f"{idx:05d}.wav"
+            line_paths.append(line_path)
+            if not line_path.exists():
+                jobs.append({
+                    "ref_wav": ref_wav,
+                    "text": text,
+                    "output_path": line_path,
+                })
+    if jobs:
+        tts_clone_many(jobs)
+    concat_wavs(line_paths, output_path)
     return output_path
 
 

@@ -2,6 +2,7 @@ ebooklib
 beautifulsoup4
 lxml
 daz-agent-sdk
+arbiter-client @ file:///Volumes/T9/darrenoakey/src/arbiter-client
 colorama
 setproctitle
 pytest

@@ -1,7 +1,6 @@
-import base64
 from pathlib import Path
 
-from arbiter_client import ArbiterClient
+from arbiter_client import ArbiterClient, stage_file
 
 
 # ##################################################################
@@ -31,12 +30,12 @@ def tts_design_to_file(description: str, sample_text: str, output_path: Path,
 # clone a voice from a local reference wav and save the result locally
 def tts_clone_to_file(ref_wav: Path, text: str, output_path: Path,
                       language: str = "English", temperature: float = 0.3) -> Path:
-    client = ArbiterClient(timeout=120)
-    ref_b64 = base64.b64encode(ref_wav.read_bytes()).decode()
+    client = ArbiterClient(timeout=60)
+    spark_ref = stage_file(ref_wav)
     job_id = client.submit(
         "tts-clone",
         text=text,
-        ref_audio=ref_b64,
+        ref_audio_file=spark_ref,
         language=language,
         temperature=temperature,
         force=True,
@@ -54,17 +53,15 @@ def tts_clone_to_file(ref_wav: Path, text: str, output_path: Path,
 # submit tts-clone jobs in parallel and write results sequentially
 def tts_clone_many(jobs: list[dict], language: str = "English",
                    temperature: float = 0.3) -> list[Path]:
-    client = ArbiterClient(timeout=120)
+    client = ArbiterClient(timeout=60)
     submissions: list[dict] = []
-    ref_cache: dict[Path, str] = {}
     for j in jobs:
         ref_wav: Path = j["ref_wav"]
-        if ref_wav not in ref_cache:
-            ref_cache[ref_wav] = base64.b64encode(ref_wav.read_bytes()).decode()
+        spark_ref = stage_file(ref_wav)
         jid = client.submit(
             "tts-clone",
             text=j["text"],
-            ref_audio=ref_cache[ref_wav],
+            ref_audio_file=spark_ref,
             language=language,
             temperature=temperature,
             force=True,

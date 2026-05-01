@@ -49,8 +49,8 @@ Voice generation uses arbiter at `http://10.0.0.254:8400`:
 - `m4b_assemble.py` chapter announcements use `tts-clone` with `voices/narrator.wav`.
 - Helpers live in `src/arbiter_tts.py`. Uses the `arbiter_client` package directly (not daz-agent-sdk).
 
-### Arbiter base64, not staged files
-`ref_audio` MUST be passed as base64 (`ref_audio` param), not as a staged file path (`ref_audio_file`). The Mac→spark inbox is supposed to be NFS-shared but isn't — `stage_file()` returns a `/mnt/arbiter-store/inbox/` path the spark adapter can't see, leading to "No ref_audio or ref_audio_file provided" errors. Base64 is wasteful but works reliably.
+### Arbiter file staging
+`audio_synth.py` and `m4b_assemble.py` pass reference WAVs via `arbiter_client.stage_file()` (returns a `/mnt/arbiter-store/inbox/...` path), then submit with `ref_audio_file=spark_ref`. The shared CIFS mount between Mac (`/Volumes/ssd_4/arbiter`) and spark (`/mnt/arbiter-store`) handles the actual transfer.
 
 ### Arbiter force=True required
 All TTS submissions pass `force=True`. Arbiter dedup returns cached jobs whose `result_path` points to `/home/darren/src/arbiter/local_output/jobs/<id>/result.wav` — a spark-local path that arbiter-client can't resolve once the job dir is gone. force=True bypasses dedup and re-runs the job, returning fresh `data` (base64) inline.

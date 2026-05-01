@@ -7,10 +7,9 @@ EPUB to M4B audiobook converter with multi-character voice synthesis.
 1. `extract` - EPUB to chapter text files
 2. `characters` - Claude Haiku per-chapter analysis → characters.json
 3. `voices_desc` - Claude Sonnet single-call → voices.json
-4. `voices_clone` - Arbiter `tts-design` → reference WAVs per character
-5. `scripts` - Claude Haiku → speaker-attributed JSONL
-6. `audio` - Arbiter `tts-clone` per line, ffmpeg concat → chapter WAVs
-7. `m4b` - ffmpeg assembly → M4B with chapters
+4. `scripts` - Claude Haiku → speaker-attributed JSONL
+5. `audio` - Arbiter `tts-design` per line (description → audio), ffmpeg concat → chapter WAVs
+6. `m4b` - ffmpeg assembly → M4B with chapters
 
 ## Key Files
 
@@ -43,14 +42,11 @@ No mocks. Tests call actual Claude APIs and TTS tools. Audio synthesis test may 
 Haiku sometimes outputs `{"speaker_id": "name", "text": "..."}` instead of `{"name": "text"}`. The `parse_jsonl_response` function normalizes both formats.
 
 ### TTS via arbiter (qwen3-tts)
-Voice generation uses arbiter at `http://10.0.0.254:8400`:
-- `voice_clone.py` calls `tts-design` once per character with the description as `instruct` → saves `voices/<name>.wav`.
-- `audio_synth.py` calls `tts-clone` per line with the character's WAV as `ref_audio` (base64). Lines are submitted in parallel per chapter, then concatenated via ffmpeg.
-- `m4b_assemble.py` chapter announcements use `tts-clone` with `voices/narrator.wav`.
+All voice synthesis goes through arbiter `tts-design` at `http://10.0.0.254:8400`:
+- `audio_synth.py` calls `tts-design` per line with the speaker's `voices.json` description as `instruct`. Lines are submitted in parallel per chapter, then concatenated via ffmpeg.
+- `m4b_assemble.py` chapter announcements use `tts-design` with the narrator description.
+- No reference WAVs — qwen3-tts generates the voice directly from description each call. There is no separate "voices_clone" step.
 - Helpers live in `src/arbiter_tts.py`. Uses the `arbiter_client` package directly (not daz-agent-sdk).
-
-### Arbiter file staging
-`audio_synth.py` and `m4b_assemble.py` pass reference WAVs via `arbiter_client.stage_file()` (returns a `/mnt/arbiter-store/inbox/...` path), then submit with `ref_audio_file=spark_ref`. The shared CIFS mount between Mac (`/Volumes/ssd_4/arbiter`) and spark (`/mnt/arbiter-store`) handles the actual transfer.
 
 ### Arbiter force=True required
 All TTS submissions pass `force=True`. Arbiter dedup returns cached jobs whose `result_path` points to `/home/darren/src/arbiter/local_output/jobs/<id>/result.wav` — a spark-local path that arbiter-client can't resolve once the job dir is gone. force=True bypasses dedup and re-runs the job, returning fresh `data` (base64) inline.

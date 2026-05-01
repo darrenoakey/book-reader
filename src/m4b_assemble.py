@@ -2,8 +2,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from src.arbiter_tts import tts_clone_to_file
-from src.voice_clone import voice_path
+from src.arbiter_tts import tts_design_to_file
+from src.audio_synth import load_voices
 
 PAUSE_BETWEEN_CHAPTERS_SEC = 3.0
 PAUSE_AFTER_CHIME_SEC = 0.5
@@ -63,11 +63,11 @@ def generate_chime(output_path: Path) -> None:
 
 # ##################################################################
 # generate announcement
-# use arbiter tts-clone with narrator wav to speak a chapter announcement
-def generate_announcement(text: str, narrator_wav: Path, output_path: Path) -> None:
+# use arbiter tts-design with narrator description to speak a chapter announcement
+def generate_announcement(text: str, narrator_description: str, output_path: Path) -> None:
     if output_path.exists():
         return
-    tts_clone_to_file(narrator_wav, text, output_path)
+    tts_design_to_file(narrator_description, text, output_path)
 
 
 # ##################################################################
@@ -75,11 +75,12 @@ def generate_announcement(text: str, narrator_wav: Path, output_path: Path) -> N
 # create chime and announcement wavs for each chapter
 def generate_all_announcements(output_dir: Path, title: str, chapter_files: list[Path]) -> None:
     audio_dir = output_dir / "audio"
-    voices_dir = output_dir / "voices"
-    narrator_wav_path = voices_dir / "narrator.wav"
-    if not narrator_wav_path.exists():
+    if not (output_dir / "voices.json").exists():
         return
-    narrator_wav = voice_path(voices_dir, "narrator")
+    voices = load_voices(output_dir)
+    if "narrator" not in voices:
+        return
+    narrator_description = voices["narrator"]
     chime_path = audio_dir / "chime.wav"
     generate_chime(chime_path)
     for chapter_file in chapter_files:
@@ -90,7 +91,7 @@ def generate_all_announcements(output_dir: Path, title: str, chapter_files: list
         if chapter_name.lower() == "intro":
             continue
         announce_text = f"{title}. {chapter_name}."
-        generate_announcement(announce_text, narrator_wav, announce_path)
+        generate_announcement(announce_text, narrator_description, announce_path)
 
 
 # ##################################################################

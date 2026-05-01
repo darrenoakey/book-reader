@@ -10,7 +10,6 @@ from src.epub_extract import extract_epub, get_output_dir
 from src.m4b_assemble import assemble_m4b
 from src.script_generate import generate_scripts_sync
 from src.state import mark_step_complete
-from src.voice_clone import clone_all_voices
 from src.voice_description import generate_voices_sync
 
 init(autoreset=True)
@@ -57,11 +56,6 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0) -> int:
             print(f"  {info['description']}\n")
         mark_step_complete(output_dir, "voices_desc")
 
-    elif step == "clone":
-        voices = clone_all_voices(output_dir)
-        print(f"Cloned {len(voices)} voices")
-        mark_step_complete(output_dir, "voices_clone")
-
     elif step == "scripts":
         scripts = generate_scripts_sync(output_dir)
         print(f"Generated {len(scripts)} script files")
@@ -82,7 +76,7 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0) -> int:
 
     else:
         print(f"Unknown step: {step}")
-        print("Valid steps: extract, characters, voices, clone, scripts, audio, m4b")
+        print("Valid steps: extract, characters, voices, scripts, audio, m4b")
         return 1
 
     return 0

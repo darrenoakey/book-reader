@@ -8,7 +8,6 @@ from src.epub_extract import extract_epub, get_output_dir
 from src.m4b_assemble import assemble_m4b
 from src.script_generate import generate_scripts_sync
 from src.state import is_step_complete, mark_step_complete
-from src.voice_clone import clone_all_voices
 from src.voice_description import generate_voices_sync
 
 init(autoreset=True)
@@ -68,28 +67,21 @@ def run_pipeline(epub_path: Path) -> Path:
         generate_voices_sync(output_dir)
         print_done("Voice descriptions generated")
         mark_step_complete(output_dir, "voices_desc")
-    print_step(4, "Clone voices with TTS")
-    if is_step_complete(output_dir, "voices_clone"):
-        print_skip("Voices already cloned")
-    else:
-        voices = clone_all_voices(output_dir)
-        print_done(f"Created {len(voices)} voice files")
-        mark_step_complete(output_dir, "voices_clone")
-    print_step(5, "Generate scripts with Claude Haiku")
+    print_step(4, "Generate scripts with Claude Haiku")
     if is_step_complete(output_dir, "scripts"):
         print_skip("Scripts already generated")
     else:
         scripts = generate_scripts_sync(output_dir)
         print_done(f"Generated {len(scripts)} script files")
         mark_step_complete(output_dir, "scripts")
-    print_step(6, "Synthesize audio")
+    print_step(5, "Synthesize audio")
     if is_step_complete(output_dir, "audio"):
         print_skip("Audio already synthesized")
     else:
         audio_files = synthesize_all_chapters(output_dir)
         print_done(f"Synthesized {len(audio_files)} audio segments")
         mark_step_complete(output_dir, "audio")
-    print_step(7, "Assemble M4B audiobook")
+    print_step(6, "Assemble M4B audiobook")
     if is_step_complete(output_dir, "m4b"):
         print_skip("M4B already assembled")
         m4b_path = output_dir / f"{output_dir.name}.m4b"

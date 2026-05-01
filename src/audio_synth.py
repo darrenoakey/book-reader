@@ -3,10 +3,20 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from src.arbiter_tts import tts_clone_many
-from src.voice_clone import voice_path
+from src.arbiter_tts import tts_design_many
 
 SAMPLE_RATE = 24000
+
+
+# ##################################################################
+# load voices
+# read voices.json and return a mapping of speaker id to description
+def load_voices(output_dir: Path) -> dict[str, str]:
+    voices_json_path = output_dir / "voices.json"
+    if not voices_json_path.exists():
+        raise ValueError("voices.json not found")
+    voices = json.loads(voices_json_path.read_text(encoding="utf-8"))
+    return {k: v["description"] for k, v in voices.items()}
 
 
 # ##################################################################
@@ -38,8 +48,9 @@ def concat_wavs(line_paths: list[Path], output_path: Path) -> None:
 
 # ##################################################################
 # synthesize chapter
-# synthesize each script line via arbiter tts-clone, then concatenate
-def synthesize_chapter(script_path: Path, audio_dir: Path, voices_dir: Path) -> Path:
+# synthesize each script line via arbiter tts-design, then concatenate
+def synthesize_chapter(script_path: Path, audio_dir: Path,
+                       voices: dict[str, str]) -> Path:
     chapter_name = script_path.stem
     output_path = audio_dir / f"{chapter_name}.wav"
     if output_path.exists():
@@ -56,17 +67,18 @@ def synthesize_chapter(script_path: Path, audio_dir: Path, voices_dir: Path) -> 
             entry = json.loads(raw)
             speaker = list(entry.keys())[0]
             text = entry[speaker]
-            ref_wav = voice_path(voices_dir, speaker)
+            if speaker not in voices:
+                raise ValueError(f"speaker {speaker!r} not in voices.json")
             line_path = work_dir / f"{idx:05d}.wav"
             line_paths.append(line_path)
             if not line_path.exists():
                 jobs.append({
-                    "ref_wav": ref_wav,
+                    "description": voices[speaker],
                     "text": text,
                     "output_path": line_path,
                 })
     if jobs:
-        tts_clone_many(jobs)
+        tts_design_many(jobs)
     concat_wavs(line_paths, output_path)
     return output_path
 
@@ -77,17 +89,15 @@ def synthesize_chapter(script_path: Path, audio_dir: Path, voices_dir: Path) -> 
 def synthesize_all_chapters(output_dir: Path, max_chapters: int = 0) -> list[Path]:
     script_dir = output_dir / "script"
     audio_dir = output_dir / "audio"
-    voices_dir = output_dir / "voices"
     if not script_dir.exists():
         raise ValueError("script directory not found")
-    if not voices_dir.exists():
-        raise ValueError("voices directory not found")
+    voices = load_voices(output_dir)
     audio_dir.mkdir(parents=True, exist_ok=True)
     script_files = sorted(script_dir.glob("*.jsonl"))
     if max_chapters > 0:
         script_files = script_files[:max_chapters]
     all_created = []
     for script_path in script_files:
-        output_path = synthesize_chapter(script_path, audio_dir, voices_dir)
+        output_path = synthesize_chapter(script_path, audio_dir, voices)
         all_created.append(output_path)
     return all_created

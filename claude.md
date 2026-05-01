@@ -7,9 +7,9 @@ EPUB to M4B audiobook converter with multi-character voice synthesis.
 1. `extract` - EPUB to chapter text files
 2. `characters` - Claude Haiku per-chapter analysis → characters.json
 3. `voices_desc` - Claude Sonnet single-call → voices.json
-4. `voices_clone` - TTS voice cloning → voice zips
+4. `voices_clone` - Arbiter `tts-design` → reference WAVs per character
 5. `scripts` - Claude Haiku → speaker-attributed JSONL
-6. `audio` - TTS synthesis → WAV files
+6. `audio` - Arbiter `tts-clone` per line, ffmpeg concat → chapter WAVs
 7. `m4b` - ffmpeg assembly → M4B with chapters
 
 ## Key Files
@@ -42,8 +42,24 @@ No mocks. Tests call actual Claude APIs and TTS tools. Audio synthesis test may 
 ### Haiku JSONL format variance
 Haiku sometimes outputs `{"speaker_id": "name", "text": "..."}` instead of `{"name": "text"}`. The `parse_jsonl_response` function normalizes both formats.
 
-### TTS multi command
-Audio synthesis uses `tts multi` per chapter (one subprocess call per chapter, not per line). The multi command handles per-line synthesis and concatenation internally via a work directory.
+### TTS via arbiter (qwen3-tts)
+Voice generation uses arbiter at `http://10.0.0.254:8400`:
+- `voice_clone.py` calls `tts-design` once per character with the description as `instruct` → saves `voices/<name>.wav`.
+- `audio_synth.py` calls `tts-clone` per line with the character's WAV as `ref_audio` (base64). Lines are submitted in parallel per chapter, then concatenated via ffmpeg.
+- `m4b_assemble.py` chapter announcements use `tts-clone` with `voices/narrator.wav`.
+- Helpers live in `src/arbiter_tts.py`. Uses the `arbiter_client` package directly (not daz-agent-sdk).
+
+### Arbiter base64, not staged files
+`ref_audio` MUST be passed as base64 (`ref_audio` param), not as a staged file path (`ref_audio_file`). The Mac→spark inbox is supposed to be NFS-shared but isn't — `stage_file()` returns a `/mnt/arbiter-store/inbox/` path the spark adapter can't see, leading to "No ref_audio or ref_audio_file provided" errors. Base64 is wasteful but works reliably.
+
+### Arbiter force=True required
+All TTS submissions pass `force=True`. Arbiter dedup returns cached jobs whose `result_path` points to `/home/darren/src/arbiter/local_output/jobs/<id>/result.wav` — a spark-local path that arbiter-client can't resolve once the job dir is gone. force=True bypasses dedup and re-runs the job, returning fresh `data` (base64) inline.
+
+### Arbiter refs are broken for tts-clone
+`POST /v1/refs?filename=` succeeds and stores under `local_output/refs/`, but the adapter resolves `ref:<id>` to `output/refs/<id>` (relative to cwd) which doesn't exist. Don't use refs; pass base64 instead.
+
+### get_result_bytes over copy_result
+Use `client.get_result_bytes(job_id)` not `copy_result()` — it checks the inline `data` field first (works even when `result_path` is unresolvable), only falling back to mount/scp lookup.
 
 ### M4B idempotency caveat
 `assemble_m4b` skips if the .m4b file exists. When re-running with different `--max-chapters`, delete the existing .m4b first. Also delete `chime.wav` if changing the chime, since it's cached.

@@ -9,7 +9,7 @@ from daz_agent_sdk import Tier, agent
 # query sonnet
 # send a prompt to claude sonnet and get text response
 async def query_sonnet(prompt: str) -> str:
-    response = await agent.ask(prompt, tier=Tier.MID)
+    response = await agent.ask(prompt, tier=Tier.MEDIUM)
     return response.text.strip()
 
 

@@ -175,7 +175,7 @@ Return ONLY valid JSON:
 
 Each group = same person. IDs not in any group stay as singles."""
 
-    result_msg = await agent.ask(prompt, tier=Tier.MID)
+    result_msg = await agent.ask(prompt, tier=Tier.MEDIUM)
     response = result_msg.text.strip()
     result = parse_json_response(response)
     groups = result.get("groups", [])

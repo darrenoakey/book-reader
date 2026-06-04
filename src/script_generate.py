@@ -68,13 +68,31 @@ async def _process_chunk(chunk: str, speakers_list: str, label: str) -> list[dic
 Valid speakers: {speakers_list}
 
 Convert to audiobook script. Each line MUST be exactly this JSON format:
-{{"speaker_id": "<one of the valid speakers>", "text": "<what they say>"}}
+{{"speaker_id": "<one of the valid speakers>", "text": "<spoken words>"}}
 
 Rules:
-- Quoted dialogue → that character's speaker_id (must be in the valid list above).
-- Everything else → "narrator".
-- One JSON object per line. No code fences, no explanation, no chapter title.
+- ONLY the words INSIDE quotation marks are a character's speech → that character's speaker_id.
+- The dialogue TAG ("Bob said", "she whispered", "he replied, grinning") is NARRATION → a separate "narrator" line. It is NOT part of the character's line.
+- All other prose (description, action, narration) → "narrator".
+- Split a sentence that mixes speech and tag into MULTIPLE lines.
+- Do NOT include the quotation marks themselves in "text".
 - speaker_id MUST be from the valid list. If unsure, use "narrator".
+- One JSON object per line. No code fences, no explanation, no chapter title.
+
+EXAMPLES:
+Input: "We have to leave now," Bob said, glancing at the door.
+Output:
+{{"speaker_id": "bob", "text": "We have to leave now,"}}
+{{"speaker_id": "narrator", "text": "Bob said, glancing at the door."}}
+
+Input: The rain hammered the roof. "I won't," she snapped, "go back there."
+Output:
+{{"speaker_id": "narrator", "text": "The rain hammered the roof."}}
+{{"speaker_id": "jane", "text": "I won't,"}}
+{{"speaker_id": "narrator", "text": "she snapped,"}}
+{{"speaker_id": "jane", "text": "go back there."}}
+
+(Use the actual valid speaker_ids above, not "bob"/"jane", matching whoever is speaking.)
 
 TEXT:
 {chunk}

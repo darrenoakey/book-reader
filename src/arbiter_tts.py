@@ -164,13 +164,44 @@ def tts_clone_many(jobs: list[dict], ref_audio_path: Path,
 
 
 # ##################################################################
+# write wav slice
+# write a frame-slice of a source wav (raw frames + params) to a new wav,
+# preserving the source's exact format (kokoro outputs 24 kHz mono float wav)
+def _write_wav_slice(params, frames: bytes, start_frame: int, n_frames: int,
+                     out_path: Path) -> None:
+    import wave
+    sw = params.sampwidth
+    nch = params.nchannels
+    fb = sw * nch
+    seg = frames[start_frame * fb:(start_frame + n_frames) * fb]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(out_path), "wb") as w:
+        w.setnchannels(nch)
+        w.setsampwidth(sw)
+        w.setframerate(params.framerate)
+        w.writeframes(seg)
+
+
+# ##################################################################
+# kokoro batch sizing
+# Lines per kokoro job. Batching is essential: the arbiter scheduler adds
+# ~seconds of dispatch overhead PER JOB, which dwarfs kokoro's sub-second
+# synthesis. ~40 lines/job → jobs run ~10-30s, the scheduler spreads them
+# across all kokoro instances, and one novel's audio drops from hours to
+# minutes. Result payloads stay small (~1-2 MB) so inline base64 is fine.
+KOKORO_BATCH_LINES = 40
+KOKORO_BATCH_WINDOW = 16
+
+
+# ##################################################################
 # tts kokoro many
-# submit a batch of kokoro TTS jobs (one per line) in parallel. Each job dict
-# carries its own kokoro voice spec + speed, so different speakers render with
-# different voices in the same batch. Kokoro is tiny+fast, so a wide window
-# keeps the single spark worker saturated.
+# synthesize many lines by BATCHING them into a few multi-item jobs (each job
+# returns one concatenated wav + per-item sample counts), then slicing each
+# batch wav back into the individual per-line output WAVs.
 def tts_kokoro_many(jobs: list[dict]) -> list[Path]:
     """Each job: {text, voice, speed, output_path}. Fills output_path WAVs."""
+    import io
+    import wave
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     todo = [j for j in jobs
@@ -178,26 +209,61 @@ def tts_kokoro_many(jobs: list[dict]) -> list[Path]:
     if not todo:
         return [j["output_path"] for j in jobs]
 
-    def _do_one(j: dict) -> None:
-        client = _client(120)
+    batches = [todo[i:i + KOKORO_BATCH_LINES]
+               for i in range(0, len(todo), KOKORO_BATCH_LINES)]
+
+    def _do_batch(batch: list[dict]) -> int:
+        client = _client(300)
         params = {
-            "text": j["text"],
-            "voice": j.get("voice", "af_heart"),
-            "speed": float(j.get("speed", 1.0)),
+            "items": [{"text": j["text"], "voice": j.get("voice", "af_heart"),
+                       "speed": float(j.get("speed", 1.0))} for j in batch],
+            "gap_seconds": 0.0,
             "force": True,
         }
-        jid = _submit(client, "tts-kokoro", params)
-        _fetch(client, jid, "tts-kokoro", params, j["output_path"])
+        # submit + poll, retrying transient/dead-job failures forever
+        while True:
+            jid = _submit(client, "tts-kokoro", params)
+            try:
+                res = client.poll(jid, interval=2.0, timeout=31536000)
+                meta = res.get("result", {}) if isinstance(res, dict) else {}
+                item_samples = meta.get("item_samples")
+                data = client.get_result_bytes(jid)
+                if not item_samples or len(item_samples) != len(batch) or len(data) < 100:
+                    log.warning("kokoro batch bad result (items=%s, bytes=%d) — resubmitting",
+                                item_samples and len(item_samples), len(data))
+                    continue
+                w = wave.open(io.BytesIO(data))
+                frames = w.readframes(w.getnframes())
 
-    print(f"  {len(todo)} kokoro jobs, window={IN_FLIGHT_WINDOW}")
-    done_count = 0
-    with ThreadPoolExecutor(max_workers=IN_FLIGHT_WINDOW) as pool:
-        futures = {pool.submit(_do_one, j): j for j in todo}
+                class _P:
+                    sampwidth = w.getsampwidth()
+                    nchannels = w.getnchannels()
+                    framerate = w.getframerate()
+                gap = int(meta.get("gap_samples", 0))
+                off = 0
+                for j, n in zip(batch, item_samples):
+                    _write_wav_slice(_P, frames, off, n, j["output_path"])
+                    off += n + gap
+                return len(batch)
+            except ArbiterError as e:
+                msg = str(e).lower()
+                if "failed" in msg or "cancelled" in msg or "timed out" in msg:
+                    log.warning("kokoro batch job died (%s) — resubmitting", e)
+                    continue
+                log.warning("kokoro batch transient (%s) — retrying", e)
+                time.sleep(5)
+            except (ConnectionError, OSError) as e:
+                log.warning("kokoro batch connection (%s) — retrying", e)
+                time.sleep(5)
+
+    print(f"  {len(todo)} kokoro lines in {len(batches)} batches "
+          f"(≤{KOKORO_BATCH_LINES}/job, window={KOKORO_BATCH_WINDOW})")
+    done = 0
+    with ThreadPoolExecutor(max_workers=KOKORO_BATCH_WINDOW) as pool:
+        futures = [pool.submit(_do_batch, b) for b in batches]
         for fut in as_completed(futures):
-            fut.result()
-            done_count += 1
-            if done_count % 100 == 0:
-                print(f"    {done_count}/{len(todo)} done")
+            done += fut.result()
+            print(f"    {done}/{len(todo)} lines done")
 
     return [j["output_path"] for j in jobs]
 

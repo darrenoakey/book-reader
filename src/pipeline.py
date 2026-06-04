@@ -1,7 +1,12 @@
+import json
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from colorama import Fore, Style, init
 
+from src import tts_engine
 from src.audio_synth import synthesize_all_chapters
 from src.character_analysis import analyze_characters_sync
 from src.epub_extract import extract_epub, get_output_dir
@@ -11,6 +16,20 @@ from src.state import is_step_complete, mark_step_complete
 from src.voice_description import generate_voices_sync
 
 init(autoreset=True)
+
+
+@contextmanager
+def _time_step(output_dir: Path, step: str):
+    t0 = time.time()
+    started = datetime.now(timezone.utc).isoformat()
+    try:
+        yield
+    finally:
+        elapsed = time.time() - t0
+        rec = {"step": step, "started": started, "seconds": round(elapsed, 2)}
+        with (output_dir / "timings.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(f"  {Fore.CYAN}⏱  {step}: {elapsed:.1f}s{Style.RESET_ALL}")
 
 
 # ##################################################################
@@ -43,6 +62,7 @@ def run_pipeline(epub_path: Path) -> Path:
     print(f"{Fore.CYAN}Book Reader Pipeline{Style.RESET_ALL}")
     print(f"  Input: {epub_path}")
     print(f"  Output: {output_dir}")
+    pipeline_t0 = time.time()
     print_step(1, "Extract chapters from EPUB")
     if is_step_complete(output_dir, "extract"):
         print_skip("Already extracted")
@@ -50,43 +70,48 @@ def run_pipeline(epub_path: Path) -> Path:
         title = title_line[0]
         author = title_line[1].split(", narrated by")[0] if len(title_line) > 1 else "Unknown"
     else:
-        title, author, written = extract_epub(epub_path, output_dir)
+        with _time_step(output_dir, "extract"):
+            title, author, written = extract_epub(epub_path, output_dir)
         print_done(f"Extracted {len(written)} chapter files")
         mark_step_complete(output_dir, "extract")
     print_step(2, "Analyze characters with Claude Haiku")
     if is_step_complete(output_dir, "characters"):
         print_skip("Characters already analyzed")
     else:
-        analyze_characters_sync(output_dir, title, author)
+        with _time_step(output_dir, "characters"):
+            analyze_characters_sync(output_dir, title, author)
         print_done("Character analysis complete")
         mark_step_complete(output_dir, "characters")
     print_step(3, "Generate voice descriptions")
     if is_step_complete(output_dir, "voices_desc"):
         print_skip("Voice descriptions already generated")
     else:
-        generate_voices_sync(output_dir)
+        with _time_step(output_dir, "voices_desc"):
+            generate_voices_sync(output_dir)
         print_done("Voice descriptions generated")
         mark_step_complete(output_dir, "voices_desc")
-    print_step(4, "Design character voice references with TTS")
+    print_step(4, f"Prepare character voices ({tts_engine.engine_name()})")
     if is_step_complete(output_dir, "voices_clone"):
-        print_skip("Voice references already designed")
+        print_skip("Voices already prepared")
     else:
-        from src.voice_clone import clone_all_voices
-        voices = clone_all_voices(output_dir)
-        print_done(f"Created {len(voices)} reference voice WAVs")
+        with _time_step(output_dir, "voices_clone"):
+            n_voices = tts_engine.prepare_voices(output_dir)
+        print_done(f"Prepared {n_voices} character voices")
         mark_step_complete(output_dir, "voices_clone")
     print_step(5, "Generate scripts with Claude Haiku")
     if is_step_complete(output_dir, "scripts"):
         print_skip("Scripts already generated")
     else:
-        scripts = generate_scripts_sync(output_dir)
+        with _time_step(output_dir, "scripts"):
+            scripts = generate_scripts_sync(output_dir)
         print_done(f"Generated {len(scripts)} script files")
         mark_step_complete(output_dir, "scripts")
     print_step(6, "Synthesize audio with voice cloning")
     if is_step_complete(output_dir, "audio"):
         print_skip("Audio already synthesized")
     else:
-        audio_files = synthesize_all_chapters(output_dir)
+        with _time_step(output_dir, "audio"):
+            audio_files = synthesize_all_chapters(output_dir)
         print_done(f"Synthesized {len(audio_files)} audio segments")
         mark_step_complete(output_dir, "audio")
     print_step(7, "Assemble M4B audiobook")
@@ -94,8 +119,18 @@ def run_pipeline(epub_path: Path) -> Path:
         print_skip("M4B already assembled")
         m4b_path = output_dir / f"{output_dir.name}.m4b"
     else:
-        m4b_path = assemble_m4b(output_dir, title, author)
+        with _time_step(output_dir, "m4b"):
+            m4b_path = assemble_m4b(output_dir, title, author)
         print_done(f"Created {m4b_path.name}")
         mark_step_complete(output_dir, "m4b")
+    total = time.time() - pipeline_t0
+    with (output_dir / "timings.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "step": "TOTAL",
+            "started": datetime.now(timezone.utc).isoformat(),
+            "seconds": round(total, 2),
+        }) + "\n")
+    mins = total / 60
     print(f"\n{Fore.GREEN}Complete!{Style.RESET_ALL} Audiobook: {m4b_path}")
+    print(f"{Fore.CYAN}⏱  Total pipeline: {total:.0f}s ({mins:.1f} min){Style.RESET_ALL}")
     return m4b_path

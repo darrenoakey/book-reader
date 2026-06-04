@@ -6,8 +6,9 @@ from pathlib import Path
 
 import ebooklib
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-from daz_agent_sdk import Tier, agent
 from ebooklib import epub
+
+from src.llm import ask
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -74,8 +75,7 @@ def is_substantial_item(text: str) -> bool:
 # query haiku
 # send a prompt to claude haiku and get text response
 async def query_haiku(prompt: str) -> str:
-    response = await agent.ask(prompt, tier=Tier.LOW)
-    return response.text.strip()
+    return (await ask(prompt)).strip()
 
 
 # ##################################################################
@@ -231,7 +231,8 @@ def extract_cover_image(book: epub.EpubBook, output_dir: Path) -> Path | None:
 # create output directory based on epub filename
 def get_output_dir(epub_path: Path) -> Path:
     book_name = epub_path.stem
-    return epub_path.parent / "output" / book_name
+    project_root = Path(__file__).resolve().parent.parent
+    return project_root / "output" / book_name
 
 
 # ##################################################################

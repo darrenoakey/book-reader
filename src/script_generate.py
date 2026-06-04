@@ -2,15 +2,15 @@ import asyncio
 import json
 from pathlib import Path
 
-from daz_agent_sdk import Tier, agent
+from src.llm import ask
 
 
 # ##################################################################
 # query haiku
-# send a prompt to claude haiku and get text response
+# script generation via boringstack qwen3.6 (name kept for call-site
+# compatibility — it is no longer Haiku)
 async def query_haiku(prompt: str) -> str:
-    response = await agent.ask(prompt, tier=Tier.LOW)
-    return response.text.strip()
+    return (await ask(prompt)).strip()
 
 
 # ##################################################################
@@ -34,33 +34,81 @@ def parse_jsonl_response(text: str) -> list[dict]:
                 continue
             if "speaker_id" in entry and "text" in entry:
                 entry = {entry["speaker_id"]: entry["text"]}
+            elif "speaker" in entry and "text" in entry:
+                entry = {entry["speaker"]: entry["text"]}
             result.append(entry)
     return result
 
 
 # ##################################################################
+# chunk text
+# split chapter into pieces small enough that the model can handle reliably
+def chunk_text(text: str, chunk_size: int = 4000, overlap: int = 0) -> list[str]:
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        if end < len(text):
+            for sep in ("\n\n", ". ", " "):
+                idx = text.rfind(sep, start + chunk_size // 2, end)
+                if idx > start:
+                    end = idx + len(sep)
+                    break
+        chunks.append(text[start:end])
+        start = end - overlap if end > overlap else end
+    return chunks
+
+
+# ##################################################################
 # generate chapter script
-# convert chapter text to speaker-attributed jsonl
-async def generate_chapter_script(chapter_text: str, chapter_title: str, speaker_ids: list[str]) -> list[dict]:
-    speakers_list = ", ".join(speaker_ids)
+# convert chapter text to speaker-attributed jsonl — every chunk MUST succeed
+async def _process_chunk(chunk: str, speakers_list: str, label: str) -> list[dict]:
     prompt = f"""Output JSONL only. No explanations. No markdown. Just JSONL lines.
 
 Valid speakers: {speakers_list}
 
-Convert to audiobook script:
-- Quoted dialogue → character's speaker_id
-- Everything else → narrator
-- One speaker per line
+Convert to audiobook script. Each line MUST be exactly this JSON format:
+{{"speaker_id": "<one of the valid speakers>", "text": "<what they say>"}}
 
-Start with: {{"narrator": "{chapter_title}"}}
+Rules:
+- Quoted dialogue → that character's speaker_id (must be in the valid list above).
+- Everything else → "narrator".
+- One JSON object per line. No code fences, no explanation, no chapter title.
+- speaker_id MUST be from the valid list. If unsure, use "narrator".
 
 TEXT:
-{chapter_text[:12000]}
+{chunk}
 
 OUTPUT (JSONL only, nothing else):"""
-
     response = await query_haiku(prompt)
-    return parse_jsonl_response(response)
+    parsed = parse_jsonl_response(response)
+    attempt = 0
+    while not parsed and attempt < 5:
+        attempt += 1
+        response = await query_haiku(prompt)
+        parsed = parse_jsonl_response(response)
+        if not parsed:
+            print(f"  {label} parse retry {attempt}")
+            await asyncio.sleep(5)
+    if not parsed:
+        # All-narrator fallback for chunks the model can't structure (e.g.
+        # pure narration with no dialogue keeps producing unparseable output).
+        print(f"  {label} giving up after {attempt} retries — narrator fallback")
+        parsed = [{"narrator": chunk}]
+    return parsed
+
+
+async def generate_chapter_script(chapter_text: str, chapter_title: str, speaker_ids: list[str]) -> list[dict]:
+    speakers_list = ", ".join(speaker_ids)
+    chunks = chunk_text(chapter_text, chunk_size=4000)
+    chunk_results = await asyncio.gather(
+        *(_process_chunk(c, speakers_list, f"{chapter_title} chunk {i+1}/{len(chunks)}")
+          for i, c in enumerate(chunks))
+    )
+    all_lines: list[dict] = [{"narrator": chapter_title}]
+    for parsed in chunk_results:
+        all_lines.extend(parsed)
+    return all_lines
 
 
 # ##################################################################
@@ -106,7 +154,6 @@ async def generate_single_script(output_dir: Path, chapter_num: int) -> Path:
     if chapter_num < 0 or chapter_num >= len(chapter_files):
         raise ValueError(f"Chapter {chapter_num} not found (have {len(chapter_files)} chapters)")
     chapter_path = chapter_files[chapter_num]
-    # Delete existing script to regenerate
     script_name = chapter_path.stem + ".jsonl"
     script_path = script_dir / script_name
     if script_path.exists():
@@ -130,11 +177,10 @@ async def generate_all_scripts(output_dir: Path) -> list[Path]:
     script_dir = output_dir / "script"
     script_dir.mkdir(parents=True, exist_ok=True)
     chapter_files = sorted(chapters_dir.glob("*.txt"))
-    created = []
-    for chapter_path in chapter_files:
-        script_path = await generate_script_for_file(chapter_path, script_dir, speaker_ids)
-        created.append(script_path)
-    return created
+    print(f"Generating {len(chapter_files)} chapter scripts in parallel...")
+    return list(await asyncio.gather(
+        *(generate_script_for_file(p, script_dir, speaker_ids) for p in chapter_files)
+    ))
 
 
 # ##################################################################

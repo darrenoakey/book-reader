@@ -2,15 +2,15 @@ import asyncio
 import json
 from pathlib import Path
 
-from daz_agent_sdk import Tier, agent
+from src.llm import ask
 
 
 # ##################################################################
 # query sonnet
-# send a prompt to claude sonnet and get text response
+# voice-description generation via boringstack qwen3.6 (kept the name for
+# call-site compatibility — it is no longer Sonnet)
 async def query_sonnet(prompt: str) -> str:
-    response = await agent.ask(prompt, tier=Tier.MEDIUM)
-    return response.text.strip()
+    return (await ask(prompt)).strip()
 
 
 # ##################################################################
@@ -38,38 +38,39 @@ def parse_json_response(text: str) -> dict:
     return json.loads(text)
 
 
+async def _voice_description_for_one(char_id: str, info: dict) -> tuple[str, dict]:
+    bio = info.get("bio") or info.get("description") or ""
+    is_narrator = char_id == "narrator"
+    role_hint = ("Audiobook narrator. Focus on narration qualities: clarity, authority, "
+                 "warmth, pace, range for character voices.") if is_narrator else \
+                "Audiobook character voice for TTS cloning."
+    prompt = f"""You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.
+
+{role_hint}
+
+Character id: {char_id}
+Bio: {bio}
+
+Cover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid.
+
+Output the voice description text only. No JSON, no preamble."""
+    while True:
+        text = (await query_sonnet(prompt)).strip()
+        if text:
+            return char_id, {"description": text}
+        print(f"  empty response for {char_id} — retrying")
+        await asyncio.sleep(3)
+
+
 # ##################################################################
 # generate all voice descriptions
-# create voice descriptions for all characters in one call
+# per-character parallel sonnet calls (batched JSON triggers refusal)
 async def generate_all_voice_descriptions(characters: dict) -> dict:
-    chars_json = json.dumps(characters, indent=2)
-    prompt = f"""Create voice descriptions for audiobook text-to-speech voice cloning.
-
-Input characters JSON:
-{chars_json}
-
-For each character, create a detailed voice description suitable for AI TTS voice cloning.
-Include:
-- Gender and approximate age
-- Vocal qualities (pitch, timbre, resonance, rasp, etc.)
-- Speaking style (pace, emphasis, warmth, formality)
-- Accent or dialect that fits their background
-- Emotional tone and personality in voice
-
-For the "narrator" character, focus on audiobook narration qualities.
-Keep each description 60-100 words. Be specific and vivid.
-
-Return ONLY valid JSON in this exact format:
-{{
-  "character_id": {{
-    "description": "The voice description text"
-  }}
-}}
-
-Include ALL characters from the input. Use the same character IDs as keys."""
-
-    response = await query_sonnet(prompt)
-    return parse_json_response(response)
+    print(f"  voice descriptions: {len(characters)} parallel sonnet calls")
+    results = await asyncio.gather(
+        *(_voice_description_for_one(cid, info) for cid, info in characters.items())
+    )
+    return {cid: desc for cid, desc in results}
 
 
 # ##################################################################

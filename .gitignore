@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .publish_config
+pipeline.log
+~/
+output/

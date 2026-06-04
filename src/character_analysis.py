@@ -2,7 +2,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from daz_agent_sdk import Tier, agent
+from src.llm import ask
 
 
 # ##################################################################
@@ -40,9 +40,20 @@ def parse_json_response(text: str) -> dict:
 # ##################################################################
 # query haiku
 # send a prompt to claude haiku and get text response
+MAX_CONCURRENT_LLM = 8
+_llm_sem: asyncio.Semaphore | None = None
+
+
+def _llm_semaphore() -> asyncio.Semaphore:
+    global _llm_sem
+    if _llm_sem is None:
+        _llm_sem = asyncio.Semaphore(MAX_CONCURRENT_LLM)
+    return _llm_sem
+
+
 async def query_haiku(prompt: str) -> str:
-    response = await agent.ask(prompt, tier=Tier.LOW)
-    return response.text.strip()
+    async with _llm_semaphore():
+        return (await ask(prompt)).strip()
 
 
 # ##################################################################
@@ -176,8 +187,7 @@ Return ONLY valid JSON:
 
 Each group = same person. IDs not in any group stay as singles."""
 
-    result_msg = await agent.ask(prompt, tier=Tier.MEDIUM)
-    response = result_msg.text.strip()
+    response = (await ask(prompt)).strip()
     result = parse_json_response(response)
     groups = result.get("groups", [])
     if not groups:
@@ -270,15 +280,18 @@ async def analyze_characters(output_dir: Path, title: str, author: str) -> Path:
     chapter_files = sorted(chapters_dir.glob("*.txt"))
     if not chapter_files:
         raise ValueError("No chapter files found")
-    all_chars = []
     sample_text = ""
+    targets: list[tuple[int, Path]] = []
     for i, chapter_path in enumerate(chapter_files):
         if chapter_path.name == "00-intro.txt":
             continue
         if not sample_text:
             sample_text = chapter_path.read_text(encoding="utf-8")[:3000]
-        chapter_chars = await analyze_chapter(chapter_path, i)
-        all_chars.append(chapter_chars)
+        targets.append((i, chapter_path))
+    print(f"Analyzing {len(targets)} chapters in parallel...")
+    all_chars = await asyncio.gather(
+        *(analyze_chapter(p, i) for i, p in targets)
+    )
     merged = merge_character_info(all_chars)
     print(f"Raw merge: {len(merged)} characters")
     print("Deduplicating with Sonnet...")

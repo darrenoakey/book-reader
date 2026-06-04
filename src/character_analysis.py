@@ -39,21 +39,9 @@ def parse_json_response(text: str) -> dict:
 
 # ##################################################################
 # query haiku
-# send a prompt to claude haiku and get text response
-MAX_CONCURRENT_LLM = 8
-_llm_sem: asyncio.Semaphore | None = None
-
-
-def _llm_semaphore() -> asyncio.Semaphore:
-    global _llm_sem
-    if _llm_sem is None:
-        _llm_sem = asyncio.Semaphore(MAX_CONCURRENT_LLM)
-    return _llm_sem
-
-
+# send a prompt to the LLM (concurrency is bounded inside src.llm.ask)
 async def query_haiku(prompt: str) -> str:
-    async with _llm_semaphore():
-        return (await ask(prompt)).strip()
+    return (await ask(prompt)).strip()
 
 
 # ##################################################################

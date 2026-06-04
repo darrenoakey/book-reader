@@ -78,15 +78,21 @@ def ask_sync(prompt: str, system: str | None = None, temperature: float = 0.2,
 
 # ##################################################################
 # semaphore
-# bound concurrent in-flight requests so we don't swamp the single model
-_sem: asyncio.Semaphore | None = None
+# bound concurrent in-flight requests so we don't swamp the single model.
+# Keyed per running event loop: the pipeline runs each step under its own
+# asyncio.run(), and an asyncio.Semaphore is bound to the loop it was created
+# in — a module-level singleton would raise "bound to a different event loop"
+# on the second step.
+_sems: dict = {}
 
 
 def _semaphore() -> asyncio.Semaphore:
-    global _sem
-    if _sem is None:
-        _sem = asyncio.Semaphore(MAX_CONCURRENT)
-    return _sem
+    loop = asyncio.get_running_loop()
+    sem = _sems.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+        _sems[loop] = sem
+    return sem
 
 
 # ##################################################################

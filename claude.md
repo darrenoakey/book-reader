@@ -5,17 +5,56 @@ EPUB to M4B audiobook converter with multi-character voice synthesis.
 ## Pipeline Steps
 
 1. `extract` - EPUB to chapter text files
-2. `characters` - Claude Haiku per-chapter analysis → characters.json
-3. `voices_desc` - Claude Sonnet single-call → voices.json
-4. `scripts` - Claude Haiku → speaker-attributed JSONL
-5. `audio` - Arbiter `tts-design` per line (description → audio), ffmpeg concat → chapter WAVs
-6. `m4b` - ffmpeg assembly → M4B with chapters
+2. `characters` - per-chapter LLM analysis → characters.json
+3. `voices_desc` - single-call LLM → voices.json (voice descriptions)
+4. `voices` - prepare per-character voices for the selected TTS engine
+   (kokoro: LLM maps each description → kokoro voice → kokoro_voices.json;
+   qwen: tts-design a reference WAV per character → voices/*.wav)
+5. `scripts` - LLM → speaker-attributed JSONL
+6. `audio` - selected TTS engine per line, ffmpeg concat → chapter WAVs
+7. `m4b` - ffmpeg assembly → M4B with chapters
+
+## LLM backend (all LLM work)
+
+All LLM calls go through `src/llm.py` → **qwen3.6:35b-a3b on the boringstack
+machine** (Ollama HTTP at `http://10.0.0.237:11434`, `think=false`, stdlib
+urllib only — no local model process, no per-call subprocess). Configurable via
+`BOOK_LLM_HOST`, `BOOK_LLM_MODEL`, `BOOK_LLM_CONCURRENCY`. The old
+daz-agent-sdk/Claude path (which spawned a ~400 MB Node CLI per call and
+exhausted local memory) is gone.
+
+`src/llm.py` semaphore is keyed **per running event loop** — the pipeline runs
+each step under its own `asyncio.run()`, and an asyncio.Semaphore is bound to
+the loop it was created in; a module-level singleton raises "bound to a
+different event loop" on the second step.
+
+## TTS engines (pluggable)
+
+`src/tts_engine.py` dispatches on env `BOOK_TTS_ENGINE` (default `kokoro`):
+
+- **kokoro** — Kokoro-82M via arbiter `tts-kokoro` (new adapter on spark).
+  Hundreds of times faster than qwen3-tts. No cloning: each character is mapped
+  by the LLM to a kokoro voice (gender/accent match, optional 2-voice blend,
+  speed) in `src/kokoro_voices.py` → `kokoro_voices.json`. A voice spec is
+  `"af_heart"` or a blend `"af_heart*0.6+am_michael*0.4"`.
+- **qwen** — original path: `tts-design` a reference WAV per character, then
+  `tts-clone` per line (uses ref WAVs in `voices/`).
+
+The "perfect world" goal (qwen3-tts creates voices → kokoro clones them) needs
+**kvoicewalk** to evolve a real kokoro `.pt` style tensor per voice (~30-90 min
+GPU each, one-time) — documented in `arbiter/KOKORO_TTS.md` as a future hybrid
+(grow the bank from 54 → ~500 voices, then map onto that). Not yet wired in.
+
+Arbiter is reached **directly at spark** (`http://10.0.0.254:8400`, override
+with `ARBITER_BASE`); kokoro jobs need no ref staging so the local
+arbiter-proxy/client services (8399/8401) are not required.
 
 ## Key Files
 
 - `output/<epub-stem>/state.jsonl` - Append-only progress tracking
 - `output/<epub-stem>/characters.json` - Character bios (physical/voice focus)
 - `output/<epub-stem>/voices.json` - TTS voice descriptions
+- `output/<epub-stem>/kokoro_voices.json` - per-character kokoro voice + speed
 - `output/<epub-stem>/script/*.jsonl` - Speaker-attributed lines
 
 ## Gotchas

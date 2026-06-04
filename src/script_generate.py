@@ -70,13 +70,21 @@ Valid speakers: {speakers_list}
 Convert to audiobook script. Each line MUST be exactly this JSON format:
 {{"speaker_id": "<one of the valid speakers>", "text": "<spoken words>"}}
 
-Rules:
-- ONLY the words INSIDE quotation marks are a character's speech → that character's speaker_id.
-- The dialogue TAG ("Bob said", "she whispered", "he replied, grinning") is NARRATION → a separate "narrator" line. It is NOT part of the character's line.
-- All other prose (description, action, narration) → "narrator".
-- Split a sentence that mixes speech and tag into MULTIPLE lines.
+THE ONE HARD RULE: a character speaks ONLY text wrapped in quotation marks
+(straight " " or ' ', or curly “ ” or ‘ ’). If text is NOT inside quotation
+marks, it is NARRATION → "narrator". No exceptions, ever.
+
+Therefore:
+- If a sentence/passage contains NO quotation marks at all, EVERY line of it is "narrator".
+- Third-person narration of a character's actions or thoughts is NARRATION, even
+  when terse, clipped, or a subjectless fragment. "He vaulted the fence." → narrator.
+  "Looked forward." → narrator. "He breathed. In. Out." → narrator. "Ducked." → narrator.
+  A short fragment is NOT speech just because it's short — only quotation marks make it speech.
+- The dialogue TAG ("Bob said", "she whispered", "he replied, grinning") is NARRATION
+  → a separate "narrator" line. It is NOT part of the character's line.
+- Split a sentence that mixes quoted speech and a tag into MULTIPLE lines.
 - Do NOT include the quotation marks themselves in "text".
-- speaker_id MUST be from the valid list. If unsure, use "narrator".
+- speaker_id MUST be from the valid list. When unsure, use "narrator".
 - One JSON object per line. No code fences, no explanation, no chapter title.
 
 EXAMPLES:
@@ -91,6 +99,11 @@ Output:
 {{"speaker_id": "jane", "text": "I won't,"}}
 {{"speaker_id": "narrator", "text": "she snapped,"}}
 {{"speaker_id": "jane", "text": "go back there."}}
+
+Input (clipped action prose, NO quotation marks — ALL narrator):
+He didn't look back. Looked forward. Toward her. He vaulted a mailbox. Servos whined. He breathed. In. Out.
+Output:
+{{"speaker_id": "narrator", "text": "He didn't look back. Looked forward. Toward her. He vaulted a mailbox. Servos whined. He breathed. In. Out."}}
 
 (Use the actual valid speaker_ids above, not "bob"/"jane", matching whoever is speaking.)
 

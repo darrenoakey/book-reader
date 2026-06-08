@@ -30,7 +30,7 @@ from src.arbiter_tts import tts_kokoro_many
 
 WORDS_PER_PAGE = 300
 SENTENCES_PER_PARA = (3, 8)
-PARAS_PER_CHAPTER = (8, 16)
+TARGET_CHAPTERS = 12  # split the whole book into roughly this many chapters
 
 # Terminal punctuation, weighted (period most common, plenty of variety).
 _ENDINGS = ([".", 30], ["!", 14], ["?", 12], ["...", 8], ["?!", 5],
@@ -77,28 +77,22 @@ def make_sentence(rng: random.Random) -> str:
 def generate_book(pages: int, seed: int) -> list[tuple[str, list[str]]]:
     rng = random.Random(seed)
     target_words = pages * WORDS_PER_PAGE
+    words_per_chapter = max(WORDS_PER_PAGE, target_words // TARGET_CHAPTERS)
     chapters: list[tuple[str, list[str]]] = []
     words_so_far = 0
     chapter_idx = 0
-    # ~20 pages/chapter.
-    words_per_chapter = max(WORDS_PER_PAGE, target_words // max(1, pages // 20 or 1))
     while words_so_far < target_words:
         chapter_idx += 1
         paras: list[str] = []
         chapter_words = 0
-        n_paras = rng.randint(*PARAS_PER_CHAPTER)
-        for _ in range(n_paras):
-            if words_so_far >= target_words:
-                break
+        # Fill the chapter to its word target (driven by words, not a para cap).
+        while chapter_words < words_per_chapter and words_so_far < target_words:
             sentences = [make_sentence(rng)
                          for _ in range(rng.randint(*SENTENCES_PER_PARA))]
-            para = " ".join(sentences)
-            paras.append(para)
+            paras.append(" ".join(sentences))
             w = sum(len(s.split()) for s in sentences)
             chapter_words += w
             words_so_far += w
-            if chapter_words >= words_per_chapter:
-                break
         if paras:
             chapters.append((f"Chapter {chapter_idx}", paras))
     return chapters
@@ -157,25 +151,29 @@ def split_sentences(text: str) -> list[str]:
 
 
 # ##################################################################
-# synthesize chapter
-# render every sentence of a chapter in one kokoro voice → chapter wav
-def synthesize_chapter(paras: list[str], voice: str, speed: float,
-                       work_dir: Path, chapter_wav: Path) -> Path:
-    if chapter_wav.exists() and chapter_wav.stat().st_size >= 100:
-        return chapter_wav
-    work_dir.mkdir(parents=True, exist_ok=True)
-    sentences: list[str] = []
-    for para in paras:
-        sentences.extend(split_sentences(para))
-    jobs = []
-    line_paths = []
-    for idx, sent in enumerate(sentences):
-        p = work_dir / f"{idx:05d}.wav"
-        line_paths.append(p)
-        jobs.append({"text": sent, "voice": voice, "speed": speed, "output_path": p})
-    tts_kokoro_many(jobs)
-    m4b.concatenate_audio_files(line_paths, chapter_wav)
-    return chapter_wav
+# plan chapters
+# build per-chapter (title, line_paths, chapter_wav) + the flat job list for
+# the WHOLE book, so every sentence is synthesised in one batched pass (max
+# pipelining across kokoro's concurrent slots) rather than chapter by chapter
+def plan_chapters(chapters: list[tuple[str, list[str]]], audio_dir: Path,
+                  voice: str, speed: float):
+    all_jobs: list[dict] = []
+    plans: list[tuple[str, list[Path], Path]] = []
+    for i, (ch_title, paras) in enumerate(chapters, start=1):
+        cw = audio_dir / f"{i:03d}.wav"
+        work = audio_dir / f".lines_{i:03d}"
+        work.mkdir(parents=True, exist_ok=True)
+        sentences: list[str] = []
+        for para in paras:
+            sentences.extend(split_sentences(para))
+        paths: list[Path] = []
+        for idx, sent in enumerate(sentences):
+            p = work / f"{idx:05d}.wav"
+            paths.append(p)
+            all_jobs.append({"text": sent, "voice": voice, "speed": speed,
+                             "output_path": p})
+        plans.append((ch_title, paths, cw))
+    return plans, all_jobs
 
 
 # ##################################################################
@@ -245,12 +243,13 @@ def main() -> int:
     print(f"      {epub_path}")
 
     print(f"[3/4] Synthesising with kokoro voice '{args.voice}' (speed {args.speed})...")
+    plans, all_jobs = plan_chapters(chapters, audio_dir, args.voice, args.speed)
+    print(f"      {len(all_jobs)} sentences across {len(plans)} chapters — one batched pass")
+    tts_kokoro_many(all_jobs)
     chapter_wavs: list[tuple[str, Path]] = []
-    for i, (ch_title, paras) in enumerate(chapters, start=1):
-        cw = audio_dir / f"{i:03d}.wav"
-        work = audio_dir / f".lines_{i:03d}"
-        print(f"      {ch_title} ({i}/{len(chapters)})...")
-        synthesize_chapter(paras, args.voice, args.speed, work, cw)
+    for ch_title, paths, cw in plans:
+        if not (cw.exists() and cw.stat().st_size >= 100):
+            m4b.concatenate_audio_files(paths, cw)
         chapter_wavs.append((ch_title, cw))
 
     print("[4/4] Assembling M4B...")

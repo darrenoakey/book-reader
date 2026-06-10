@@ -17,7 +17,7 @@ EPUB to M4B audiobook converter with multi-character voice synthesis.
 ## LLM backend (all LLM work)
 
 All LLM calls go through `src/llm.py` → **qwen3.6:35b-a3b on the boringstack
-machine** (Ollama HTTP at `http://10.0.0.237:11434`, `think=false`, stdlib
+machine** (Ollama HTTP at `http://10.0.0.42:11434` — DHCP-assigned, was .237; check asus dnsmasq leases if unreachable, `think=false`, stdlib
 urllib only — no local model process, no per-call subprocess). Configurable via
 `BOOK_LLM_HOST`, `BOOK_LLM_MODEL`, `BOOK_LLM_CONCURRENCY`. The old
 daz-agent-sdk/Claude path (which spawned a ~400 MB Node CLI per call and

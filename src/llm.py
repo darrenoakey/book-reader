@@ -1,14 +1,17 @@
-"""Central LLM backend — qwen3.6:35b-a3b on the boringstack machine via Ollama.
+"""Central LLM backend — qwen3.6-35b served by the arbiter GPU job server.
 
 All book-reader LLM work (character analysis, voice descriptions, voice
-mapping, script generation) goes through here. We talk to Ollama's HTTP API
-directly with stdlib urllib so there is no heavyweight local model process and
-no per-call subprocess (the previous claude-agent-sdk path spawned a ~400 MB
-Node CLI per call, which exhausted local memory).
+mapping, script generation) goes through here. We talk to the arbiter's
+OpenAI-compatible HTTP endpoint directly with stdlib urllib so there is no
+heavyweight local model process and no per-call subprocess (the previous
+claude-agent-sdk path spawned a ~400 MB Node CLI per call, which exhausted
+local memory). The arbiter transparently farms each job to whichever Ollama
+host (boringstack / darrens-mbp) is available, with failover, so this client
+no longer needs to know about any single model host.
 
 Configurable via env:
-  BOOK_LLM_HOST         default http://10.0.0.237:11434  (boringstack Ollama)
-  BOOK_LLM_MODEL        default qwen3.6:35b-a3b
+  BOOK_LLM_HOST         default http://10.0.0.254:8400  (spark arbiter server)
+  BOOK_LLM_MODEL        default qwen3.6-35b
   BOOK_LLM_CONCURRENCY  default 4   (parallel in-flight requests)
 """
 from __future__ import annotations
@@ -21,8 +24,8 @@ import time
 import urllib.error
 import urllib.request
 
-LLM_HOST = os.environ.get("BOOK_LLM_HOST", "http://10.0.0.237:11434").rstrip("/")
-LLM_MODEL = os.environ.get("BOOK_LLM_MODEL", "qwen3.6:35b-a3b")
+LLM_HOST = os.environ.get("BOOK_LLM_HOST", "http://10.0.0.254:8400").rstrip("/")
+LLM_MODEL = os.environ.get("BOOK_LLM_MODEL", "qwen3.6-35b")
 MAX_CONCURRENT = int(os.environ.get("BOOK_LLM_CONCURRENCY", "4"))
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -37,8 +40,9 @@ def strip_think(text: str) -> str:
 
 # ##################################################################
 # ask sync
-# one blocking chat completion against boringstack ollama; retries transient
-# failures forever with backoff (the pipeline must never silently lose work)
+# one blocking chat completion against the arbiter's OpenAI-compatible
+# endpoint; retries transient failures forever with backoff (the pipeline must
+# never silently lose work). The arbiter handles model-host selection/failover.
 def ask_sync(prompt: str, system: str | None = None, temperature: float = 0.2,
              max_tokens: int = 4096, timeout: float = 300.0) -> str:
     messages: list[dict] = []
@@ -48,9 +52,8 @@ def ask_sync(prompt: str, system: str | None = None, temperature: float = 0.2,
     payload = json.dumps({
         "model": LLM_MODEL,
         "messages": messages,
-        "stream": False,
-        "think": False,
-        "options": {"temperature": temperature, "num_predict": max_tokens},
+        "max_tokens": max_tokens,
+        "temperature": temperature,
     }).encode("utf-8")
 
     attempt = 0
@@ -58,12 +61,13 @@ def ask_sync(prompt: str, system: str | None = None, temperature: float = 0.2,
         attempt += 1
         try:
             req = urllib.request.Request(
-                f"{LLM_HOST}/api/chat", data=payload,
+                f"{LLM_HOST}/v1/chat/completions", data=payload,
                 headers={"Content-Type": "application/json"}, method="POST",
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            content = (data.get("message", {}) or {}).get("content", "") or ""
+            choices = data.get("choices", []) or []
+            content = (choices[0].get("message", {}) if choices else {}).get("content", "") or ""
             content = strip_think(content)
             if content.strip():
                 return content.strip()

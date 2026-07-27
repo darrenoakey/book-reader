@@ -1,4 +1,4 @@
-"""Central LLM backend — qwen3.6-35b served by the arbiter GPU job server.
+"""Central LLM backend — local-coder category served by the arbiter GPU job server.
 
 All book-reader LLM work (character analysis, voice descriptions, voice
 mapping, script generation) goes through here. We talk to the arbiter's
@@ -11,7 +11,7 @@ no longer needs to know about any single model host.
 
 Configurable via env:
   BOOK_LLM_HOST         default http://10.0.0.254:8400  (spark arbiter server)
-  BOOK_LLM_MODEL        default qwen3.6-35b
+  BOOK_LLM_MODEL        default local-coder
   BOOK_LLM_CONCURRENCY  default 4   (parallel in-flight requests)
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 LLM_HOST = os.environ.get("BOOK_LLM_HOST", "http://10.0.0.254:8400").rstrip("/")
-LLM_MODEL = os.environ.get("BOOK_LLM_MODEL", "qwen3.6-35b")
+LLM_MODEL = os.environ.get("BOOK_LLM_MODEL", "local-coder")
 MAX_CONCURRENT = int(os.environ.get("BOOK_LLM_CONCURRENCY", "4"))
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)

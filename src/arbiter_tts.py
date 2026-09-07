@@ -24,16 +24,20 @@ def _client(timeout: float = 60) -> ArbiterClient:
 # ##################################################################
 # submit
 # submit a job of given type and return its id, retrying on transient errors
-def _submit(client: ArbiterClient, job_type: str, params: dict) -> str:
+def _submit(client: ArbiterClient, job_type: str, params: dict, why: str | None = None) -> str:
+    # who/why provenance: the arbiter records this on every job so GPU work is
+    # attributable (who="book-reader", why names the output being narrated);
+    # an ambient ARBITER_WHY from a root task would override via None here.
     last_err: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
-            return client.submit(job_type, **params)
+            return client.submit(job_type, who="book-reader", why=why, **params)
         except (ArbiterError, ConnectionError, OSError) as e:
             last_err = e
             wait = min(RETRY_BACKOFF_SEC * (attempt + 1), 60)
-            log.warning("submit %s attempt %d/%d failed: %s — retrying in %ds",
-                        job_type, attempt + 1, MAX_RETRIES, e, wait)
+            log.warning(
+                "submit %s attempt %d/%d failed: %s — retrying in %ds", job_type, attempt + 1, MAX_RETRIES, e, wait
+            )
             time.sleep(wait)
     raise RuntimeError(f"submit {job_type} failed after {MAX_RETRIES} attempts: {last_err}")
 
@@ -41,8 +45,7 @@ def _submit(client: ArbiterClient, job_type: str, params: dict) -> str:
 # ##################################################################
 # fetch
 # poll an existing job and write result; on failure resubmit and retry
-def _fetch(client: ArbiterClient, job_id: str, job_type: str, params: dict,
-           output_path: Path) -> None:
+def _fetch(client: ArbiterClient, job_id: str, job_type: str, params: dict, output_path: Path) -> None:
     """Wait for a job to finish. NEVER resubmit on a mere poll timeout — that
     just pushes the job to the back of the queue and makes things worse.
     Only resubmit if the job is genuinely terminated (failed or cancelled)."""
@@ -55,32 +58,29 @@ def _fetch(client: ArbiterClient, job_id: str, job_type: str, params: dict,
             output_path.write_bytes(client.get_result_bytes(current_jid))
             if output_path.stat().st_size >= 100:
                 return
-            log.warning("fetch %s for %s returned empty — resubmitting",
-                        job_type, output_path.name)
+            log.warning("fetch %s for %s returned empty — resubmitting", job_type, output_path.name)
             current_jid = _submit(client, job_type, params)
         except ArbiterError as e:
             msg = str(e).lower()
             if "failed" in msg or "cancelled" in msg or "timed out" in msg:
                 # job is dead — resubmit a new one
-                log.warning("fetch %s for %s: job died (%s) — resubmitting",
-                            job_type, output_path.name, e)
+                log.warning("fetch %s for %s: job died (%s) — resubmitting", job_type, output_path.name, e)
                 current_jid = _submit(client, job_type, params)
             else:
                 # transient connection error — keep polling the same job
-                log.warning("fetch %s for %s: transient (%s) — retrying poll",
-                            job_type, output_path.name, e)
+                log.warning("fetch %s for %s: transient (%s) — retrying poll", job_type, output_path.name, e)
                 time.sleep(5)
         except (ConnectionError, OSError) as e:
-            log.warning("fetch %s for %s: connection (%s) — retrying poll",
-                        job_type, output_path.name, e)
+            log.warning("fetch %s for %s: connection (%s) — retrying poll", job_type, output_path.name, e)
             time.sleep(5)
 
 
 # ##################################################################
 # tts design to file
 # generate a voice from description and save the wav locally
-def tts_design_to_file(description: str, text: str, output_path: Path,
-                       language: str = "English", temperature: float = 0.9) -> Path:
+def tts_design_to_file(
+    description: str, text: str, output_path: Path, language: str = "English", temperature: float = 0.9
+) -> Path:
     if output_path.exists() and output_path.stat().st_size >= 100:
         return output_path
     client = _client(60)
@@ -91,7 +91,7 @@ def tts_design_to_file(description: str, text: str, output_path: Path,
         "temperature": temperature,
         "force": True,
     }
-    jid = _submit(client, "tts-design", params)
+    jid = _submit(client, "tts-design", params, why=f"narrate {output_path.name}")
     _fetch(client, jid, "tts-design", params, output_path)
     return output_path
 
@@ -99,8 +99,9 @@ def tts_design_to_file(description: str, text: str, output_path: Path,
 # ##################################################################
 # tts clone to file
 # clone a voice using a pre-registered speaker_id (no ref audio sent)
-def tts_clone_to_file(speaker_id: str, text: str, output_path: Path,
-                      language: str = "English", temperature: float = 0.7) -> Path:
+def tts_clone_to_file(
+    speaker_id: str, text: str, output_path: Path, language: str = "English", temperature: float = 0.7
+) -> Path:
     if output_path.exists() and output_path.stat().st_size >= 100:
         return output_path
     client = _client(120)
@@ -111,7 +112,7 @@ def tts_clone_to_file(speaker_id: str, text: str, output_path: Path,
         "temperature": temperature,
         "force": True,
     }
-    jid = _submit(client, "tts-clone", params)
+    jid = _submit(client, "tts-clone", params, why=f"narrate {output_path.name}")
     _fetch(client, jid, "tts-clone", params, output_path)
     return output_path
 
@@ -123,18 +124,18 @@ def tts_clone_to_file(speaker_id: str, text: str, output_path: Path,
 IN_FLIGHT_WINDOW = 32
 
 
-def tts_clone_many(jobs: list[dict], ref_audio_path: Path,
-                   language: str = "English",
-                   temperature: float = 0.7) -> list[Path]:
+def tts_clone_many(
+    jobs: list[dict], ref_audio_path: Path, language: str = "English", temperature: float = 0.7
+) -> list[Path]:
     """Submit a batch of tts-clone jobs all sharing one staged ref WAV,
     keeping ~IN_FLIGHT_WINDOW jobs in flight at a time using a thread pool
     so arbiter's worker slots stay saturated."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from arbiter_client import stage_file
+
     spark_path = stage_file(ref_audio_path, keep_for_seconds=6 * 86400)
 
-    todo = [j for j in jobs
-            if not (j["output_path"].exists() and j["output_path"].stat().st_size >= 100)]
+    todo = [j for j in jobs if not (j["output_path"].exists() and j["output_path"].stat().st_size >= 100)]
     if not todo:
         return [j["output_path"] for j in jobs]
 
@@ -147,7 +148,7 @@ def tts_clone_many(jobs: list[dict], ref_audio_path: Path,
             "temperature": temperature,
             "force": True,
         }
-        jid = _submit(client, "tts-clone", params)
+        jid = _submit(client, "tts-clone", params, why=f"narrate {j['output_path'].name}")
         _fetch(client, jid, "tts-clone", params, j["output_path"])
 
     print(f"  {len(todo)} jobs, window={IN_FLIGHT_WINDOW}")
@@ -167,13 +168,13 @@ def tts_clone_many(jobs: list[dict], ref_audio_path: Path,
 # write wav slice
 # write a frame-slice of a source wav (raw frames + params) to a new wav,
 # preserving the source's exact format (kokoro outputs 24 kHz mono float wav)
-def _write_wav_slice(params, frames: bytes, start_frame: int, n_frames: int,
-                     out_path: Path) -> None:
+def _write_wav_slice(params, frames: bytes, start_frame: int, n_frames: int, out_path: Path) -> None:
     import wave
+
     sw = params.sampwidth
     nch = params.nchannels
     fb = sw * nch
-    seg = frames[start_frame * fb:(start_frame + n_frames) * fb]
+    seg = frames[start_frame * fb : (start_frame + n_frames) * fb]
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(out_path), "wb") as w:
         w.setnchannels(nch)
@@ -204,33 +205,36 @@ def tts_kokoro_many(jobs: list[dict]) -> list[Path]:
     import wave
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    todo = [j for j in jobs
-            if not (j["output_path"].exists() and j["output_path"].stat().st_size >= 100)]
+    todo = [j for j in jobs if not (j["output_path"].exists() and j["output_path"].stat().st_size >= 100)]
     if not todo:
         return [j["output_path"] for j in jobs]
 
-    batches = [todo[i:i + KOKORO_BATCH_LINES]
-               for i in range(0, len(todo), KOKORO_BATCH_LINES)]
+    batches = [todo[i : i + KOKORO_BATCH_LINES] for i in range(0, len(todo), KOKORO_BATCH_LINES)]
 
     def _do_batch(batch: list[dict]) -> int:
         client = _client(300)
         params = {
-            "items": [{"text": j["text"], "voice": j.get("voice", "af_heart"),
-                       "speed": float(j.get("speed", 1.0))} for j in batch],
+            "items": [
+                {"text": j["text"], "voice": j.get("voice", "af_heart"), "speed": float(j.get("speed", 1.0))}
+                for j in batch
+            ],
             "gap_seconds": 0.0,
             "force": True,
         }
         # submit + poll, retrying transient/dead-job failures forever
         while True:
-            jid = _submit(client, "tts-kokoro", params)
+            jid = _submit(client, "tts-kokoro", params, why=f"narrate {len(batch)} lines")
             try:
                 res = client.poll(jid, interval=2.0, timeout=31536000)
                 meta = res.get("result", {}) if isinstance(res, dict) else {}
                 item_samples = meta.get("item_samples")
                 data = client.get_result_bytes(jid)
                 if not item_samples or len(item_samples) != len(batch) or len(data) < 100:
-                    log.warning("kokoro batch bad result (items=%s, bytes=%d) — resubmitting",
-                                item_samples and len(item_samples), len(data))
+                    log.warning(
+                        "kokoro batch bad result (items=%s, bytes=%d) — resubmitting",
+                        item_samples and len(item_samples),
+                        len(data),
+                    )
                     continue
                 w = wave.open(io.BytesIO(data))
                 frames = w.readframes(w.getnframes())
@@ -239,6 +243,7 @@ def tts_kokoro_many(jobs: list[dict]) -> list[Path]:
                     sampwidth = w.getsampwidth()
                     nchannels = w.getnchannels()
                     framerate = w.getframerate()
+
                 gap = int(meta.get("gap_samples", 0))
                 off = 0
                 for j, n in zip(batch, item_samples):
@@ -256,8 +261,10 @@ def tts_kokoro_many(jobs: list[dict]) -> list[Path]:
                 log.warning("kokoro batch connection (%s) — retrying", e)
                 time.sleep(5)
 
-    print(f"  {len(todo)} kokoro lines in {len(batches)} batches "
-          f"(≤{KOKORO_BATCH_LINES}/job, window={KOKORO_BATCH_WINDOW})")
+    print(
+        f"  {len(todo)} kokoro lines in {len(batches)} batches "
+        f"(≤{KOKORO_BATCH_LINES}/job, window={KOKORO_BATCH_WINDOW})"
+    )
     done = 0
     with ThreadPoolExecutor(max_workers=KOKORO_BATCH_WINDOW) as pool:
         futures = [pool.submit(_do_batch, b) for b in batches]
@@ -269,6 +276,8 @@ def tts_kokoro_many(jobs: list[dict]) -> list[Path]:
 
 
 __all__ = [
-    "tts_design_to_file", "tts_clone_to_file", "tts_clone_many",
+    "tts_design_to_file",
+    "tts_clone_to_file",
+    "tts_clone_many",
     "tts_kokoro_many",
 ]

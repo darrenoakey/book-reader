@@ -115,6 +115,7 @@ HARD RULES:
 - The image generator has NEVER read the book. The description must be fully self-contained: no names from the story world, no in-world terms, no plot, no roles, no relationships.
 - Be SPECIFIC and CONCRETE: age in years, height/build, hair color and style, eye color, face, skin tone, clothing described by plain garment names and colors. Less "young fantasy boy", more "boy, 10 years old, short and slight for his age, messy brown hair, brown eyes, loose beige linen shirt and brown trousers, bare feet".
 - Humans are plain humans: normal skin, no scales, no fur, no animal features, unless the source text explicitly describes them.
+- Describe the character's CANONICAL default appearance only. Temporary states are NOT part of the look: ignore injuries, bandages, casts, dirt, disguises, bedding, or items carried in one scene, unless the character has them for essentially the whole story. (Keevan's plaster cast belongs to his injured chapters, not to his face.)
 - If the source gives few visual details, fill in SIMPLE neutral defaults consistent with what is given (age, gender, build) — never exotic ones.
 - If the character has no visual form (e.g. a narrator), write "NONE".
 

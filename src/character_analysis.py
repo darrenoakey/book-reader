@@ -51,8 +51,9 @@ async def analyze_chapter(chapter_path: Path, chapter_num: int) -> dict:
     text = chapter_path.read_text(encoding="utf-8")
     prompt = f"""Analyze this chapter and identify characters who speak or have internal monologue.
 
-For each speaking character, extract ONLY voice-relevant physical details. ALWAYS include nationality/region and a specific age if there are ANY contextual clues (setting, era, vocabulary, place names, period detail) — these are the most important signals for voice. Do not default to "young" or "American" without evidence.
+For each speaking character, extract TWO SEPARATE descriptions: how they SOUND (voice) and how they LOOK (look).
 
+VOICE — ALWAYS include nationality/region and a specific age if there are ANY contextual clues (setting, era, vocabulary, place names, period detail) — these are the most important signals for voice. Do not default to "young" or "American" without evidence.
 - Gender (from pronouns or descriptions)
 - Age — be specific where possible (e.g. "early 30s", "around 50"). Only use "young/middle-aged/elderly" if no clue. War setting alone does NOT mean young.
 - Nationality / regional accent (REQUIRED if any contextual evidence exists — WWI British, South African, Egyptian, Australian, etc. Use period and setting cues, not just accent words.)
@@ -60,12 +61,23 @@ For each speaking character, extract ONLY voice-relevant physical details. ALWAY
 - Voice/speech patterns (gruff, soft, educated, crude, accent, lisping, etc.)
 - Distinctive physical traits affecting voice (old, frail, booming, wheezing, etc.)
 
+LOOK — harvest EVERY visual detail the text states or directly describes about the character's appearance, exhaustively:
+- Hair (color, length, style), eyes (color, shape), face (shape, features, marks, scars, beard)
+- Height, build, posture, how they move
+- Clothing and its colors, gear, jewelry — exactly as described
+- Apparent age as a viewer would see it
+- Distinguishing marks a viewer would notice
+- Species: state it explicitly (e.g. "ordinary human", "dragon"). NEVER invent animal/dragon/monster features for a character the text describes as a person — humans in the text are plain humans, even in fantasy settings where they bond with dragons.
+- Use PLAIN UNIVERSAL visual language. NO in-world proper nouns or setting jargon in the look field — an image generator does not know what "Pernese", "Weyr", or "candidate" means and will guess (badly). Translate into concrete visuals: "boy in a plain white robe", never "Pernese candidate".
+- If the text gives NO visual details for a character, say "no visual details given" — do NOT invent an appearance.
+
 Return ONLY valid JSON:
 {{
   "characters": {{
     "character_id": {{
       "name": "Display Name",
-      "details": "Physical and voice description only"
+      "voice": "Physical and voice description only",
+      "look": "Every visual detail the text gives, or 'no visual details given'"
     }}
   }}
 }}
@@ -74,10 +86,9 @@ Rules:
 - Include ONLY characters who actually speak (quoted dialogue) or have internal monologue
 - Do NOT include characters who are merely mentioned
 - Character IDs: lowercase with underscores (e.g., "jean_tannen")
-- Details must focus on VOICE generation - what would help create their voice
-- EXCLUDE: plot roles, story function, relationships to other characters, emotional descriptions
-- INCLUDE: "elderly man with gravelly voice" / "young woman, speaks formally" / "large man, booming voice" / "British soldier, ~30s, weary, working-class accent" / "South African woman, late 20s, clear professional tone"
-- NO cross-character references (don't mention other characters in the details)
+- voice must focus on VOICE generation; look must focus on what a viewer SEES
+- EXCLUDE from both: plot roles, story function, relationships to other characters, emotional descriptions
+- NO cross-character references (don't mention other characters in the descriptions)
 
 Chapter {chapter_num} text:
 {text[:15000]}"""
@@ -93,12 +104,19 @@ def merge_character_info(all_chars: list[dict]) -> dict:
     merged = {}
     for chapter_chars in all_chars:
         for char_id, info in chapter_chars.get("characters", {}).items():
-            details = info.get("details", info.get("bio", ""))
+            # "details" is the legacy single-field shape; "voice"+"look" is the
+            # current two-field shape (sound vs appearance kept separate so the
+            # movie side never has to mine voice notes for visual facts).
+            voice = info.get("voice", info.get("details", info.get("bio", "")))
+            look = info.get("look", "")
             name = info.get("name", char_id)
             if char_id not in merged:
-                merged[char_id] = {"name": name, "bio": details}
+                merged[char_id] = {"name": name, "bio": voice, "look": look}
             else:
-                merged[char_id]["bio"] += " " + details
+                if voice and voice not in merged[char_id]["bio"]:
+                    merged[char_id]["bio"] += " " + voice
+                if look and look not in merged[char_id].get("look", ""):
+                    merged[char_id]["look"] = (merged[char_id].get("look", "") + " " + look).strip()
     return merged
 
 
@@ -194,12 +212,15 @@ Each group = same person. IDs not in any group stay as singles."""
     for char_id, info in characters.items():
         canonical_id = id_to_canonical.get(char_id, char_id)
         if canonical_id not in deduplicated:
-            deduplicated[canonical_id] = {"name": info["name"], "bio": info["bio"]}
+            deduplicated[canonical_id] = {"name": info["name"], "bio": info["bio"], "look": info.get("look", "")}
         else:
             existing_bio = deduplicated[canonical_id]["bio"]
             new_bio = info["bio"]
             if new_bio not in existing_bio:
                 deduplicated[canonical_id]["bio"] += " " + new_bio
+            new_look = info.get("look", "")
+            if new_look and new_look not in deduplicated[canonical_id].get("look", ""):
+                deduplicated[canonical_id]["look"] = (deduplicated[canonical_id].get("look", "") + " " + new_look).strip()
             if len(info["name"]) > len(deduplicated[canonical_id]["name"]):
                 deduplicated[canonical_id]["name"] = info["name"]
     deduplicated = post_process_dedup(deduplicated)

@@ -19,6 +19,7 @@ fine — the picture should never change mid-sentence).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from src.audio_synth import wav_duration
@@ -92,11 +93,20 @@ def distill_appearances(output_dir: Path) -> dict:
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
     characters = json.loads((output_dir / "characters.json").read_text(encoding="utf-8"))
+    # Prefer the dedicated `look` field (everything the text says about
+    # appearance); fall back to the voice bio only when no look was captured.
     roster = "\n".join(
-        f"- {cid} ({info.get('name', cid)}): {(info.get('bio') or info.get('description') or '')[:600]}"
+        f"- {cid} ({info.get('name', cid)}): {((info.get('look') or '').strip() or (info.get('bio') or info.get('description') or ''))[:800]}"
         for cid, info in characters.items()
     )
-    prompt = f"""You are the character designer on an animated film. For each character below, write a tight VISUAL description (40-70 words) usable as an image-generation prompt: species/body, age appearance, face, hair, build, clothing, colors, distinguishing marks. No plot, no personality, no relationships — only what a viewer SEES. If the character has no visual form (e.g. a narrator), write "NONE".
+    prompt = f"""You are the character designer on an animated family film. For each character below, write a tight VISUAL description (50-80 words) for an image generator.
+
+HARD RULES:
+- The image generator has NEVER read the book. The description must be fully self-contained: no names from the story world, no in-world terms, no plot, no roles, no relationships.
+- Be SPECIFIC and CONCRETE: age in years, height/build, hair color and style, eye color, face, skin tone, clothing described by plain garment names and colors. Less "young fantasy boy", more "boy, 10 years old, short and slight for his age, messy brown hair, brown eyes, loose beige linen shirt and brown trousers, bare feet".
+- Humans are plain humans: normal skin, no scales, no fur, no animal features, unless the source text explicitly describes them.
+- If the source gives few visual details, fill in SIMPLE neutral defaults consistent with what is given (age, gender, build) — never exotic ones.
+- If the character has no visual form (e.g. a narrator), write "NONE".
 
 Characters:
 {roster}
@@ -111,24 +121,30 @@ Output JSON only: {{"<char_id>": "<visual description or NONE>", ...}}. No markd
 
 # ##################################################################
 # choose style
-# one LLM call: a single consistent cinematic style anchor for every image
+# the film's single visual style. DEFAULT is bright/happy/cartoonish (owner
+# rule 2026-09-26): an LLM-invented style once picked "dramatic chiaroscuro,
+# textures of stone and scales" for a hopeful children's tale — grimdark
+# scenes and literal scales on human skin. The style is now a deterministic
+# SETTING, never an LLM invention. Override order: $BOOK_MOVIE_STYLE, then
+# <output>/style.txt, then DEFAULT_STYLE.
+DEFAULT_STYLE = (
+    "Bright, cheerful animated-family-film cartoon: bold clean shapes, warm saturated "
+    "colors, sunny optimistic lighting, soft cel shading, friendly expressive faces, "
+    "storybook charm. Light and hopeful even in tense moments."
+)
+
+
 def choose_style(output_dir: Path) -> str:
     storyboard_path = output_dir / "storyboard.json"
     if storyboard_path.exists():
         return json.loads(storyboard_path.read_text(encoding="utf-8"))["style"]
-    chapters = sorted((output_dir / "chapters").glob("*.txt"))
-    sample = ""
-    for p in chapters[1:]:
-        sample = p.read_text(encoding="utf-8")[:2000]
-        if len(sample.split()) > 100:
-            break
-    prompt = f"""You are the art director on an animated film adaptation of this story. Write ONE visual style paragraph (30-50 words) that will be appended to every image-generation prompt so the whole film looks consistent: medium (e.g. painterly digital illustration), palette, lighting, mood, level of detail. The mood must match the STORY's actual emotional tone (a hopeful adventure is bright and warm; do not default to dark/moody/chiaroscuro). Describe environments and materials only — NEVER mention skin, scales, fur, or body textures (those words leak onto human characters' bodies). Never mention text, captions, or watermarks.
-
-Story sample:
-{sample}
-
-Output the style paragraph only. No preamble."""
-    return ask_sync(prompt, max_tokens=300)
+    env = os.environ.get("BOOK_MOVIE_STYLE")
+    if env and env.strip():
+        return env.strip()
+    style_txt = output_dir / "style.txt"
+    if style_txt.exists():
+        return style_txt.read_text(encoding="utf-8").strip()
+    return DEFAULT_STYLE
 
 
 # ##################################################################

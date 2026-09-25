@@ -132,8 +132,9 @@ def qwen_image_to_file(
 
 # ##################################################################
 # build contact sheet
-# compose labelled portraits side by side: n tiles of tile×tile plus a
-# LABEL_BAND strip underneath with each character's display name
+# compose labelled reference images side by side: n tiles of tile×tile plus a
+# LABEL_BAND strip underneath with each label. Non-square inputs are
+# centre-cropped to square (the previous-scene style tile is 16:9).
 def build_contact_sheet(items: list[tuple[str, Path]], dest: Path, tile: int = REF_SIZE // 2) -> Path:
     if not items:
         raise ValueError("contact sheet needs at least one portrait")
@@ -141,8 +142,11 @@ def build_contact_sheet(items: list[tuple[str, Path]], dest: Path, tile: int = R
     sheet = Image.new("RGB", (tile * len(items), tile + LABEL_BAND), (18, 18, 24))
     draw = ImageDraw.Draw(sheet)
     for i, (name, path) in enumerate(items):
-        portrait = Image.open(path).convert("RGB").resize((tile, tile), Image.LANCZOS)
-        sheet.paste(portrait, (i * tile, 0))
+        img = Image.open(path).convert("RGB")
+        if img.width != img.height:  # centre-crop to square
+            side = min(img.width, img.height)
+            img = img.crop(((img.width - side) // 2, (img.height - side) // 2, (img.width + side) // 2, (img.height + side) // 2))
+        sheet.paste(img.resize((tile, tile), Image.LANCZOS), (i * tile, 0))
         label = name.replace("-", " ").title()
         bbox = draw.textbbox((0, 0), label)
         x = i * tile + (tile - (bbox[2] - bbox[0])) // 2
@@ -195,19 +199,46 @@ def generate_character_refs(output_dir: Path) -> list[Path]:
 # scene ref
 # pick the conditioning image for one scene: the single character's portrait,
 # or a labelled contact sheet when several characters appear together
-def _scene_ref(output_dir: Path, characters: list[str], index: int) -> tuple[Path | None, str]:
+# ##################################################################
+# scene condition
+# the single condition image for one scene job (qwen-image takes ONE image):
+# a labelled strip whose FIRST tile is the previous scene (style continuity —
+# without it, scenes drift between photo, painting, and cartoon looks) and
+# whose remaining tiles are the visible characters' portraits (identity).
+# Scene 0 (no previous) uses portraits alone; a character-less scene N>0
+# conditions on the previous scene alone.
+def _scene_condition(output_dir: Path, characters: list[str], index: int) -> tuple[Path | None, str]:
     refs_dir = output_dir / "refs"
     available = [(cid, refs_dir / f"{cid}.png") for cid in characters if (refs_dir / f"{cid}.png").exists()]
+    prev = output_dir / "scenes" / f"{index - 1:04d}.png"
+    has_prev = index > 0 and prev.exists() and prev.stat().st_size >= 1000
+
+    style_note = (
+        "The FIRST panel of the reference image (labelled STYLE REF) is the previous scene: "
+        "match its art style, palette, and lighting EXACTLY — same medium, same rendering. "
+        "Paint a NEW scene, do not copy its composition. "
+    ) if has_prev else ""
+
     if not available:
-        return None, ""
-    if len(available) == 1:
+        if not has_prev:
+            return None, ""
+        return prev, (
+            "The reference image is the previous scene: match its art style, palette, and "
+            "lighting EXACTLY — same medium, same rendering. Paint a NEW scene, do not copy "
+            "its composition. "
+        )
+
+    if not has_prev and len(available) == 1:
         cid, path = available[0]
         return path, f"The reference image is a portrait of {cid.replace('-', ' ')}; keep this exact face, hair, and clothing."
-    sheet = build_contact_sheet(available, output_dir / "scenes" / ".sheets" / f"{index:04d}.png")
+
+    tiles: list[tuple[str, Path]] = ([("STYLE REF", prev)] if has_prev else []) + available
+    sheet = build_contact_sheet(tiles, output_dir / "scenes" / ".sheets" / f"{index:04d}.png")
     names = ", ".join(cid.replace("-", " ") for cid, _ in available)
     return sheet, (
-        f"The reference image is a labelled strip of character portraits ({names}); "
-        "use these exact faces, hair, and clothing for the matching characters in the scene."
+        f"{style_note}The remaining panels of the reference image are labelled character "
+        f"portraits ({names}); use these exact faces, hair, and clothing for the matching "
+        "characters in the scene. "
     )
 
 
@@ -226,19 +257,19 @@ def generate_scene_images(output_dir: Path) -> list[Path]:
         if dest.exists() and dest.stat().st_size >= 1000:
             written.append(dest)
             continue
-        ref, ref_note = _scene_ref(output_dir, scene.get("characters", []), index)
+        cond, cond_note = _scene_condition(output_dir, scene.get("characters", []), index)
         prompt = scene["prompt"]
-        if ref_note:
-            prompt = f"{ref_note} Scene: {prompt}"
+        if cond_note:
+            prompt = f"{cond_note}Scene: {prompt}"
         prompt = f"{prompt}{RESTRAINT}"
-        print(f"  scene {index + 1}/{len(scenes)} (chars: {','.join(scene.get('characters', [])) or 'none'})")
+        print(f"  scene {index + 1}/{len(scenes)} (chars: {','.join(scene.get('characters', [])) or 'none'}, chain: {'yes' if index > 0 else 'first'})")
         qwen_image_to_file(
             prompt,
             dest,
             SCENE_WIDTH,
             SCENE_HEIGHT,
             seed=2000 + index,
-            ref_image=ref,
+            ref_image=cond,
             why=f"scene {index} {scene.get('text_excerpt', '')[:60]}",
         )
         written.append(dest)

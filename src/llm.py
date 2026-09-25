@@ -28,6 +28,10 @@ import urllib.request
 LLM_HOST = os.environ.get("BOOK_LLM_HOST", "http://10.0.0.254:8400").rstrip("/")
 LLM_MODEL = os.environ.get("BOOK_LLM_MODEL", "local-coder")
 MAX_CONCURRENT = int(os.environ.get("BOOK_LLM_CONCURRENCY", "4"))
+# ollama = native Ollama /api/chat with think=false (no reasoning-field token
+# burn — the OpenAI-compat shim ignores think and reasoning eats max_tokens);
+# anything else = OpenAI-compatible /v1/chat/completions (arbiter).
+LLM_STYLE = os.environ.get("BOOK_LLM_STYLE", "openai").lower()
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
@@ -51,29 +55,45 @@ def ask_sync(
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-    payload = json.dumps(
-        {
-            "model": LLM_MODEL,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-    ).encode("utf-8")
+    if LLM_STYLE == "ollama":
+        url = f"{LLM_HOST}/api/chat"
+        payload = json.dumps(
+            {
+                "model": LLM_MODEL,
+                "messages": messages,
+                "think": False,
+                "stream": False,
+                "options": {"temperature": temperature, "num_predict": max_tokens},
+            }
+        ).encode("utf-8")
+    else:
+        url = f"{LLM_HOST}/v1/chat/completions"
+        payload = json.dumps(
+            {
+                "model": LLM_MODEL,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+        ).encode("utf-8")
 
     attempt = 0
     while True:
         attempt += 1
         try:
             req = urllib.request.Request(
-                f"{LLM_HOST}/v1/chat/completions",
+                url,
                 data=payload,
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            choices = data.get("choices", []) or []
-            content = (choices[0].get("message", {}) if choices else {}).get("content", "") or ""
+            if LLM_STYLE == "ollama":
+                content = (data.get("message") or {}).get("content", "") or ""
+            else:
+                choices = data.get("choices", []) or []
+                content = (choices[0].get("message", {}) if choices else {}).get("content", "") or ""
             content = strip_think(content)
             if content.strip():
                 return content.strip()

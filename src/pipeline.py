@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -58,11 +59,45 @@ def print_skip(message: str) -> None:
 
 
 # ##################################################################
+# acquire lock
+# single-runner guard: exactly one pipeline may work a project at a time.
+# Two concurrent runs race the same script/audio files and triple the LLM
+# queue (this actually happened — degraded scripts, cancelled TTS batches).
+def acquire_lock(output_dir: Path) -> Path:
+    lock = output_dir / ".pipeline.lock"
+    if lock.exists():
+        try:
+            pid = int(lock.read_text().strip())
+            os.kill(pid, 0)  # alive?
+            raise SystemExit(f"pipeline already running for {output_dir.name} (pid {pid}) — refusing to start a second")
+        except ProcessLookupError:
+            pass  # stale lock from a dead run
+        except ValueError:
+            pass
+    lock.write_text(str(os.getpid()), encoding="utf-8")
+    return lock
+
+
+# ##################################################################
+# release lock
+def release_lock(lock: Path) -> None:
+    lock.unlink(missing_ok=True)
+
+
+# ##################################################################
 # run pipeline
 # execute the full book-reader pipeline
 def run_pipeline(epub_path: Path) -> Path:
     output_dir = get_output_dir(epub_path)
     output_dir.mkdir(parents=True, exist_ok=True)
+    lock = acquire_lock(output_dir)
+    try:
+        return _run_pipeline_locked(epub_path, output_dir)
+    finally:
+        release_lock(lock)
+
+
+def _run_pipeline_locked(epub_path: Path, output_dir: Path) -> Path:
     print(f"{Fore.CYAN}Book Reader Pipeline{Style.RESET_ALL}")
     print(f"  Input: {epub_path}")
     print(f"  Output: {output_dir}")

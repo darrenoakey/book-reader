@@ -175,3 +175,21 @@ M4B assembly auto-numbers duplicate titles: "Interlude" → "Interlude 1", "Inte
   `data`/`result_path` shapes are also handled (movie_images._fetch_image).
 - **Contact sheets**: qwen-image takes ONE condition image, so multi-character
   scenes pass a labelled portrait strip (movie_images.build_contact_sheet).
+
+## Operational gotchas (2026-09-26)
+
+- **Exactly ONE pipeline run per project.** `run_pipeline` takes
+  `.pipeline.lock` (pid-checked). Concurrent runs race script/audio files and
+  multiply LLM queue load — this degraded real output once. Never launch a
+  second `./run create` on the same story; check `ps` first.
+- **Long pipeline runs MUST be detached** (`nohup /tmp/run.sh > log 2>&1 &
+  disown`) — the agentd3 daemon restarts kill foreground tool calls, and a
+  killed run leaves partial artifacts (which are resumable, but scripts with
+  LLM-fallback chunks must be deleted and regenerated).
+- **LLM backends**: default arbiter `local-coder` (OpenAI-compat). If the
+  arbiter chat fleet is congested (persistent EMPTY completions — the server
+  answers 200 with no content under queue timeouts), fall back to direct
+  Ollama: `BOOK_LLM_STYLE=ollama BOOK_LLM_HOST=http://10.0.0.42:11434
+  BOOK_LLM_MODEL=qwen3.6:35b-a3b`. The OpenAI-compat shim on Ollama IGNORES
+  `think:false` and burns max_tokens on a separate reasoning field — always
+  use the native `/api/chat` style for thinking models.

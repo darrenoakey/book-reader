@@ -77,9 +77,14 @@ def ask_sync(
             content = strip_think(content)
             if content.strip():
                 return content.strip()
-            # Empty completion — retry a few times then give back empty.
-            if attempt >= 5:
-                return ""
+            # Empty completion — the server answered 200 with no content
+            # (model timeout under queue congestion). Never silently return
+            # "": downstream steps would fall back to all-narrator output and
+            # quietly lose every dialogue line. Retry forever with backoff,
+            # same as transport errors — the pipeline must not lose work.
+            wait = min(5 * attempt, 60)
+            print(f"  llm ({LLM_MODEL}) attempt {attempt} returned EMPTY — retry in {wait}s")
+            time.sleep(wait)
         except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError) as e:
             wait = min(5 * attempt, 60)
             print(f"  llm ({LLM_MODEL}) attempt {attempt} failed: {e} — retry in {wait}s")

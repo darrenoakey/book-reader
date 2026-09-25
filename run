@@ -110,6 +110,68 @@ def command_step(args: argparse.Namespace) -> int:
     return run_venv(cmd)
 
 
+INSPECT_SERVICE = "book-reader-inspect"
+INSPECT_PORT = 8769
+
+
+# ##################################################################
+# command serve
+# run the inspect web UI in the venv
+def command_serve(args: argparse.Namespace) -> int:
+    ensure_venv()
+    code = f"from src.server import serve; serve(host='{args.host}', port={args.port})"
+    return run_venv([str(VENV_PYTHON), "-c", code])
+
+
+# ##################################################################
+# command deploy
+# register the inspect UI as an auto service and verify it answers
+def command_deploy(args: argparse.Namespace) -> int:
+    command = (
+        "sh -lc 'export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin; "
+        f"cd {PROJECT_ROOT} && exec ./run serve --port {INSPECT_PORT}'"
+    )
+    rc = subprocess.call(
+        [
+            "auto", "-q", "update", INSPECT_SERVICE,
+            "--command", command,
+            "--port", str(INSPECT_PORT),
+            "--workdir", str(PROJECT_ROOT),
+        ]
+    )
+    if rc != 0:
+        # first deploy: the service doesn't exist yet — add it (add takes the
+        # command positionally and has no --workdir: the sh -lc wrapper cds)
+        rc = subprocess.call(
+            [
+                "auto", "-q", "add", INSPECT_SERVICE,
+                command,
+                "--port", str(INSPECT_PORT),
+            ]
+        )
+    if rc != 0:
+        return rc
+    subprocess.call(["auto", "-q", "restart", INSPECT_SERVICE])
+    return command_health(args)
+
+
+# ##################################################################
+# command health
+# probe the live inspect UI
+def command_health(args: argparse.Namespace) -> int:
+    import json as _json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{INSPECT_PORT}/api/projects", timeout=10) as resp:
+            projects = _json.loads(resp.read())
+        print(f"book-reader-inspect OK: {len(projects)} projects at http://127.0.0.1:{INSPECT_PORT}")
+        return 0
+    except OSError as e:
+        print(f"book-reader-inspect UNHEALTHY: {e}")
+        return 1
+
+
 # ##################################################################
 # main
 # parse arguments and dispatch to the appropriate command handler
@@ -145,6 +207,17 @@ def main(argv: list[str]) -> int:
     p_step.add_argument("epub", help="Path to EPUB file (or .md/.txt story)")
     p_step.add_argument("--max-chapters", type=int, default=0, help="Limit to first N chapters")
     p_step.set_defaults(func=command_step)
+
+    p_serve = sub.add_parser("serve", help="Run the inspect web UI")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=INSPECT_PORT)
+    p_serve.set_defaults(func=command_serve)
+
+    p_deploy = sub.add_parser("deploy", help="Register the inspect UI as an auto service")
+    p_deploy.set_defaults(func=command_deploy)
+
+    p_health = sub.add_parser("health", help="Probe the live inspect UI")
+    p_health.set_defaults(func=command_health)
 
     args = parser.parse_args(argv)
     return args.func(args)

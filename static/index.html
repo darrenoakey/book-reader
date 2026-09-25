@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Book Reader</title>
+<link rel="stylesheet" href="{{ static:app.css }}">
+</head>
+<body>
+<header>
+  <h1>📖→🎬 Book Reader</h1>
+  <p class="tagline">Stories become audiobooks become films</p>
+</header>
+<main>
+  <aside id="project-list">
+    <h2>Projects</h2>
+    <div id="projects"></div>
+  </aside>
+  <section id="detail">
+    <div id="empty-state">Select a project</div>
+    <div id="project-detail" hidden>
+      <h2 id="d-title"></h2>
+      <div id="d-progress"></div>
+      <div id="d-movie"></div>
+      <div id="d-audiobook"></div>
+      <h3>Characters &amp; Voices</h3>
+      <div id="d-characters" class="card-grid"></div>
+      <h3>Storyboard</h3>
+      <p id="d-style" class="style-note"></p>
+      <div id="d-scenes" class="filmstrip"></div>
+    </div>
+  </section>
+</main>
+<script src="{{ static:app.js }}"></script>
+</body>
+</html>

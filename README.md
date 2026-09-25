@@ -1,139 +1,63 @@
 ![](banner.jpg)
 
-```markdown
 # Book Reader
 
-Convert EPUB books into M4B audiobooks with distinct voices for each character using AI-powered voice synthesis.
+Turn a book or short story into an **audiobook movie**: a multi-voice narrated
+production where every character speaks in their own AI-designed voice, and the
+narration plays over cinematic illustrations that slowly pan and zoom — an
+audiobook you can watch.
 
-## Overview
+## What it does
 
-Book Reader is a command-line pipeline that takes an EPUB file and produces a fully chaptered M4B audiobook. Each character in the book is assigned a unique synthesised voice. The output includes chapter markers, a cover image, and chime announcements between chapters.
+Give it an EPUB (or a plain `.md` / `.txt` story) and it produces:
 
-## Requirements
+- **`*.m4b`** — a chaptered audiobook. A narrator voice reads the prose; every
+  character's dialogue is spoken in that character's own voice (Breeze TTS 2,
+  voice-designed from the character's description and then cloned line-by-line
+  for perfect consistency).
+- **`movie/movie.mp4`** — the audiobook plus a moving picture track: every ~30
+  seconds of narration gets its own cinematic illustration (Qwen-Image-2.1),
+  conditioned on per-character reference portraits so faces stay consistent,
+  rendered with slow Ken Burns pans and zooms so the picture never sits still.
 
-- Python 3.10+
-- `ffmpeg` available on your PATH
-- A running TTS (text-to-speech) service accessible via the `tts` CLI
-- An Anthropic API key set in your environment (`ANTHROPIC_API_KEY`)
-
-## Installation
-
-Clone the repository and install dependencies into a local virtual environment:
-
-```bash
-git clone <repo-url>
-cd book-reader
-./run install
-```
-
-This creates a `.venv` directory and installs all Python dependencies automatically.
-
-## Pipeline Steps
-
-The conversion process runs as a sequence of steps:
+## Pipeline
 
 | Step | Name | Description |
 |------|------|-------------|
-| 1 | `extract` | Extracts chapter text from the EPUB file |
-| 2 | `characters` | Analyses each chapter to identify characters |
-| 3 | `voices` | Generates voice descriptions for each character |
-| 4 | `clone` | Clones TTS voices from descriptions |
-| 5 | `scripts` | Converts chapters into speaker-attributed dialogue scripts |
-| 6 | `audio` | Synthesises audio for each chapter |
-| 7 | `m4b` | Assembles all audio into a final M4B file with chapter markers |
+| 1 | `extract` | EPUB → chapter text (or chapter-chunk a .md/.txt story) |
+| 2 | `characters` | LLM identifies every character + physical description |
+| 3 | `voices` | LLM writes a voice description per character |
+| 4 | `clone` | Breeze voice-designs a reference clip per character |
+| 5 | `scripts` | LLM converts chapters to speaker-attributed dialogue |
+| 6 | `audio` | Breeze clones each line (batched), concatenated per chapter |
+| 7 | `m4b` | Chaptered M4B with cover + chapter chimes |
+| 8 | `storyboard` | ~30s scenes aligned to line boundaries + image prompts |
+| 9 | `refimages` | Qwen-Image-2.1 identity portrait per character |
+| 10 | `sceneimages` | Qwen-Image-2.1 16:9 still per scene, character-conditioned |
+| 11 | `movie` | Ken Burns pan/zoom segments, frame-exact mux with narration |
 
 ## Usage
 
-### Convert an entire book
-
 ```bash
-./run create "My Book.epub"
+./run install                     # one-time: create venv + deps
+./run create book.epub            # full pipeline (EPUB or .md/.txt)
+./run step audio book.epub        # run a single step
+./run serve                       # inspect UI
+./run deploy                      # register the UI as an auto service (port 8769)
+./run test <target>               # run tests
+./run lint                        # ruff
 ```
 
-### Run a single pipeline step
+## The inspect UI
 
-```bash
-./run step <step-name> "My Book.epub"
-```
+`./run deploy` registers `book-reader-inspect` on http://127.0.0.1:8769 —
+projects, pipeline progress, per-character voice clips and portraits, the
+storyboard filmstrip, and inline playback of the audiobook and movie.
 
-### Convert only the first N chapters
+## Infrastructure
 
-```bash
-./run step audio "My Book.epub" --max-chapters 6
-./run step m4b   "My Book.epub" --max-chapters 6
-```
-
-### Run tests
-
-```bash
-./run test src/
-./run test src/epub_extract_test.py::test_normalize_name
-```
-
-### Lint the source
-
-```bash
-./run lint
-```
-
-### Run the full quality gate suite
-
-```bash
-./run check
-```
-
-## Examples
-
-**Full conversion of a single EPUB:**
-
-```bash
-./run create "Scott Lynch - The Lies of Locke Lamora.epub"
-```
-
-Output is written to `output/Scott Lynch - The Lies of Locke Lamora/`.
-
-**Previewing the first five chapters before committing to a full run:**
-
-```bash
-./run step audio "Scott Lynch - The Lies of Locke Lamora.epub" --max-chapters 5
-./run step m4b   "Scott Lynch - The Lies of Locke Lamora.epub" --max-chapters 5
-```
-
-**Re-running the M4B assembly step after changing chapter count:**
-
-Delete the existing `.m4b` file first, then re-run:
-
-```bash
-rm "output/Scott Lynch - The Lies of Locke Lamora/"*.m4b
-./run step m4b "Scott Lynch - The Lies of Locke Lamora.epub"
-```
-
-**Resuming a partially completed pipeline:**
-
-Each step tracks its own progress. Simply run the step you want to resume from — completed work is not repeated.
-
-```bash
-./run step audio "My Book.epub"
-```
-
-## Output Structure
-
-```
-output/
-└── <epub-stem>/
-    ├── state.jsonl          # Append-only progress log
-    ├── characters.json      # Character profiles
-    ├── voices.json          # TTS voice assignments
-    ├── cover.jpeg           # Cover art extracted from EPUB
-    ├── chapters/            # Extracted chapter text files
-    ├── script/              # Speaker-attributed JSONL scripts
-    ├── audio/               # Synthesised WAV files per chapter
-    └── <stem>.m4b           # Final audiobook
-```
-
-## Notes
-
-- The M4B assembly step is skipped if the output `.m4b` already exists. Delete it manually to force a rebuild.
-- All pipeline steps are idempotent — re-running a completed step is safe.
-- Progress is tracked in `state.jsonl`; individual steps check this before doing work.
-```
+- **TTS**: Breeze TTS 2 via the arbiter `tts-breeze` adapter on spark
+  (10.0.0.254:8400). Lines are batched 40-per-job and sliced back apart.
+- **Images**: arbiter `qwen-image` (Qwen-Image-2.1, owner-sanctioned).
+- **LLM**: arbiter OpenAI-compatible chat (`local-coder`).
+- `BOOK_TTS_ENGINE=breeze|kokoro|qwen` selects the TTS engine (default breeze).

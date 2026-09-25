@@ -1,18 +1,37 @@
 # Book Reader
 
-EPUB to M4B audiobook converter with multi-character voice synthesis.
+EPUB (or .md/.txt story) to **audiobook movie**: multi-character M4B audiobook
+plus a Ken Burns video of scene illustrations. Narrator narrates; every
+character speaks their own dialogue in a voice designed for them.
 
 ## Pipeline Steps
 
-1. `extract` - EPUB to chapter text files
+1. `extract` - EPUB to chapter text files (or text_ingest chunks .md/.txt at
+   paragraph boundaries, ~900 words/chapter)
 2. `characters` - per-chapter LLM analysis → characters.json
 3. `voices_desc` - single-call LLM → voices.json (voice descriptions)
 4. `voices` - prepare per-character voices for the selected TTS engine
-   (kokoro: LLM maps each description → kokoro voice → kokoro_voices.json;
-   qwen: tts-design a reference WAV per character → voices/*.wav)
+   (breeze: voice-design a reference clip per character → voices/*.wav +
+   breeze_voices.json; kokoro: LLM maps each description → kokoro voice →
+   kokoro_voices.json; qwen: tts-design a reference WAV per character)
 5. `scripts` - LLM → speaker-attributed JSONL
-6. `audio` - selected TTS engine per line, ffmpeg concat → chapter WAVs
+6. `audio` - selected TTS engine per line, ffmpeg concat → chapter WAVs +
+   per-line `.timeline.json` (the movie storyboard aligns to these)
 7. `m4b` - ffmpeg assembly → M4B with chapters
+8. `storyboard` - ~30s scenes snapped to line boundaries + LLM image prompts →
+   storyboard.json (style, appearances, scenes)
+9. `refimages` - qwen-image identity portrait per visual character → refs/
+10. `sceneimages` - qwen-image 1920x1088 still per scene → scenes/, conditioned
+    on the scene's character portraits (contact sheet when several)
+11. `movie` - Ken Burns pan/zoom segments (frame-exact vs audio) →
+    movie/movie.mp4
+
+## Inspect UI
+
+`./run serve` / `./run deploy` (auto service `book-reader-inspect`, port 8769):
+projects, step progress, character portraits + voice clips, storyboard
+filmstrip, audiobook + movie playback. Stdlib HTTP server, hashed static
+assets, Range-aware /media for AV seeking (src/server.py + static/).
 
 ## LLM backend (all LLM work)
 
@@ -30,8 +49,15 @@ different event loop" on the second step.
 
 ## TTS engines (pluggable)
 
-`src/tts_engine.py` dispatches on env `BOOK_TTS_ENGINE` (default `kokoro`):
+`src/tts_engine.py` dispatches on env `BOOK_TTS_ENGINE` (default `breeze`):
 
+- **breeze** — Breeze TTS 2 via arbiter `tts-breeze`. Voices: voice-DESIGN one
+  short reference clip per character (instruction = voices.json description,
+  cfg_scale 4) saved to voices/<id>.wav + breeze_voices.json. Audio: every
+  line CLONES that clip (ref_audio_file + exact ref_text), so timbre is stable
+  across the whole book. Lines are batched 40/job (`items`) and sliced back
+  apart via `item_samples` — Breeze is near-realtime in eager mode, so a batch
+  job takes minutes, not the scheduler-overhead-dominated one-job-per-line.
 - **kokoro** — Kokoro-82M via arbiter `tts-kokoro` (new adapter on spark).
   Hundreds of times faster than qwen3-tts. No cloning: each character is mapped
   by the LLM to a kokoro voice (gender/accent match, optional 2-voice blend,
@@ -54,8 +80,14 @@ arbiter-proxy/client services (8399/8401) are not required.
 - `output/<epub-stem>/state.jsonl` - Append-only progress tracking
 - `output/<epub-stem>/characters.json` - Character bios (physical/voice focus)
 - `output/<epub-stem>/voices.json` - TTS voice descriptions
+- `output/<epub-stem>/breeze_voices.json` - per-character breeze ref clip+text
 - `output/<epub-stem>/kokoro_voices.json` - per-character kokoro voice + speed
 - `output/<epub-stem>/script/*.jsonl` - Speaker-attributed lines
+- `output/<epub-stem>/audio/*.timeline.json` - per-line start/end seconds
+- `output/<epub-stem>/storyboard.json` - ~30s scenes with image prompts
+- `output/<epub-stem>/refs/*.png` - character identity portraits (qwen-image)
+- `output/<epub-stem>/scenes/*.png` - 1920x1088 scene stills (qwen-image)
+- `output/<epub-stem>/movie/movie.mp4` - the audiobook movie
 
 ## Gotchas
 
@@ -119,9 +151,27 @@ M4B assembly auto-numbers duplicate titles: "Interlude" → "Interlude 1", "Inte
 ## Commands
 
 ```bash
-./run create book.epub                       # Full pipeline
-./run step <step> book.epub                  # Single step
+./run create book.epub                       # Full pipeline (EPUB or .md/.txt)
+./run step <step> book.epub                  # Single step (extract…movie)
 ./run step audio book.epub --max-chapters 6  # First 6 chapters only
-./run step m4b book.epub --max-chapters 6    # M4B from first 6 chapters
+./run serve                                  # Inspect UI (port 8769)
+./run deploy                                 # Register UI with auto
+./run health                                 # Probe the live UI
 ./run test <target>                          # Run tests
 ```
+
+## Movie assembly gotchas
+
+- **Frame-exact A/V**: total video frames = round(audio_seconds * 30); the last
+  scene absorbs the rounding remainder. Never use `-shortest` (it drops video
+  frames); the video track is authoritative.
+- **Scene offsets** are global seconds across the concatenated chapter WAVs in
+  sorted-timeline order — the movie audio must be exactly that concatenation
+  (no chimes/announcements; those exist only in the M4B).
+- **zoompan**: stills are upscaled to 2880x1620 first so pans have travel room;
+  expressions use `on/(frames-1)` so moves hit their endpoint exactly.
+- **qwen-image result is file-only** (`{"file": "result.png"}`) — resolve via
+  `local_result("/mnt/arbiter-store/output/jobs/<id>/result.png")`; inline
+  `data`/`result_path` shapes are also handled (movie_images._fetch_image).
+- **Contact sheets**: qwen-image takes ONE condition image, so multi-character
+  scenes pass a labelled portrait strip (movie_images.build_contact_sheet).

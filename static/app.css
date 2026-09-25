@@ -1,0 +1,127 @@
+:root {
+  --bg: #0d1017;
+  --bg-raised: #161b26;
+  --bg-card: #1c2331;
+  --edge: #2a3347;
+  --text: #e8ecf4;
+  --text-dim: #97a1b5;
+  --accent: #e8a13c;
+  --accent-2: #6ea8fe;
+  --good: #4cc38a;
+  --radius: 14px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+header {
+  padding: 28px 36px 20px;
+  background: linear-gradient(120deg, #141a28 0%, #1d2434 55%, #2b2138 100%);
+  border-bottom: 1px solid var(--edge);
+}
+header h1 { margin: 0; font-size: 26px; letter-spacing: 0.4px; }
+header .tagline { margin: 4px 0 0; color: var(--text-dim); font-size: 13px; }
+
+main {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 0;
+  min-height: calc(100vh - 95px);
+}
+
+#project-list {
+  border-right: 1px solid var(--edge);
+  padding: 20px;
+  background: var(--bg-raised);
+}
+#project-list h2 { margin: 0 0 14px; font-size: 14px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--text-dim); }
+
+.project-card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: var(--bg-card);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 12px;
+  cursor: pointer;
+  color: var(--text);
+  transition: border-color 0.15s, transform 0.15s;
+}
+.project-card:hover { border-color: var(--accent-2); transform: translateY(-1px); }
+.project-card.active { border-color: var(--accent); }
+.project-card .name { font-weight: 600; font-size: 14px; margin-bottom: 6px; }
+.project-card .meta { font-size: 12px; color: var(--text-dim); display: flex; gap: 10px; flex-wrap: wrap; }
+
+.progress-track {
+  height: 5px; border-radius: 3px; background: #0a0d13; margin-top: 10px; overflow: hidden;
+}
+.progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent-2), var(--accent)); }
+
+#detail { padding: 28px 36px; overflow-x: hidden; }
+#empty-state { color: var(--text-dim); padding: 60px 0; text-align: center; font-size: 16px; }
+#d-title { margin: 0 0 14px; font-size: 22px; }
+
+.step-pills { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 22px; }
+.pill {
+  font-size: 11px; padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--edge); color: var(--text-dim); background: var(--bg-card);
+}
+.pill.done { color: #0d1017; background: var(--good); border-color: var(--good); font-weight: 600; }
+.pill.next { color: #0d1017; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+
+video, audio { width: 100%; border-radius: var(--radius); outline: none; }
+video { background: #000; box-shadow: 0 12px 40px rgba(0,0,0,0.5); }
+.media-block { margin-bottom: 26px; }
+.media-block h3, #project-detail h3 {
+  font-size: 13px; text-transform: uppercase; letter-spacing: 1.2px;
+  color: var(--text-dim); margin: 26px 0 12px;
+}
+
+.card-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px;
+}
+.character-card {
+  background: var(--bg-card); border: 1px solid var(--edge);
+  border-radius: var(--radius); overflow: hidden;
+}
+.character-card img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; background: #0a0d13; }
+.character-card .body { padding: 12px 14px; }
+.character-card .cname { font-weight: 700; font-size: 14px; }
+.character-card .cbio { font-size: 12px; color: var(--text-dim); margin: 6px 0 10px; }
+.character-card audio { height: 34px; }
+
+.filmstrip {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px;
+}
+.scene-card {
+  background: var(--bg-card); border: 1px solid var(--edge);
+  border-radius: var(--radius); overflow: hidden;
+}
+.scene-card img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; background: #0a0d13; cursor: zoom-in; }
+.scene-card .body { padding: 10px 12px; }
+.scene-card .time { font-size: 11px; color: var(--accent); font-variant-numeric: tabular-nums; }
+.scene-card .excerpt { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+.scene-card .chars { font-size: 11px; color: var(--accent-2); margin-top: 4px; }
+
+.style-note { color: var(--text-dim); font-size: 13px; font-style: italic; }
+
+#lightbox {
+  position: fixed; inset: 0; background: rgba(5,7,11,0.92);
+  display: flex; align-items: center; justify-content: center; z-index: 50; cursor: zoom-out;
+}
+#lightbox img { max-width: 92vw; max-height: 92vh; border-radius: 8px; }
+
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; }
+  #project-list { border-right: none; border-bottom: 1px solid var(--edge); }
+}

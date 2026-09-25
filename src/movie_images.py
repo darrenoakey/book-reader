@@ -33,7 +33,11 @@ SCENE_HEIGHT = 1088
 REF_SIZE = 1024
 LABEL_BAND = 56  # px of label strip under each contact-sheet tile
 
-RESTRAINT = " No text, no captions, no watermark, no extra limbs, anatomically correct."
+RESTRAINT = (
+    " No text, no captions, no watermark, no extra limbs, anatomically correct."
+    " Human characters have completely normal human skin — no scales, no reptilian"
+    " patches, no dragon features — unless the character description explicitly says so."
+)
 
 # Spark's /mnt/arbiter-store is this Mac's /Volumes/ssd_4/arbiter (CIFS).
 _SPARK_PREFIX = "/mnt/arbiter-store/"
@@ -178,7 +182,7 @@ def generate_character_refs(output_dir: Path) -> list[Path]:
         name = names.get(cid, cid.replace("-", " "))
         prompt = (
             f"Head-and-shoulders character reference portrait of {name}. {appearance}. "
-            f"Facing camera, full face visible, neutral dark background, face large and unmistakable. "
+            f"Facing camera, full face visible, neutral soft-lit background, face large and unmistakable. "
             f"Style: {style}.{RESTRAINT}"
         )
         print(f"  ref {index + 1}/{len(cast)}: {cid}")

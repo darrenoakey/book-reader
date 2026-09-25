@@ -122,7 +122,7 @@ def choose_style(output_dir: Path) -> str:
         sample = p.read_text(encoding="utf-8")[:2000]
         if len(sample.split()) > 100:
             break
-    prompt = f"""You are the art director on an animated film adaptation of this story. Write ONE visual style paragraph (30-50 words) that will be appended to every image-generation prompt so the whole film looks consistent: medium (e.g. painterly digital illustration), palette, lighting, mood, level of detail. Never mention text, captions, or watermarks.
+    prompt = f"""You are the art director on an animated film adaptation of this story. Write ONE visual style paragraph (30-50 words) that will be appended to every image-generation prompt so the whole film looks consistent: medium (e.g. painterly digital illustration), palette, lighting, mood, level of detail. The mood must match the STORY's actual emotional tone (a hopeful adventure is bright and warm; do not default to dark/moody/chiaroscuro). Describe environments and materials only — NEVER mention skin, scales, fur, or body textures (those words leak onto human characters' bodies). Never mention text, captions, or watermarks.
 
 Story sample:
 {sample}
@@ -152,6 +152,10 @@ Characters speaking in this window (show only characters who are actually presen
 {cast_block}
 
 Rules: describe the SCENE (setting, action, composition, lighting, camera framing). Do not mention sound, narration, or dialogue. No text in the image. Show at most the listed characters. If no listed character is present, depict the setting/action alone.
+
+TWO HARD RULES about consistency:
+- Every character you NAME anywhere in the prompt MUST also appear in the "characters" list — the list drives which reference portraits condition the image, so a named-but-unlisted character renders as a random stranger.
+- Wardrobe lock: restate each shown character's clothing from their description and NEVER dress characters in matching/coordinated outfits unless their descriptions say so. A uniform described for ONE character belongs to that character alone.
 
 Output JSON only: {{"prompt": "<60-100 word image prompt>", "characters": ["<char_ids actually shown>"]}}. No markdown."""
     from src.voice_description import parse_json_response

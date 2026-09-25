@@ -37,6 +37,8 @@ RESTRAINT = (
     " No text, no captions, no watermark, no extra limbs, anatomically correct."
     " Human characters have completely normal human skin — no scales, no reptilian"
     " patches, no dragon features — unless the character description explicitly says so."
+    " Output ONE single continuous cinematic scene — never panels, split screen,"
+    " collage, borders, or labels."
 )
 
 # Spark's /mnt/arbiter-store is this Mac's /Volumes/ssd_4/arbiter (CIFS).
@@ -131,26 +133,40 @@ def qwen_image_to_file(
 
 
 # ##################################################################
-# build contact sheet
-# compose labelled reference images side by side: n tiles of tile×tile plus a
-# LABEL_BAND strip underneath with each label. Non-square inputs are
-# centre-cropped to square (the previous-scene style tile is 16:9).
+# build reference sheet
+# compose the condition image for a scene job as a CHARACTER REFERENCE SHEET:
+# dark canvas, a title band that declares the image's purpose, and labelled
+# portrait tiles with generous margins. A bare side-by-side strip reads as a
+# comic page and the model reproduces the panels in the scene (observed: a
+# 3-tile strip became a 3-panel triptych); the reference-sheet framing tells
+# it "this is lookup material, not a layout".
+TITLE_BAND = 72
+_MARGIN = 28
+_GAP = 20
+
+
 def build_contact_sheet(items: list[tuple[str, Path]], dest: Path, tile: int = REF_SIZE // 2) -> Path:
     if not items:
-        raise ValueError("contact sheet needs at least one portrait")
+        raise ValueError("reference sheet needs at least one image")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    sheet = Image.new("RGB", (tile * len(items), tile + LABEL_BAND), (18, 18, 24))
+    width = _MARGIN * 2 + tile * len(items) + _GAP * (len(items) - 1)
+    height = TITLE_BAND + tile + LABEL_BAND + _MARGIN * 2
+    sheet = Image.new("RGB", (width, height), (24, 24, 32))
     draw = ImageDraw.Draw(sheet)
+    title = "CHARACTER REFERENCE SHEET - portraits for likeness only - NOT a scene, NOT a layout"
+    tb = draw.textbbox((0, 0), title)
+    draw.text(((width - (tb[2] - tb[0])) // 2, (TITLE_BAND - (tb[3] - tb[1])) // 2), title, fill=(200, 200, 210))
     for i, (name, path) in enumerate(items):
         img = Image.open(path).convert("RGB")
         if img.width != img.height:  # centre-crop to square
             side = min(img.width, img.height)
             img = img.crop(((img.width - side) // 2, (img.height - side) // 2, (img.width + side) // 2, (img.height + side) // 2))
-        sheet.paste(img.resize((tile, tile), Image.LANCZOS), (i * tile, 0))
+        x0 = _MARGIN + i * (tile + _GAP)
+        sheet.paste(img.resize((tile, tile), Image.LANCZOS), (x0, TITLE_BAND))
         label = name.replace("-", " ").title()
         bbox = draw.textbbox((0, 0), label)
-        x = i * tile + (tile - (bbox[2] - bbox[0])) // 2
-        draw.text((x, tile + (LABEL_BAND - (bbox[3] - bbox[1])) // 2), label, fill=(235, 235, 235))
+        lx = x0 + (tile - (bbox[2] - bbox[0])) // 2
+        draw.text((lx, TITLE_BAND + tile + (LABEL_BAND - (bbox[3] - bbox[1])) // 2), label, fill=(235, 235, 235))
     sheet.save(dest, format="PNG")
     return dest
 
@@ -214,7 +230,7 @@ def _scene_condition(output_dir: Path, characters: list[str], index: int) -> tup
     has_prev = index > 0 and prev.exists() and prev.stat().st_size >= 1000
 
     style_note = (
-        "The FIRST panel of the reference image (labelled STYLE REF) is the previous scene: "
+        "The reference sheet's FIRST tile (labelled STYLE REF) is the previous scene: "
         "match its art style, palette, and lighting EXACTLY — same medium, same rendering. "
         "Paint a NEW scene, do not copy its composition. "
     ) if has_prev else ""
@@ -236,9 +252,9 @@ def _scene_condition(output_dir: Path, characters: list[str], index: int) -> tup
     sheet = build_contact_sheet(tiles, output_dir / "scenes" / ".sheets" / f"{index:04d}.png")
     names = ", ".join(cid.replace("-", " ") for cid, _ in available)
     return sheet, (
-        f"{style_note}The remaining panels of the reference image are labelled character "
-        f"portraits ({names}); use these exact faces, hair, and clothing for the matching "
-        "characters in the scene. "
+        f"{style_note}The reference image is a CHARACTER REFERENCE SHEET: separate labelled "
+        f"portrait panels ({names}) for likeness lookup only. Do NOT reproduce its layout — "
+        "paint ONE continuous cinematic scene using these exact faces, hair, and clothing. "
     )
 
 

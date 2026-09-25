@@ -31,10 +31,12 @@ def test_contact_sheet() -> None:
         b = _make_portrait(tmp / "beterli.png", (60, 80, 200))
         sheet = build_contact_sheet([("keevan", a), ("beterli", b)], tmp / "sheet.png", tile=256)
         img = Image.open(sheet)
-        assert img.size == (512, 256 + 56)
-        # left tile is keevan's color, right tile beterli's
-        assert img.getpixel((128, 128)) == (200, 80, 60)
-        assert img.getpixel((384, 128)) == (60, 80, 200)
+        # reference-sheet layout: margins, title band, label band
+        assert img.size == (2 * 28 + 2 * 256 + 20, 72 + 256 + 56 + 2 * 28)
+        # left tile is keevan's color, right tile beterli's (tile origins at
+        # (28, 72) and (28+256+20, 72); sample each tile's centre)
+        assert img.getpixel((28 + 128, 72 + 128)) == (200, 80, 60)
+        assert img.getpixel((28 + 256 + 20 + 128, 72 + 128)) == (60, 80, 200)
 
 
 # ##################################################################

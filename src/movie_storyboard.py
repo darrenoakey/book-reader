@@ -72,6 +72,15 @@ def window_lines(lines: list[dict], target_seconds: float = TARGET_SECONDS) -> l
             scenes[-1].extend(current)  # tail too short — fold into previous
         else:
             scenes.append(current)
+    def _mid_text(s: list[dict]) -> str:
+        # The still hangs on screen for the WHOLE window, so it must depict
+        # what is being said at the window's temporal MIDPOINT (a 5s scene is
+        # judged at 2.5s), not the opening or closing beat.
+        mid = (s[0]["start"] + s[-1]["end"]) / 2
+        line = min(s, key=lambda l: min(abs(mid - l["start"]), abs(mid - l["end"]))
+                   if not (l["start"] <= mid <= l["end"]) else 0.0)
+        return line["text"]
+
     return [
         {
             "index": i,
@@ -79,6 +88,7 @@ def window_lines(lines: list[dict], target_seconds: float = TARGET_SECONDS) -> l
             "end": round(s[-1]["end"], 3),
             "speakers": sorted({l["speaker"] for l in s}),
             "text": " ".join(l["text"] for l in s),
+            "mid_text": _mid_text(s),
         }
         for i, s in enumerate(scenes)
     ]
@@ -161,7 +171,10 @@ def _scene_prompt(scene: dict, style: str, appearances: dict, title: str) -> dic
     cast_block = "\n".join(cast_notes) or "(no named characters speak in this window)"
     prompt = f"""You are the storyboard artist on an animated film of "{title}". Write an image prompt for ONE cinematic 16:9 still illustrating this {scene['end'] - scene['start']:.0f}-second moment of the story.
 
-Spoken text during the window:
+The still stays on screen for the whole window, so it MUST depict the window's temporal midpoint. Illustrate THIS moment:
+{scene.get('mid_text') or scene['text'][:400]}
+
+Full spoken text during the window (context only — the midpoint moment above is the subject):
 {scene['text'][:1200]}
 
 Characters speaking in this window (show only characters who are actually present in the action; use these exact visual descriptions if you show them):

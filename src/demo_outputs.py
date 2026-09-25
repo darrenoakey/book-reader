@@ -43,9 +43,9 @@ has a weakness for fortune tellers."
 
 
 def print_section(title: str) -> None:
-    print(f"\n{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
+    print(f"\n{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}")
     print(f"{Fore.CYAN}{title}{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
+    print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}\n")
 
 
 def main() -> None:
@@ -97,7 +97,7 @@ def main() -> None:
         lines = script_path.read_text().strip().split("\n")
         for i, line in enumerate(lines[:15]):  # Show first 15 lines
             entry = json.loads(line)
-            speaker = list(entry.keys())[0]
+            speaker = next(iter(entry.keys()))
             text = entry[speaker][:80]
             if len(entry[speaker]) > 80:
                 text += "..."

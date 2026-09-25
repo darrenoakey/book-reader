@@ -16,12 +16,9 @@ def test_generate_voices_real() -> None:
         characters = {
             "john": {
                 "name": "John",
-                "bio": "A tall man in his forties with dark hair. Speaks slowly and thoughtfully."
+                "bio": "A tall man in his forties with dark hair. Speaks slowly and thoughtfully.",
             },
-            "narrator": {
-                "name": "Narrator",
-                "bio": "An authoritative but warm narrator for a family drama novel."
-            }
+            "narrator": {"name": "Narrator", "bio": "An authoritative but warm narrator for a family drama novel."},
         }
         characters_path = output_dir / "characters.json"
         characters_path.write_text(json.dumps(characters), encoding="utf-8")

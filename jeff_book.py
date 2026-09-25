@@ -15,6 +15,7 @@ Usage:
     ./run jeff --pages 200
     python jeff_book.py --pages 200 --voice am_michael --speed 1.0
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,8 +34,19 @@ SENTENCES_PER_PARA = (3, 8)
 TARGET_CHAPTERS = 12  # split the whole book into roughly this many chapters
 
 # Terminal punctuation, weighted (period most common, plenty of variety).
-_ENDINGS = ([".", 30], ["!", 14], ["?", 12], ["...", 8], ["?!", 5],
-            ["!!", 4], ["—", 3], ["!?", 3], [".", 20], ["?!?", 2], ["…", 4])
+_ENDINGS = (
+    [".", 30],
+    ["!", 14],
+    ["?", 12],
+    ["...", 8],
+    ["?!", 5],
+    ["!!", 4],
+    ["—", 3],
+    ["!?", 3],
+    [".", 20],
+    ["?!?", 2],
+    ["…", 4],
+)
 # Word forms for "Jeff".
 _FORMS = (["Jeff", 70], ["jeff", 18], ["JEFF", 6], ["Jeff", 6])
 
@@ -49,8 +61,7 @@ def _weighted(rng: random.Random, pairs) -> str:
 # make sentence
 # build one "Jeff" sentence with varied length, casing and punctuation
 def make_sentence(rng: random.Random) -> str:
-    n = rng.choices([1, 2, 3, 4, 5, 6, 7, 8, 10, 12],
-                    weights=[4, 9, 11, 11, 9, 6, 4, 3, 2, 1])[0]
+    n = rng.choices([1, 2, 3, 4, 5, 6, 7, 8, 10, 12], weights=[4, 9, 11, 11, 9, 6, 4, 3, 2, 1])[0]
     words = [_weighted(rng, _FORMS) for _ in range(n)]
     # Capitalise the first word so it reads like a sentence start.
     if words[0] in ("jeff",):
@@ -62,11 +73,11 @@ def make_sentence(rng: random.Random) -> str:
         if not last:
             r = rng.random()
             if r < 0.14:
-                parts[-1] += ","          # comma beat
+                parts[-1] += ","  # comma beat
             elif r < 0.20:
-                parts[-1] += " —"         # em-dash aside
+                parts[-1] += " —"  # em-dash aside
             elif r < 0.24:
-                parts[-1] += "..."        # trailing ellipsis mid-sentence
+                parts[-1] += "..."  # trailing ellipsis mid-sentence
     body = " ".join(parts)
     return body + _weighted(rng, _ENDINGS)
 
@@ -87,8 +98,7 @@ def generate_book(pages: int, seed: int) -> list[tuple[str, list[str]]]:
         chapter_words = 0
         # Fill the chapter to its word target (driven by words, not a para cap).
         while chapter_words < words_per_chapter and words_so_far < target_words:
-            sentences = [make_sentence(rng)
-                         for _ in range(rng.randint(*SENTENCES_PER_PARA))]
+            sentences = [make_sentence(rng) for _ in range(rng.randint(*SENTENCES_PER_PARA))]
             paras.append(" ".join(sentences))
             w = sum(len(s.split()) for s in sentences)
             chapter_words += w
@@ -101,19 +111,19 @@ def generate_book(pages: int, seed: int) -> list[tuple[str, list[str]]]:
 # ##################################################################
 # write epub
 # assemble the chapters into an EPUB (mirrors noveliser's epub_generator)
-def write_epub(title: str, author: str, chapters: list[tuple[str, list[str]]],
-               out_path: Path) -> Path:
+def write_epub(title: str, author: str, chapters: list[tuple[str, list[str]]], out_path: Path) -> Path:
     book = epub.EpubBook()
     book.set_identifier(str(uuid.uuid4()))
     book.set_title(title)
     book.set_language("en")
     book.add_author(author)
 
-    css = ("body{font-family:Georgia,serif;line-height:1.6;margin:2em}"
-           "h1{text-align:center;margin:2em 0 1em;font-size:1.8em}"
-           "p{text-indent:1.5em;margin:.3em 0}p:first-of-type{text-indent:0}")
-    style = epub.EpubItem(uid="style", file_name="style/default.css",
-                          media_type="text/css", content=css.encode())
+    css = (
+        "body{font-family:Georgia,serif;line-height:1.6;margin:2em}"
+        "h1{text-align:center;margin:2em 0 1em;font-size:1.8em}"
+        "p{text-indent:1.5em;margin:.3em 0}p:first-of-type{text-indent:0}"
+    )
+    style = epub.EpubItem(uid="style", file_name="style/default.css", media_type="text/css", content=css.encode())
     book.add_item(style)
 
     spine = ["nav"]
@@ -144,9 +154,10 @@ def write_epub(title: str, author: str, chapters: list[tuple[str, list[str]]],
 # split a paragraph back into individual sentences for per-line synthesis
 def split_sentences(text: str) -> list[str]:
     import re
+
     # Keep terminal punctuation with the sentence; split on whitespace after
     # one or more end marks. Treat em-dash sentences (end "—") too.
-    parts = re.split(r'(?<=[.!?…—])\s+', text.strip())
+    parts = re.split(r"(?<=[.!?…—])\s+", text.strip())
     return [p.strip() for p in parts if p.strip()]
 
 
@@ -155,8 +166,7 @@ def split_sentences(text: str) -> list[str]:
 # build per-chapter (title, line_paths, chapter_wav) + the flat job list for
 # the WHOLE book, so every sentence is synthesised in one batched pass (max
 # pipelining across kokoro's concurrent slots) rather than chapter by chapter
-def plan_chapters(chapters: list[tuple[str, list[str]]], audio_dir: Path,
-                  voice: str, speed: float):
+def plan_chapters(chapters: list[tuple[str, list[str]]], audio_dir: Path, voice: str, speed: float):
     all_jobs: list[dict] = []
     plans: list[tuple[str, list[Path], Path]] = []
     for i, (ch_title, paras) in enumerate(chapters, start=1):
@@ -170,8 +180,7 @@ def plan_chapters(chapters: list[tuple[str, list[str]]], audio_dir: Path,
         for idx, sent in enumerate(sentences):
             p = work / f"{idx:05d}.wav"
             paths.append(p)
-            all_jobs.append({"text": sent, "voice": voice, "speed": speed,
-                             "output_path": p})
+            all_jobs.append({"text": sent, "voice": voice, "speed": speed, "output_path": p})
         plans.append((ch_title, paths, cw))
     return plans, all_jobs
 
@@ -179,9 +188,9 @@ def plan_chapters(chapters: list[tuple[str, list[str]]], audio_dir: Path,
 # ##################################################################
 # assemble m4b
 # concat chapter wavs with short gaps + chapter markers → m4b
-def assemble_m4b(chapter_wavs: list[tuple[str, Path]], title: str, author: str,
-                 out_dir: Path) -> Path:
+def assemble_m4b(chapter_wavs: list[tuple[str, Path]], title: str, author: str, out_dir: Path) -> Path:
     import tempfile
+
     m4b_path = out_dir / f"{title}.m4b"
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -202,11 +211,27 @@ def assemble_m4b(chapter_wavs: list[tuple[str, Path]], title: str, author: str,
         m4b.concatenate_audio_files(interleaved, full)
         meta = work / "meta.txt"
         m4b.write_chapter_metadata(chapter_info, meta)
-        cmd = ["ffmpeg", "-y", "-i", str(full), "-i", str(meta),
-               "-map_metadata", "1",
-               "-metadata", f"title={title}", "-metadata", f"artist={author}",
-               "-metadata", f"album={title}",
-               "-c:a", "aac", "-b:a", "64k", str(m4b_path)]
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(full),
+            "-i",
+            str(meta),
+            "-map_metadata",
+            "1",
+            "-metadata",
+            f"title={title}",
+            "-metadata",
+            f"artist={author}",
+            "-metadata",
+            f"album={title}",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "64k",
+            str(m4b_path),
+        ]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"ffmpeg m4b failed: {r.stderr}")
@@ -235,8 +260,10 @@ def main() -> int:
     chapters = generate_book(args.pages, args.seed)
     total_sentences = sum(len(split_sentences(" ".join(p))) for _, p in chapters)
     total_words = sum(len(" ".join(p).split()) for _, p in chapters)
-    print(f"      {len(chapters)} chapters, {total_sentences} sentences, "
-          f"~{total_words} words (~{total_words // WORDS_PER_PAGE} pages)")
+    print(
+        f"      {len(chapters)} chapters, {total_sentences} sentences, "
+        f"~{total_words} words (~{total_words // WORDS_PER_PAGE} pages)"
+    )
 
     print("[2/4] Writing EPUB...")
     epub_path = write_epub(args.title, args.author, chapters, out_dir / f"{args.title}.epub")

@@ -55,7 +55,7 @@ def command_create(args: argparse.Namespace) -> int:
     ensure_venv()
     epub_path = Path(args.epub).resolve()
     if not epub_path.exists():
-        print(f"Error: EPUB file not found: {epub_path}")
+        print(f"Error: input file not found: {epub_path}")
         return 1
     code = f'''
 from pathlib import Path
@@ -135,8 +135,14 @@ def main(argv: list[str]) -> int:
     p_check.set_defaults(func=command_check)
 
     p_step = sub.add_parser("step", help="Run a single pipeline step")
-    p_step.add_argument("step", choices=["extract", "characters", "voices", "clone", "scripts", "audio", "m4b"])
-    p_step.add_argument("epub", help="Path to EPUB file")
+    p_step.add_argument(
+        "step",
+        choices=[
+            "extract", "characters", "voices", "clone", "scripts", "audio", "m4b",
+            "storyboard", "refimages", "sceneimages", "movie",
+        ],
+    )
+    p_step.add_argument("epub", help="Path to EPUB file (or .md/.txt story)")
     p_step.add_argument("--max-chapters", type=int, default=0, help="Limit to first N chapters")
     p_step.set_defaults(func=command_step)
 

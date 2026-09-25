@@ -15,6 +15,7 @@ SAMPLE_RATE = 24000
 # append numbers to titles that appear more than once
 def number_duplicate_titles(chapters: list[dict]) -> None:
     from collections import Counter
+
     counts = Counter(ch["title"] for ch in chapters)
     duplicates = {title for title, count in counts.items() if count > 1}
     seen: dict[str, int] = {}
@@ -43,19 +44,32 @@ def generate_chime(output_path: Path) -> None:
     if output_path.exists():
         return
     cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi", "-i", f"sine=frequency=523:sample_rate={SAMPLE_RATE}:duration=0.2",
-        "-f", "lavfi", "-i", f"sine=frequency=659:sample_rate={SAMPLE_RATE}:duration=0.2",
-        "-f", "lavfi", "-i", f"sine=frequency=784:sample_rate={SAMPLE_RATE}:duration=0.4",
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"sine=frequency=523:sample_rate={SAMPLE_RATE}:duration=0.2",
+        "-f",
+        "lavfi",
+        "-i",
+        f"sine=frequency=659:sample_rate={SAMPLE_RATE}:duration=0.2",
+        "-f",
+        "lavfi",
+        "-i",
+        f"sine=frequency=784:sample_rate={SAMPLE_RATE}:duration=0.4",
         "-filter_complex",
-        "[0]afade=t=in:d=0.02,afade=t=out:st=0.15:d=0.05[a];"
-        "[1]afade=t=in:d=0.02,afade=t=out:st=0.15:d=0.05[b];"
-        "[2]afade=t=in:d=0.02,afade=t=out:st=0.3:d=0.1[c];"
-        "[a][b][c]concat=n=3:v=0:a=1",
-        "-ar", str(SAMPLE_RATE),
+        (
+            "[0]afade=t=in:d=0.02,afade=t=out:st=0.15:d=0.05[a];"
+            "[1]afade=t=in:d=0.02,afade=t=out:st=0.15:d=0.05[b];"
+            "[2]afade=t=in:d=0.02,afade=t=out:st=0.3:d=0.1[c];"
+            "[a][b][c]concat=n=3:v=0:a=1"
+        ),
+        "-ar",
+        str(SAMPLE_RATE),
         str(output_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg chime generation failed: {result.stderr}")
 
@@ -78,11 +92,13 @@ def generate_all_announcements(output_dir: Path, title: str, chapter_files: list
         if chapter_name.lower() == "intro":
             continue
         announce_text = f"{title}. {chapter_name}."
-        jobs.append({
-            "speaker": "narrator",
-            "text": announce_text,
-            "output_path": announce_path,
-        })
+        jobs.append(
+            {
+                "speaker": "narrator",
+                "text": announce_text,
+                "output_path": announce_path,
+            }
+        )
     if jobs:
         print(f"  Generating {len(jobs)} announcements via {tts_engine.engine_name()}...")
         tts_engine.synthesize_jobs(jobs, output_dir)
@@ -94,12 +110,15 @@ def generate_all_announcements(output_dir: Path, title: str, chapter_files: list
 def get_audio_duration(audio_path: Path) -> float:
     cmd = [
         "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
         str(audio_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe failed: {result.stderr}")
     return float(result.stdout.strip())
@@ -110,13 +129,17 @@ def get_audio_duration(audio_path: Path) -> float:
 # create a silent audio file of specified duration
 def generate_silence(duration_sec: float, output_path: Path, sample_rate: int = SAMPLE_RATE) -> None:
     cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi",
-        "-i", f"anullsrc=r={sample_rate}:cl=mono",
-        "-t", str(duration_sec),
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"anullsrc=r={sample_rate}:cl=mono",
+        "-t",
+        str(duration_sec),
         str(output_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg silence generation failed: {result.stderr}")
 
@@ -133,15 +156,21 @@ def concatenate_audio_files(audio_files: list[Path], output_path: Path) -> None:
         list_file = Path(f.name)
     try:
         cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(list_file),
-            "-ar", str(SAMPLE_RATE),
-            "-ac", "1",
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_file),
+            "-ar",
+            str(SAMPLE_RATE),
+            "-ac",
+            "1",
             str(output_path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg concat failed: {result.stderr}")
     finally:
@@ -206,11 +235,13 @@ def assemble_m4b(output_dir: Path, title: str, author: str, max_chapters: int = 
                 interleaved.append(announce_silence_path)
                 current_time += PAUSE_AFTER_ANNOUNCEMENT_SEC
             duration = get_audio_duration(chapter_file)
-            chapter_info.append({
-                "title": chapter_name,
-                "start": chapter_start,
-                "end": current_time + duration,
-            })
+            chapter_info.append(
+                {
+                    "title": chapter_name,
+                    "start": chapter_start,
+                    "end": current_time + duration,
+                }
+            )
             interleaved.append(chapter_file)
             current_time += duration
             interleaved.append(chapter_silence_path)
@@ -222,32 +253,45 @@ def assemble_m4b(output_dir: Path, title: str, author: str, max_chapters: int = 
         write_chapter_metadata(chapter_info, metadata_path)
         cover_path = find_cover_image(output_dir)
         cmd = [
-            "ffmpeg", "-y",
-            "-i", str(full_audio_path),
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(full_audio_path),
         ]
         if cover_path:
             cmd += ["-i", str(cover_path)]
         cmd += [
-            "-i", str(metadata_path),
+            "-i",
+            str(metadata_path),
         ]
         metadata_index = 2 if cover_path else 1
         cmd += [
-            "-map_metadata", str(metadata_index),
-            "-metadata", f"title={title}",
-            "-metadata", f"artist={author}",
-            "-metadata", f"album={title}",
-            "-c:a", "aac",
-            "-b:a", "64k",
+            "-map_metadata",
+            str(metadata_index),
+            "-metadata",
+            f"title={title}",
+            "-metadata",
+            f"artist={author}",
+            "-metadata",
+            f"album={title}",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "64k",
         ]
         if cover_path:
             cmd += [
-                "-map", "0:a",
-                "-map", "1:v",
-                "-c:v", "mjpeg",
-                "-disposition:v:0", "attached_pic",
+                "-map",
+                "0:a",
+                "-map",
+                "1:v",
+                "-c:v",
+                "mjpeg",
+                "-disposition:v:0",
+                "attached_pic",
             ]
         cmd.append(str(m4b_path))
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg m4b creation failed: {result.stderr}")
     return m4b_path

@@ -1,8 +1,12 @@
 """Pluggable TTS engine selection.
 
-Two engines, chosen by env ``BOOK_TTS_ENGINE``:
+Three engines, chosen by env ``BOOK_TTS_ENGINE``:
 
-  kokoro  (default) — Kokoro-82M via arbiter ``tts-kokoro``. Hundreds of times
+  breeze  (default) — Breeze TTS 2 via arbiter ``tts-breeze``. Each character
+                      gets a voice-DESIGNED reference clip (voices/<id>.wav)
+                      which every line then clones, so timbre stays stable
+                      across the whole book. Batched multi-item jobs.
+  kokoro            — Kokoro-82M via arbiter ``tts-kokoro``. Hundreds of times
                       faster than qwen3-tts. Each character is mapped to a
                       kokoro voice (see kokoro_voices.py); no reference WAVs.
   qwen              — the original qwen3-tts path: design a reference WAV per
@@ -12,13 +16,14 @@ The rest of the pipeline is engine-agnostic: it plans line jobs
 ({speaker, text, output_path}) and asks the engine to fill the WAVs and to
 prepare per-character voices.
 """
+
 from __future__ import annotations
 
 import os
 from collections import defaultdict
 from pathlib import Path
 
-ENGINE = os.environ.get("BOOK_TTS_ENGINE", "kokoro").lower()
+ENGINE = os.environ.get("BOOK_TTS_ENGINE", "breeze").lower()
 
 
 # ##################################################################
@@ -31,6 +36,8 @@ def engine_name() -> str:
 # voices ready
 # has the per-character voice preparation already been done for this engine?
 def voices_ready(output_dir: Path) -> bool:
+    if ENGINE == "breeze":
+        return (output_dir / "breeze_voices.json").exists()
     if ENGINE == "kokoro":
         return (output_dir / "kokoro_voices.json").exists()
     return (output_dir / "voices").exists()
@@ -41,7 +48,10 @@ def voices_ready(output_dir: Path) -> bool:
 # the set of valid speaker ids for the current engine
 def speaker_set(output_dir: Path) -> set[str]:
     import json
-    if ENGINE == "kokoro":
+
+    if ENGINE == "breeze":
+        path = output_dir / "breeze_voices.json"
+    elif ENGINE == "kokoro":
         path = output_dir / "kokoro_voices.json"
     else:
         path = output_dir / "voices.json"
@@ -54,13 +64,24 @@ def speaker_set(output_dir: Path) -> set[str]:
 # prepare voices
 # create whatever per-character voice artifacts the engine needs
 def prepare_voices(output_dir: Path) -> int:
+    if ENGINE == "breeze":
+        from src.breeze_voices import prepare_breeze_voices
+
+        prepare_breeze_voices(output_dir)
+        import json
+
+        data = json.loads((output_dir / "breeze_voices.json").read_text(encoding="utf-8"))
+        return len(data)
     if ENGINE == "kokoro":
         from src.kokoro_voices import map_characters_to_voices
+
         map_characters_to_voices(output_dir)
         import json
+
         data = json.loads((output_dir / "kokoro_voices.json").read_text(encoding="utf-8"))
         return len(data)
     from src.voice_clone import clone_all_voices
+
     return len(clone_all_voices(output_dir))
 
 
@@ -70,9 +91,15 @@ def prepare_voices(output_dir: Path) -> int:
 def synthesize_jobs(jobs: list[dict], output_dir: Path) -> None:
     if not jobs:
         return
+    if ENGINE == "breeze":
+        from src.arbiter_tts import tts_breeze_many
+
+        tts_breeze_many(jobs, output_dir)
+        return
     if ENGINE == "kokoro":
         from src.arbiter_tts import tts_kokoro_many
         from src.kokoro_voices import load_voice_map
+
         vmap = load_voice_map(output_dir)
         default = vmap.get("narrator", ("af_heart", 1.0))
         kjobs = []
@@ -83,6 +110,7 @@ def synthesize_jobs(jobs: list[dict], output_dir: Path) -> None:
         return
     # qwen: group by speaker so each ref WAV stays hot in the worker
     from src.arbiter_tts import tts_clone_many
+
     voices_dir = output_dir / "voices"
     by_speaker: dict[str, list[dict]] = defaultdict(list)
     for j in jobs:

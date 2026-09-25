@@ -13,6 +13,7 @@ A "voice" string is exactly what the arbiter ``tts-kokoro`` job accepts.
 Future (documented in arbiter/KOKORO_TTS.md): pre-evolve hundreds of custom
 voices with kvoicewalk to grow the bank from 54 to ~500, then map onto that.
 """
+
 from __future__ import annotations
 
 import json
@@ -24,27 +25,78 @@ from src.llm import ask_sync
 # id prefix: a=American EN, b=British EN, e=Spanish, f=French, h=Hindi,
 # i=Italian, j=Japanese, p=Br-Portuguese, z=Mandarin; f=female, m=male.
 ALL_VOICES = [
-    "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica", "af_kore",
-    "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
-    "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael",
-    "am_onyx", "am_puck", "am_santa",
-    "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
-    "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
-    "ef_dora", "em_alex", "em_santa", "ff_siwis", "hf_alpha", "hf_beta",
-    "hm_omega", "hm_psi", "if_sara", "im_nicola", "jf_alpha", "jf_gongitsune",
-    "jf_nezumi", "jf_tebukuro", "jm_kumo", "pf_dora", "pm_alex", "pm_santa",
-    "zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi", "zm_yunjian",
-    "zm_yunxi", "zm_yunxia", "zm_yunyang",
+    "af_alloy",
+    "af_aoede",
+    "af_bella",
+    "af_heart",
+    "af_jessica",
+    "af_kore",
+    "af_nicole",
+    "af_nova",
+    "af_river",
+    "af_sarah",
+    "af_sky",
+    "am_adam",
+    "am_echo",
+    "am_eric",
+    "am_fenrir",
+    "am_liam",
+    "am_michael",
+    "am_onyx",
+    "am_puck",
+    "am_santa",
+    "bf_alice",
+    "bf_emma",
+    "bf_isabella",
+    "bf_lily",
+    "bm_daniel",
+    "bm_fable",
+    "bm_george",
+    "bm_lewis",
+    "ef_dora",
+    "em_alex",
+    "em_santa",
+    "ff_siwis",
+    "hf_alpha",
+    "hf_beta",
+    "hm_omega",
+    "hm_psi",
+    "if_sara",
+    "im_nicola",
+    "jf_alpha",
+    "jf_gongitsune",
+    "jf_nezumi",
+    "jf_tebukuro",
+    "jm_kumo",
+    "pf_dora",
+    "pm_alex",
+    "pm_santa",
+    "zf_xiaobei",
+    "zf_xiaoni",
+    "zf_xiaoxiao",
+    "zf_xiaoyi",
+    "zm_yunjian",
+    "zm_yunxi",
+    "zm_yunxia",
+    "zm_yunyang",
 ]
 
-_LANG = {"a": "American English", "b": "British English", "e": "Spanish",
-         "f": "French", "h": "Hindi", "i": "Italian", "j": "Japanese",
-         "p": "Brazilian Portuguese", "z": "Mandarin Chinese"}
+_LANG = {
+    "a": "American English",
+    "b": "British English",
+    "e": "Spanish",
+    "f": "French",
+    "h": "Hindi",
+    "i": "Italian",
+    "j": "Japanese",
+    "p": "Brazilian Portuguese",
+    "z": "Mandarin Chinese",
+}
 
 # Default English pool we ask the LLM to map onto (most books are English).
 ENGLISH_VOICES = [v for v in ALL_VOICES if v[0] in ("a", "b")]
-DEFAULT_VOICE = "af_heart"          # kokoro's reference / highest-quality voice
-DEFAULT_NARRATOR = "bm_george"      # warm British male default for narration
+DEFAULT_VOICE = "af_heart"  # kokoro's reference / highest-quality voice
+DEFAULT_NARRATOR = "bm_george"  # warm British male default for narration
 
 
 # ##################################################################
@@ -110,13 +162,13 @@ def _parse_mapping(text: str) -> dict:
         a = text.find("```")
         b = text.rfind("```")
         if a != b:
-            block = text[a + 3:b].split("\n", 1)
+            block = text[a + 3 : b].split("\n", 1)
             text = block[1] if len(block) > 1 else block[0]
     if not text.startswith("{"):
         i = text.find("{")
         j = text.rfind("}")
         if i != -1 and j != -1:
-            text = text[i:j + 1]
+            text = text[i : j + 1]
     return json.loads(text)
 
 

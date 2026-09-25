@@ -1,6 +1,6 @@
 """Real integration tests for the arbiter-backed LLM client.
 
-These call the LIVE arbiter GPU job server (qwen3.6-35b at 10.0.0.254:8400).
+These call the LIVE arbiter GPU job server (local-coder at 10.0.0.254:8400).
 No mocks — a tiny completion is exercised end to end so a broken endpoint or a
 changed request/response shape fails the suite immediately.
 """
@@ -14,7 +14,7 @@ from src.llm import LLM_HOST, LLM_MODEL, ask, ask_sync, strip_think
 # test config points at arbiter
 # the default backend must be the arbiter OpenAI endpoint, not raw Ollama
 def test_config_targets_arbiter() -> None:
-    assert LLM_MODEL == "qwen3.6-35b"
+    assert LLM_MODEL == "local-coder"
     assert LLM_HOST.endswith(":8400")
 
 

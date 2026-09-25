@@ -4,7 +4,15 @@ from pathlib import Path
 
 from ebooklib import epub
 
-from src.epub_extract import classify_is_content, extract_chapters, extract_cover_image, extract_epub, html_to_text, is_substantial_item, normalize_name
+from src.epub_extract import (
+    classify_is_content,
+    extract_chapters,
+    extract_cover_image,
+    extract_epub,
+    html_to_text,
+    is_substantial_item,
+    normalize_name,
+)
 
 
 # ##################################################################
@@ -12,12 +20,17 @@ from src.epub_extract import classify_is_content, extract_chapters, extract_cove
 # use ffmpeg to generate a 1x1 JPEG image for testing
 def create_test_jpeg(output_path: Path) -> None:
     cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi", "-i", "color=c=red:s=1x1:d=1",
-        "-frames:v", "1",
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=red:s=1x1:d=1",
+        "-frames:v",
+        "1",
         str(output_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg jpeg creation failed: {result.stderr}")
 
@@ -271,6 +284,7 @@ def test_is_substantial_item() -> None:
 # verify haiku correctly classifies front matter vs real content
 def test_classify_is_content() -> None:
     import asyncio
+
     synopsis_text = (
         "Synopsis\n\nIn this stunning debut, the author delivers a wonderfully thrilling tale "
         "of an audacious criminal and his band of confidence tricksters. Set in a fantastic city "

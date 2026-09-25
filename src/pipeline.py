@@ -9,10 +9,14 @@ from colorama import Fore, Style, init
 from src import tts_engine
 from src.audio_synth import synthesize_all_chapters
 from src.character_analysis import analyze_characters_sync
-from src.epub_extract import extract_epub, get_output_dir
+from src.epub_extract import get_output_dir
 from src.m4b_assemble import assemble_m4b
+from src.movie_assemble import assemble_movie
+from src.movie_images import generate_character_refs, generate_scene_images
+from src.movie_storyboard import build_storyboard
 from src.script_generate import generate_scripts_sync
 from src.state import is_step_complete, mark_step_complete
+from src.text_ingest import extract_any
 from src.voice_description import generate_voices_sync
 
 init(autoreset=True)
@@ -63,7 +67,7 @@ def run_pipeline(epub_path: Path) -> Path:
     print(f"  Input: {epub_path}")
     print(f"  Output: {output_dir}")
     pipeline_t0 = time.time()
-    print_step(1, "Extract chapters from EPUB")
+    print_step(1, "Extract chapters")
     if is_step_complete(output_dir, "extract"):
         print_skip("Already extracted")
         title_line = (output_dir / "chapters" / "00-intro.txt").read_text().split(" by ")
@@ -71,7 +75,7 @@ def run_pipeline(epub_path: Path) -> Path:
         author = title_line[1].split(", narrated by")[0] if len(title_line) > 1 else "Unknown"
     else:
         with _time_step(output_dir, "extract"):
-            title, author, written = extract_epub(epub_path, output_dir)
+            title, author, written = extract_any(epub_path, output_dir)
         print_done(f"Extracted {len(written)} chapter files")
         mark_step_complete(output_dir, "extract")
     print_step(2, "Analyze characters with Claude Haiku")
@@ -123,14 +127,53 @@ def run_pipeline(epub_path: Path) -> Path:
             m4b_path = assemble_m4b(output_dir, title, author)
         print_done(f"Created {m4b_path.name}")
         mark_step_complete(output_dir, "m4b")
+    print_step(8, "Build movie storyboard (~30s scenes)")
+    if is_step_complete(output_dir, "storyboard"):
+        print_skip("Storyboard already built")
+    else:
+        with _time_step(output_dir, "storyboard"):
+            build_storyboard(output_dir, title)
+        print_done("Storyboard built")
+        mark_step_complete(output_dir, "storyboard")
+    print_step(9, "Generate character reference portraits (qwen-image)")
+    if is_step_complete(output_dir, "refimages"):
+        print_skip("Character refs already generated")
+    else:
+        with _time_step(output_dir, "refimages"):
+            refs = generate_character_refs(output_dir)
+        print_done(f"Generated {len(refs)} character portraits")
+        mark_step_complete(output_dir, "refimages")
+    print_step(10, "Generate scene images (qwen-image)")
+    if is_step_complete(output_dir, "sceneimages"):
+        print_skip("Scene images already generated")
+    else:
+        with _time_step(output_dir, "sceneimages"):
+            scene_images = generate_scene_images(output_dir)
+        print_done(f"Generated {len(scene_images)} scene images")
+        mark_step_complete(output_dir, "sceneimages")
+    print_step(11, "Assemble movie (Ken Burns pan/zoom + narration)")
+    if is_step_complete(output_dir, "movie"):
+        print_skip("Movie already assembled")
+        movie_path = output_dir / "movie" / "movie.mp4"
+    else:
+        with _time_step(output_dir, "movie"):
+            movie_path = assemble_movie(output_dir, title)
+        print_done(f"Created {movie_path.name}")
+        mark_step_complete(output_dir, "movie")
     total = time.time() - pipeline_t0
     with (output_dir / "timings.jsonl").open("a", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "step": "TOTAL",
-            "started": datetime.now(timezone.utc).isoformat(),
-            "seconds": round(total, 2),
-        }) + "\n")
+        f.write(
+            json.dumps(
+                {
+                    "step": "TOTAL",
+                    "started": datetime.now(timezone.utc).isoformat(),
+                    "seconds": round(total, 2),
+                }
+            )
+            + "\n"
+        )
     mins = total / 60
     print(f"\n{Fore.GREEN}Complete!{Style.RESET_ALL} Audiobook: {m4b_path}")
+    print(f"{Fore.GREEN}Movie:{Style.RESET_ALL} {movie_path}")
     print(f"{Fore.CYAN}⏱  Total pipeline: {total:.0f}s ({mins:.1f} min){Style.RESET_ALL}")
     return m4b_path

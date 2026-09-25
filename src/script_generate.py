@@ -133,8 +133,10 @@ async def generate_chapter_script(chapter_text: str, chapter_title: str, speaker
     speakers_list = ", ".join(speaker_ids)
     chunks = chunk_text(chapter_text, chunk_size=4000)
     chunk_results = await asyncio.gather(
-        *(_process_chunk(c, speakers_list, f"{chapter_title} chunk {i+1}/{len(chunks)}")
-          for i, c in enumerate(chunks))
+        *(
+            _process_chunk(c, speakers_list, f"{chapter_title} chunk {i + 1}/{len(chunks)}")
+            for i, c in enumerate(chunks)
+        )
     )
     all_lines: list[dict] = [{"narrator": chapter_title}]
     for parsed in chunk_results:
@@ -156,9 +158,8 @@ async def generate_script_for_file(chapter_path: Path, script_dir: Path, speaker
         lines = [{"narrator": chapter_text}]
     else:
         lines = await generate_chapter_script(chapter_text, chapter_title, speaker_ids)
-    with open(script_path, "w", encoding="utf-8") as f:
-        for line in lines:
-            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    payload = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines)
+    await asyncio.to_thread(script_path.write_text, payload, encoding="utf-8")
     return script_path
 
 
@@ -209,9 +210,7 @@ async def generate_all_scripts(output_dir: Path) -> list[Path]:
     script_dir.mkdir(parents=True, exist_ok=True)
     chapter_files = sorted(chapters_dir.glob("*.txt"))
     print(f"Generating {len(chapter_files)} chapter scripts in parallel...")
-    return list(await asyncio.gather(
-        *(generate_script_for_file(p, script_dir, speaker_ids) for p in chapter_files)
-    ))
+    return list(await asyncio.gather(*(generate_script_for_file(p, script_dir, speaker_ids) for p in chapter_files)))
 
 
 # ##################################################################

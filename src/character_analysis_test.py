@@ -42,7 +42,8 @@ def test_analyze_characters_real() -> None:
         intro = chapters_dir / "00-intro.txt"
         intro.write_text("Test Book by Test Author.")
         chapter1 = chapters_dir / "01-chapter_one.txt"
-        chapter1.write_text("""
+        chapter1.write_text(
+            """
 John walked into the room, his heavy boots echoing on the wooden floor. He was a tall man, well over six feet, with dark hair streaked with gray at the temples. His deep voice rumbled when he spoke. At forty-two, he carried himself with the careful movements of someone who had seen too much.
 
 "Hello, Mary," he said, his voice low and gravelly. "It's been a long time."
@@ -58,13 +59,15 @@ John thought about their childhood in Dublin. Those were simpler times, before t
 "Come, sit," Mary said, gesturing to the chair across from her. "Tell me everything. I want to hear it all in that booming voice of yours."
 
 John lowered his large frame into the chair, which creaked under his weight. He began to speak, his bass voice filling the small room with stories of where he had been.
-        """.strip())
+        """.strip()
+        )
         result_path = analyze_characters_sync(output_dir, "Test Book", "Test Author")
         assert result_path.exists()
         import json
+
         chars = json.loads(result_path.read_text())
         assert "narrator" in chars
         assert "name" in chars["narrator"]
         assert "bio" in chars["narrator"]
-        char_ids = [k for k in chars.keys() if k != "narrator"]
+        char_ids = [k for k in chars if k != "narrator"]
         assert len(char_ids) >= 1

@@ -16,7 +16,7 @@ def parse_json_response(text: str) -> dict:
         start = text.find("```")
         end = text.rfind("```")
         if start != end:
-            block = text[start:end + 3]
+            block = text[start : end + 3]
             lines = block.split("\n")
             lines = lines[1:]
             if lines and lines[-1].strip() == "```":
@@ -28,7 +28,7 @@ def parse_json_response(text: str) -> dict:
             text = text[brace_pos:]
             end_brace = text.rfind("}")
             if end_brace != -1:
-                text = text[:end_brace + 1]
+                text = text[: end_brace + 1]
     if not text or not text.startswith("{"):
         return {"characters": {}}
     try:
@@ -107,12 +107,12 @@ def merge_character_info(all_chars: list[dict]) -> dict:
 # strip accents and common prefixes for duplicate detection
 def normalize_for_comparison(char_id: str) -> str:
     import unicodedata
+
     normalized = unicodedata.normalize("NFKD", char_id)
     normalized = "".join(c for c in normalized if not unicodedata.combining(c))
     normalized = normalized.lower()
     for prefix in ["the_", "don_", "dona_", "doña_"]:
-        if normalized.startswith(prefix):
-            normalized = normalized[len(prefix):]
+        normalized = normalized.removeprefix(prefix)
     return normalized
 
 
@@ -128,10 +128,9 @@ def has_obvious_duplicates(characters: dict) -> bool:
             return True
         normalized_map[norm] = char_id
     for i, id1 in enumerate(char_ids):
-        for id2 in char_ids[i + 1:]:
-            if id1 in id2 or id2 in id1:
-                if id1 != "narrator" and id2 != "narrator":
-                    return True
+        for id2 in char_ids[i + 1 :]:
+            if (id1 in id2 or id2 in id1) and id1 != "narrator" and id2 != "narrator":
+                return True
     return False
 
 
@@ -195,10 +194,7 @@ Each group = same person. IDs not in any group stay as singles."""
     for char_id, info in characters.items():
         canonical_id = id_to_canonical.get(char_id, char_id)
         if canonical_id not in deduplicated:
-            deduplicated[canonical_id] = {
-                "name": info["name"],
-                "bio": info["bio"]
-            }
+            deduplicated[canonical_id] = {"name": info["name"], "bio": info["bio"]}
         else:
             existing_bio = deduplicated[canonical_id]["bio"]
             new_bio = info["bio"]
@@ -226,8 +222,7 @@ def post_process_dedup(characters: dict) -> dict:
             del result[alias]
     invalid_merged = ["calo_and_galdo", "the_sanza_twins", "sanza_twins", "berangias_twins"]
     for invalid in invalid_merged:
-        if invalid in result:
-            del result[invalid]
+        result.pop(invalid, None)
     return result
 
 
@@ -277,9 +272,7 @@ async def analyze_characters(output_dir: Path, title: str, author: str) -> Path:
             sample_text = chapter_path.read_text(encoding="utf-8")[:3000]
         targets.append((i, chapter_path))
     print(f"Analyzing {len(targets)} chapters in parallel...")
-    all_chars = await asyncio.gather(
-        *(analyze_chapter(p, i) for i, p in targets)
-    )
+    all_chars = await asyncio.gather(*(analyze_chapter(p, i) for i, p in targets))
     merged = merge_character_info(all_chars)
     print(f"Raw merge: {len(merged)} characters")
     print("Deduplicating with Sonnet...")

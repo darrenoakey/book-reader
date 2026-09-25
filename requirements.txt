@@ -1,9 +1,10 @@
-ebooklib
-beautifulsoup4
-lxml
-daz-agent-sdk
 arbiter-client @ file:///Users/darrenoakey/src/arbiter-client
+beautifulsoup4
 colorama
-setproctitle
+daz-agent-sdk
+ebooklib
+lxml
+Pillow
 pytest
 ruff
+setproctitle

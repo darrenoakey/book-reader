@@ -31,13 +31,15 @@ def test_generate_scripts_real() -> None:
         intro = chapters_dir / "00-intro.txt"
         intro.write_text("Test Book by Author.")
         chapter1 = chapters_dir / "01-chapter_one.txt"
-        chapter1.write_text("""
+        chapter1.write_text(
+            """
 John walked into the room.
 
 "Hello," said Mary.
 
 John nodded. "Good to see you."
-        """.strip())
+        """.strip()
+        )
         voices = {
             "narrator": {"description": "The narrator voice"},
             "john": {"description": "A male voice"},

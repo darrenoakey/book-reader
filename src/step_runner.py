@@ -6,10 +6,14 @@ from colorama import Fore, Style, init
 
 from src.audio_synth import synthesize_all_chapters
 from src.character_analysis import analyze_characters_sync
-from src.epub_extract import extract_epub, get_output_dir
+from src.epub_extract import get_output_dir
 from src.m4b_assemble import assemble_m4b
+from src.movie_assemble import assemble_movie
+from src.movie_images import generate_character_refs, generate_scene_images
+from src.movie_storyboard import build_storyboard
 from src.script_generate import generate_scripts_sync
 from src.state import mark_step_complete
+from src.text_ingest import extract_any
 from src.voice_description import generate_voices_sync
 
 init(autoreset=True)
@@ -34,7 +38,7 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if step == "extract":
-        title, author, written = extract_epub(epub_path, output_dir)
+        title, author, written = extract_any(epub_path, output_dir)
         print(f"Extracted {len(written)} files")
         mark_step_complete(output_dir, "extract")
 
@@ -56,6 +60,13 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0) -> int:
             print(f"  {info['description']}\n")
         mark_step_complete(output_dir, "voices_desc")
 
+    elif step == "clone":
+        from src import tts_engine
+
+        n = tts_engine.prepare_voices(output_dir)
+        print(f"Prepared {n} character voices ({tts_engine.engine_name()})")
+        mark_step_complete(output_dir, "voices_clone")
+
     elif step == "scripts":
         scripts = generate_scripts_sync(output_dir)
         print(f"Generated {len(scripts)} script files")
@@ -74,9 +85,34 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0) -> int:
         if max_chapters == 0:
             mark_step_complete(output_dir, "m4b")
 
+    elif step == "storyboard":
+        title, _ = get_book_info(output_dir)
+        path = build_storyboard(output_dir, title)
+        import json as _json
+
+        scenes = _json.loads(path.read_text())["scenes"]
+        print(f"Built storyboard: {len(scenes)} scenes")
+        mark_step_complete(output_dir, "storyboard")
+
+    elif step == "refimages":
+        refs = generate_character_refs(output_dir)
+        print(f"Generated {len(refs)} character reference portraits")
+        mark_step_complete(output_dir, "refimages")
+
+    elif step == "sceneimages":
+        images = generate_scene_images(output_dir)
+        print(f"Generated {len(images)} scene images")
+        mark_step_complete(output_dir, "sceneimages")
+
+    elif step == "movie":
+        title, _ = get_book_info(output_dir)
+        movie = assemble_movie(output_dir, title)
+        print(f"Created {movie}")
+        mark_step_complete(output_dir, "movie")
+
     else:
         print(f"Unknown step: {step}")
-        print("Valid steps: extract, characters, voices, scripts, audio, m4b")
+        print("Valid steps: extract, characters, voices, scripts, audio, m4b, storyboard, refimages, sceneimages, movie")
         return 1
 
     return 0
@@ -87,6 +123,7 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0) -> int:
 # entry point for step runner
 def main() -> int:
     import argparse
+
     parser = argparse.ArgumentParser(prog="step_runner")
     parser.add_argument("step")
     parser.add_argument("epub_path")

@@ -131,6 +131,7 @@ def tts_clone_many(
     keeping ~IN_FLIGHT_WINDOW jobs in flight at a time using a thread pool
     so arbiter's worker slots stay saturated."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
     from arbiter_client import stage_file
 
     spark_path = stage_file(ref_audio_path, keep_for_seconds=6 * 86400)
@@ -236,13 +237,13 @@ def tts_kokoro_many(jobs: list[dict]) -> list[Path]:
                         len(data),
                     )
                     continue
-                w = wave.open(io.BytesIO(data))
-                frames = w.readframes(w.getnframes())
+                with wave.open(io.BytesIO(data)) as w:
+                    frames = w.readframes(w.getnframes())
 
-                class _P:
-                    sampwidth = w.getsampwidth()
-                    nchannels = w.getnchannels()
-                    framerate = w.getframerate()
+                    class _P:
+                        sampwidth = w.getsampwidth()
+                        nchannels = w.getnchannels()
+                        framerate = w.getframerate()
 
                 gap = int(meta.get("gap_samples", 0))
                 off = 0
@@ -275,9 +276,154 @@ def tts_kokoro_many(jobs: list[dict]) -> list[Path]:
     return [j["output_path"] for j in jobs]
 
 
+# ##################################################################
+# tts breeze design to file
+# voice-design a single clip from a natural-language description
+# (Breeze TTS 2 voice design; cfg_scale 4 strengthens instruction-following)
+def tts_breeze_design_to_file(
+    description: str, text: str, output_path: Path, seed: int = 42, cfg_scale: float = 4.0
+) -> Path:
+    if output_path.exists() and output_path.stat().st_size >= 100:
+        return output_path
+    client = _client(120)
+    params = {
+        "text": text,
+        "instruction": description,
+        "cfg_scale": cfg_scale,
+        "seed": seed,
+        "force": True,
+    }
+    jid = _submit(client, "tts-breeze", params, why=f"voice design {output_path.name}")
+    _fetch(client, jid, "tts-breeze", params, output_path)
+    return output_path
+
+
+# ##################################################################
+# breeze batch sizing
+# Breeze runs near realtime in eager mode, so a 40-line batch job takes a few
+# minutes — well inside max_runtime_seconds — while still amortising the
+# scheduler's per-job dispatch overhead exactly like the kokoro batches.
+BREEZE_BATCH_LINES = 40
+BREEZE_BATCH_WINDOW = 4  # max_concurrent 1 on the model; keep a shallow queue
+
+
+# ##################################################################
+# tts breeze many
+# synthesize many speaker-attributed lines by BATCHING them into multi-item
+# tts-breeze jobs (clone mode: each item carries its character's staged
+# reference clip + exact transcript), then slicing the concatenated result
+# back into per-line WAVs via item_samples.
+def tts_breeze_many(jobs: list[dict], output_dir: Path) -> list[Path]:
+    """Each job: {text, speaker, output_path}. Fills output_path WAVs.
+    Voices come from breeze_voices.json (prepared by the voices step)."""
+    import io
+    import wave
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from arbiter_client import stage_file
+
+    from src.breeze_voices import load_breeze_manifest
+
+    todo = [j for j in jobs if not (j["output_path"].exists() and j["output_path"].stat().st_size >= 100)]
+    if not todo:
+        return [j["output_path"] for j in jobs]
+
+    # Only touch the voice manifest when there is real synthesis to do — an
+    # all-cached chapter must not require breeze_voices.json to exist.
+    manifest = load_breeze_manifest(output_dir)
+    narrator = manifest.get("narrator") or next(iter(manifest.values()))
+
+    batches = [todo[i : i + BREEZE_BATCH_LINES] for i in range(0, len(todo), BREEZE_BATCH_LINES)]
+
+    def _do_batch(batch: list[dict]) -> int:
+        import zlib
+
+        client = _client(300)
+        # Stage this batch's distinct reference clips; the inbox is cleaned
+        # after the job, so staging happens per batch, fresh every resubmit.
+        def _stage() -> dict:
+            staged: dict = {}
+            for j in batch:
+                speaker = j["speaker"]
+                if speaker not in staged:
+                    voice = manifest.get(speaker, narrator)
+                    staged[speaker] = (stage_file(Path(voice["ref_wav"])), voice["ref_text"])
+            return staged
+
+        staged = _stage()
+        params = {
+            "items": [
+                {
+                    "text": j["text"],
+                    "ref_audio_file": staged[j["speaker"]][0],
+                    "ref_text": staged[j["speaker"]][1],
+                    "seed": zlib.crc32(j["text"].encode("utf-8")) % 100000,
+                }
+                for j in batch
+            ],
+            "gap_seconds": 0.0,
+            "force": True,
+        }
+        while True:
+            jid = _submit(client, "tts-breeze", params, why=f"narrate {len(batch)} lines")
+            try:
+                res = client.poll(jid, interval=2.0, timeout=31536000)
+                meta = res.get("result", {}) if isinstance(res, dict) else {}
+                item_samples = meta.get("item_samples")
+                data = client.get_result_bytes(jid)
+                if not item_samples or len(item_samples) != len(batch) or len(data) < 100:
+                    log.warning(
+                        "breeze batch bad result (items=%s, bytes=%d) — resubmitting",
+                        item_samples and len(item_samples),
+                        len(data),
+                    )
+                    staged = _stage()
+                    continue
+                with wave.open(io.BytesIO(data)) as w:
+                    frames = w.readframes(w.getnframes())
+
+                    class _P:
+                        sampwidth = w.getsampwidth()
+                        nchannels = w.getnchannels()
+                        framerate = w.getframerate()
+
+                gap = int(meta.get("gap_samples", 0))
+                off = 0
+                for j, n in zip(batch, item_samples):
+                    _write_wav_slice(_P, frames, off, n, j["output_path"])
+                    off += n + gap
+                return len(batch)
+            except ArbiterError as e:
+                msg = str(e).lower()
+                if "failed" in msg or "cancelled" in msg or "timed out" in msg:
+                    log.warning("breeze batch job died (%s) — resubmitting", e)
+                    staged = _stage()
+                    continue
+                log.warning("breeze batch transient (%s) — retrying", e)
+                time.sleep(5)
+            except (ConnectionError, OSError) as e:
+                log.warning("breeze batch connection (%s) — retrying", e)
+                time.sleep(5)
+
+    print(
+        f"  {len(todo)} breeze lines in {len(batches)} batches "
+        f"(≤{BREEZE_BATCH_LINES}/job, window={BREEZE_BATCH_WINDOW})"
+    )
+    done = 0
+    with ThreadPoolExecutor(max_workers=BREEZE_BATCH_WINDOW) as pool:
+        futures = [pool.submit(_do_batch, b) for b in batches]
+        for fut in as_completed(futures):
+            done += fut.result()
+            print(f"    {done}/{len(todo)} lines done")
+
+    return [j["output_path"] for j in jobs]
+
+
 __all__ = [
-    "tts_design_to_file",
-    "tts_clone_to_file",
+    "tts_breeze_design_to_file",
+    "tts_breeze_many",
     "tts_clone_many",
+    "tts_clone_to_file",
+    "tts_design_to_file",
     "tts_kokoro_many",
 ]

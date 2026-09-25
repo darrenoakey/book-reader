@@ -114,7 +114,7 @@ async def trim_non_content(candidates: list[dict]) -> list[dict]:
         if is_content:
             end = i
             break
-    return candidates[start:end + 1]
+    return candidates[start : end + 1]
 
 
 # ##################################################################
@@ -139,12 +139,14 @@ def collect_candidates(book: epub.EpubBook) -> list[dict]:
         if not is_substantial_item(text):
             continue
         title = extract_chapter_title(html)
-        candidates.append({
-            "text": text,
-            "html": html,
-            "title": title,
-            "filename": item.get_name(),
-        })
+        candidates.append(
+            {
+                "text": text,
+                "html": html,
+                "title": title,
+                "filename": item.get_name(),
+            }
+        )
     return candidates
 
 
@@ -160,12 +162,14 @@ def extract_chapters(epub_path: Path, book: epub.EpubBook | None = None) -> tupl
     chapters = []
     for i, cand in enumerate(trimmed, start=1):
         chapter_title = cand["title"] if cand["title"] else f"Chapter {i}"
-        chapters.append(ChapterInfo(
-            number=i,
-            title=chapter_title,
-            text=cand["text"],
-            original_file=cand["filename"],
-        ))
+        chapters.append(
+            ChapterInfo(
+                number=i,
+                title=chapter_title,
+                text=cand["text"],
+                original_file=cand["filename"],
+            )
+        )
     return title, author, chapters
 
 

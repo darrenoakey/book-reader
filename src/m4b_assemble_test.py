@@ -1,8 +1,7 @@
+import json
 import subprocess
 import tempfile
 from pathlib import Path
-
-import json
 
 from src.m4b_assemble import assemble_m4b, generate_chime, generate_silence, get_audio_duration, number_duplicate_titles
 
@@ -12,12 +11,15 @@ from src.m4b_assemble import assemble_m4b, generate_chime, generate_silence, get
 # generate a short audio file with ffmpeg
 def create_test_audio(output_path: Path, duration_sec: float = 0.5) -> None:
     cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi",
-        "-i", f"sine=frequency=440:duration={duration_sec}",
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"sine=frequency=440:duration={duration_sec}",
         str(output_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg test audio failed: {result.stderr}")
 
@@ -63,7 +65,7 @@ def test_assemble_m4b_real() -> None:
         assert m4b_path.suffix == ".m4b"
         assert m4b_path.stat().st_size > 1000
         cmd = ["ffprobe", "-v", "error", "-show_chapters", "-of", "json", str(m4b_path)]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         assert result.returncode == 0
 
 
@@ -88,12 +90,17 @@ def test_assemble_m4b_idempotent() -> None:
 # use ffmpeg to generate a small valid JPEG for testing
 def create_test_jpeg(output_path: Path) -> None:
     cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi", "-i", "color=c=red:s=1x1:d=1",
-        "-frames:v", "1",
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=red:s=1x1:d=1",
+        "-frames:v",
+        "1",
         str(output_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg jpeg creation failed: {result.stderr}")
 
@@ -144,7 +151,7 @@ def test_assemble_m4b_with_duplicate_titles() -> None:
         m4b_path = assemble_m4b(output_dir, "Test Book", "Test Author")
         assert m4b_path.exists()
         cmd = ["ffprobe", "-v", "error", "-show_chapters", "-of", "json", str(m4b_path)]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         assert result.returncode == 0
         chapters = json.loads(result.stdout)["chapters"]
         titles = [ch["tags"]["title"] for ch in chapters]
@@ -166,7 +173,7 @@ def test_assemble_m4b_with_cover() -> None:
         m4b_path = assemble_m4b(output_dir, "Test Book", "Test Author")
         assert m4b_path.exists()
         cmd = ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(m4b_path)]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         assert result.returncode == 0
         streams = json.loads(result.stdout)["streams"]
         video_streams = [s for s in streams if s["codec_type"] == "video"]

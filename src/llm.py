@@ -14,6 +14,7 @@ Configurable via env:
   BOOK_LLM_MODEL        default local-coder
   BOOK_LLM_CONCURRENCY  default 4   (parallel in-flight requests)
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -43,26 +44,31 @@ def strip_think(text: str) -> str:
 # one blocking chat completion against the arbiter's OpenAI-compatible
 # endpoint; retries transient failures forever with backoff (the pipeline must
 # never silently lose work). The arbiter handles model-host selection/failover.
-def ask_sync(prompt: str, system: str | None = None, temperature: float = 0.2,
-             max_tokens: int = 4096, timeout: float = 300.0) -> str:
+def ask_sync(
+    prompt: str, system: str | None = None, temperature: float = 0.2, max_tokens: int = 4096, timeout: float = 300.0
+) -> str:
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-    payload = json.dumps({
-        "model": LLM_MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }).encode("utf-8")
+    payload = json.dumps(
+        {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+    ).encode("utf-8")
 
     attempt = 0
     while True:
         attempt += 1
         try:
             req = urllib.request.Request(
-                f"{LLM_HOST}/v1/chat/completions", data=payload,
-                headers={"Content-Type": "application/json"}, method="POST",
+                f"{LLM_HOST}/v1/chat/completions",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -102,10 +108,10 @@ def _semaphore() -> asyncio.Semaphore:
 # ##################################################################
 # ask
 # async chat completion — runs the blocking call in a worker thread
-async def ask(prompt: str, system: str | None = None, temperature: float = 0.2,
-              max_tokens: int = 4096) -> str:
+async def ask(prompt: str, system: str | None = None, temperature: float = 0.2, max_tokens: int = 4096) -> str:
     async with _semaphore():
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            None, lambda: ask_sync(prompt, system, temperature, max_tokens),
+            None,
+            lambda: ask_sync(prompt, system, temperature, max_tokens),
         )

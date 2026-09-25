@@ -5,6 +5,7 @@ its own module; here we cover audio_synth's own logic against the CURRENT API:
 line splitting, real ffmpeg concatenation of real wavs, idempotent skipping,
 and the speaker-fallback validation. No mocks — ffmpeg is invoked for real.
 """
+
 import subprocess
 import tempfile
 from pathlib import Path
@@ -19,8 +20,14 @@ from src.audio_synth import concat_wavs, split_long_text, synthesize_chapter
 # return duration of a wav file in seconds via ffprobe
 def wav_duration(path: Path) -> float:
     cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
     ]
     out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
     return float(out.strip())
@@ -31,10 +38,19 @@ def wav_duration(path: Path) -> float:
 # generate a real short sine-tone wav via ffmpeg for concat tests
 def make_tone_wav(path: Path, seconds: float = 0.5) -> None:
     cmd = [
-        "ffmpeg", "-y", "-f", "lavfi", "-i",
-        f"sine=frequency=440:duration={seconds}", "-ar", "24000", "-ac", "1", str(path),
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"sine=frequency=440:duration={seconds}",
+        "-ar",
+        "24000",
+        "-ac",
+        "1",
+        str(path),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
     assert r.returncode == 0, r.stderr
 
 
@@ -70,9 +86,8 @@ def test_concat_wavs_real() -> None:
 # test concat wavs empty
 # concatenating nothing is a hard error, not a silent empty file
 def test_concat_wavs_empty() -> None:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        with pytest.raises(ValueError):
-            concat_wavs([], Path(tmpdir) / "out.wav")
+    with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(ValueError):
+        concat_wavs([], Path(tmpdir) / "out.wav")
 
 
 # ##################################################################

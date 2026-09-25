@@ -22,7 +22,7 @@ def parse_json_response(text: str) -> dict:
         start = text.find("```")
         end = text.rfind("```")
         if start != end:
-            block = text[start:end + 3]
+            block = text[start : end + 3]
             lines = block.split("\n")
             lines = lines[1:]
             if lines and lines[-1].strip() == "```":
@@ -34,16 +34,21 @@ def parse_json_response(text: str) -> dict:
             text = text[brace_pos:]
             end_brace = text.rfind("}")
             if end_brace != -1:
-                text = text[:end_brace + 1]
+                text = text[: end_brace + 1]
     return json.loads(text)
 
 
 async def _voice_description_for_one(char_id: str, info: dict) -> tuple[str, dict]:
     bio = info.get("bio") or info.get("description") or ""
     is_narrator = char_id == "narrator"
-    role_hint = ("Audiobook narrator. Focus on narration qualities: clarity, authority, "
-                 "warmth, pace, range for character voices.") if is_narrator else \
-                "Audiobook character voice for TTS cloning."
+    role_hint = (
+        (
+            "Audiobook narrator. Focus on narration qualities: clarity, authority, "
+            "warmth, pace, range for character voices."
+        )
+        if is_narrator
+        else "Audiobook character voice for TTS cloning."
+    )
     prompt = f"""You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.
 
 {role_hint}
@@ -67,9 +72,7 @@ Output the voice description text only. No JSON, no preamble."""
 # per-character parallel sonnet calls (batched JSON triggers refusal)
 async def generate_all_voice_descriptions(characters: dict) -> dict:
     print(f"  voice descriptions: {len(characters)} parallel sonnet calls")
-    results = await asyncio.gather(
-        *(_voice_description_for_one(cid, info) for cid, info in characters.items())
-    )
+    results = await asyncio.gather(*(_voice_description_for_one(cid, info) for cid, info in characters.items()))
     return {cid: desc for cid, desc in results}
 
 

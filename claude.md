@@ -193,3 +193,4 @@ M4B assembly auto-numbers duplicate titles: "Interlude" → "Interlude 1", "Inte
   BOOK_LLM_MODEL=qwen3.6:35b-a3b`. The OpenAI-compat shim on Ollama IGNORES
   `think:false` and burns max_tokens on a separate reasoning field — always
   use the native `/api/chat` style for thinking models.
+- **To stop a pipeline run, kill by the LOCK pid** (`kill $(cat output/<proj>/.pipeline.lock)`), never `pkill -f wrapper.sh` — the wrapper's `exec` chain leaves the venv python as an orphaned grandchild that keeps generating into the same project (happened twice; caused duplicate runners racing scene files).

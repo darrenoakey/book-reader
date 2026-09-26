@@ -39,6 +39,8 @@ RESTRAINT = (
     " patches, no dragon features — unless the character description explicitly says so."
     " Output ONE single continuous cinematic scene — never panels, split screen,"
     " collage, borders, or labels."
+    " Each named character appears EXACTLY ONCE in the scene — never show the same"
+    " person twice; background people are clearly different individuals."
 )
 
 # Spark's /mnt/arbiter-store is this Mac's /Volumes/ssd_4/arbiter (CIFS).

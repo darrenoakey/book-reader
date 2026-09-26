@@ -266,6 +266,7 @@ Rules: describe the SCENE (setting, action, composition, lighting, camera framin
 TWO HARD RULES about consistency:
 - Every character you NAME anywhere in the prompt MUST also appear in the "characters" list — the list drives which reference portraits condition the image, so a named-but-unlisted character renders as a random stranger.
 - Wardrobe lock: restate each shown character's clothing from their description and NEVER dress characters in matching/coordinated outfits unless their descriptions say so. A uniform described for ONE character belongs to that character alone.
+- Each character appears EXACTLY ONCE in the scene — the prompt must never place the same person in two spots, and must not describe a crowd that could include them.
 
 Output JSON only: {{"prompt": "<60-100 word image prompt>", "characters": ["<char_ids actually shown>"]}}. No markdown."""
     from src.voice_description import parse_json_response

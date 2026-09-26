@@ -95,10 +95,71 @@ def window_lines(lines: list[dict], target_seconds: float = TARGET_SECONDS) -> l
 
 
 # ##################################################################
-# distill appearances
-# one LLM call: characters.json bios → tight visual descriptions for image
-# generation (image models need LOOKS, not plot roles)
-def distill_appearances(output_dir: Path) -> dict:
+# world bible
+# one LLM call, cached: the world's GROUND RULES in plain visual language.
+# The image generator has no idea what the book's terms mean — "dragonrider"
+# drew HORSES until the prompts stated the rules. The bible also yields a
+# forbidden-visuals list appended to every generation.
+def world_bible(output_dir: Path, title: str) -> dict:
+    path = output_dir / "world_bible.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    chapters = sorted((output_dir / "chapters").glob("*.txt"))
+    sample = "\n\n".join(p.read_text(encoding="utf-8")[:3000] for p in chapters[1:3])
+    prompt = f"""You are building the world bible for an animated film of "{title}" — the ground rules an IMAGE GENERATOR needs so it never contradicts the setting.
+
+Read this sample of the book:
+{sample[:5500]}
+
+Output JSON only:
+{{
+  "world_summary": "<2-3 sentences: what kind of world, era, technology level, look>",
+  "rules": ["<plain visual directives about how the world works — e.g. 'riders ride large winged dragons; people travel on dragonback or on foot'>, ..."],
+  "forbidden": ["<things that must NEVER appear because they don't exist in this world or contradict it — e.g. 'horses', 'cars', 'guns'> — be aggressive: anything the image model might wrongly default to>"]
+}}
+
+Rules for the rules: state what things MEAN visually (an image model has not read the book); translate in-world terms into plain visuals; if the book's people ride dragons, say explicitly that there are no horses. No markdown."""
+    from src.voice_description import parse_json_response
+
+    bible = parse_json_response(ask_sync(prompt, max_tokens=1200))
+    bible.setdefault("world_summary", "")
+    bible.setdefault("rules", [])
+    bible.setdefault("forbidden", [])
+    path.write_text(json.dumps(bible, indent=2), encoding="utf-8")
+    return bible
+
+
+# ##################################################################
+# distill locations
+# one LLM call, cached: named LOCATIONS get the same treatment as characters —
+# gather everything the text says about each recurring place and distill one
+# canonical visual per location, so the Hatching Ground (etc.) looks the same
+# every time it appears.
+def distill_locations(output_dir: Path, bible: dict) -> dict:
+    path = output_dir / "locations.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    chapters = sorted((output_dir / "chapters").glob("*.txt"))
+    full = "\n\n".join(p.read_text(encoding="utf-8") for p in chapters[1:])
+    prompt = f"""You are the production designer on an animated film. Locations are characters too: find every NAMED or clearly-recurring LOCATION in this text (buildings, rooms, caverns, grounds, halls — places the action returns to), and for each, harvest EVERY visual detail the text gives and distill ONE canonical visual description.
+
+World rules (respect them): {bible.get('world_summary', '')} {' '.join(bible.get('rules', []))}
+
+Text:
+{full[:12000]}
+
+For each location output:
+- id: lowercase_snake (e.g. "hatching_ground", "great_hall", "lower_corridors")
+- name: display name
+- description: 50-80 words, CONCRETE and self-contained: size, materials, colors, light, key features, mood — what a viewer SEES. No in-world jargon without a plain explanation, no plot, no characters. Merge every detail the text gives about the place into one consistent picture.
+
+Output JSON only: {{"<loc_id>": {{"name": "...", "description": "..."}}, ...}}. No markdown."""
+    from src.voice_description import parse_json_response
+
+    locations = parse_json_response(ask_sync(prompt, max_tokens=3000))
+    path.write_text(json.dumps(locations, indent=2), encoding="utf-8")
+    return locations
+def distill_appearances(output_dir: Path, bible: dict | None = None) -> dict:
     path = output_dir / "appearances.json"
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
@@ -111,12 +172,13 @@ def distill_appearances(output_dir: Path) -> dict:
     )
     prompt = f"""You are the character designer on an animated family film. For each character below, write a tight VISUAL description (50-80 words) for an image generator.
 
-HARD RULES:
+{_bible_block(bible)}HARD RULES:
 - The image generator has NEVER read the book. The description must be fully self-contained: no names from the story world, no in-world terms, no plot, no roles, no relationships.
-- Be SPECIFIC and CONCRETE: age in years, height/build, hair color and style, eye color, face, skin tone, clothing described by plain garment names and colors. Less "young fantasy boy", more "boy, 10 years old, short and slight for his age, messy brown hair, brown eyes, loose beige linen shirt and brown trousers, bare feet".
+- Source details are AUTHORITATIVE: anything the source text states (footwear, clothing, hair, marks) MUST appear in your description unchanged — never drop a stated detail, never replace it with a stereotype. (A book said "heavy wher-hide boots"; a previous draft wrote "barefoot". Never again.)
+- Be SPECIFIC and CONCRETE: age in years, height/build, hair color and style, eye color, face, skin tone, clothing described by plain garment names and colors.
 - Humans are plain humans: normal skin, no scales, no fur, no animal features, unless the source text explicitly describes them.
-- Describe the character's CANONICAL default appearance only. Temporary states are NOT part of the look: ignore injuries, bandages, casts, dirt, disguises, bedding, or items carried in one scene, unless the character has them for essentially the whole story. (Keevan's plaster cast belongs to his injured chapters, not to his face.)
-- If the source gives few visual details, fill in SIMPLE neutral defaults consistent with what is given (age, gender, build) — never exotic ones.
+- Describe the character's CANONICAL default appearance only. Temporary states are NOT part of the look: ignore injuries, bandages, casts, dirt, disguises, bedding, or items carried in one scene, unless the character has them for essentially the whole story.
+- Defaults are ONLY for gaps the source never mentions, and must be SIMPLE and neutral, consistent with what IS given (age, gender, build) — never exotic.
 - If the character has no visual form (e.g. a narrator), write "NONE".
 
 Characters:
@@ -159,9 +221,27 @@ def choose_style(output_dir: Path) -> str:
 
 
 # ##################################################################
+# bible block
+# render the world bible as a prompt preamble (used by every LLM visual step)
+def _bible_block(bible: dict) -> str:
+    if not bible:
+        return ""
+    summary = bible.get("world_summary") or bible.get("context") or ""
+    if not summary:
+        return ""
+    rules = "\n".join(f"- {r}" for r in bible.get("rules", []))
+    forbidden = ", ".join(bible.get("forbidden", []))
+    return (
+        f"WORLD CONTEXT (ground truth about this story's world — overrides your assumptions):\n"
+        f"{summary}\n{rules}\n"
+        f"NEVER show (does not exist in this world): {forbidden}\n\n"
+    )
+
+
+# ##################################################################
 # prompt for scene
 # one LLM call per scene: the window's spoken text → a cinematic still prompt
-def _scene_prompt(scene: dict, style: str, appearances: dict, title: str) -> dict:
+def _scene_prompt(scene: dict, style: str, appearances: dict, title: str, bible: dict | None = None) -> dict:
     cast_notes = []
     for speaker in scene["speakers"]:
         if speaker == "narrator":
@@ -172,7 +252,7 @@ def _scene_prompt(scene: dict, style: str, appearances: dict, title: str) -> dic
     cast_block = "\n".join(cast_notes) or "(no named characters speak in this window)"
     prompt = f"""You are the storyboard artist on an animated film of "{title}". Write an image prompt for ONE cinematic 16:9 still illustrating this {scene['end'] - scene['start']:.0f}-second moment of the story.
 
-The still stays on screen for the whole window, so it MUST depict the window's temporal midpoint. Illustrate THIS moment:
+{_bible_block(bible)}The still stays on screen for the whole window, so it MUST depict the window's temporal midpoint. Illustrate THIS moment:
 {scene.get('mid_text') or scene['text'][:400]}
 
 Full spoken text during the window (context only — the midpoint moment above is the subject):
@@ -211,15 +291,20 @@ def build_storyboard(output_dir: Path, title: str) -> Path:
     lines = load_global_lines(output_dir)
     windows = window_lines(lines)
     style = choose_style(output_dir)
-    appearances = distill_appearances(output_dir)
+    bible = world_bible(output_dir, title)
+    appearances = distill_appearances(output_dir, bible)
+    locations = distill_locations(output_dir, bible)
     print(f"  storyboard: {len(windows)} scenes, style: {style[:80]}...")
     scenes = []
     for window in windows:
-        scenes.append(_scene_prompt(window, style, appearances, title))
+        scenes.append(_scene_prompt(window, style, appearances, title, bible))
         if (window["index"] + 1) % 10 == 0:
             print(f"    {window['index'] + 1}/{len(windows)} scene prompts")
     storyboard_path.write_text(
-        json.dumps({"style": style, "appearances": appearances, "scenes": scenes}, indent=2),
+        json.dumps(
+            {"style": style, "appearances": appearances, "locations": locations, "world_bible": bible, "scenes": scenes},
+            indent=2,
+        ),
         encoding="utf-8",
     )
     return storyboard_path

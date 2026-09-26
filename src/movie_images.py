@@ -259,6 +259,42 @@ def _scene_condition(output_dir: Path, characters: list[str], index: int) -> tup
 
 
 # ##################################################################
+# panel borders
+# detect a panelized output (the model reproducing the reference sheet's
+# layout as side-by-side panels). A panel border is a strong vertical edge
+# sustained in >65% of rows with a full-height brightness step — ordinary
+# scene content (columns, doorways) doesn't hold an edge that uniformly.
+def panel_borders(path: Path) -> list[int]:
+    import numpy as np
+
+    img = np.asarray(Image.open(path).convert("L").resize((640, 360)), dtype=np.float32)
+    dx = np.abs(np.diff(img, axis=1))
+    strong = (dx > 35).mean(axis=0)
+    step = []
+    for x in range(8, img.shape[1] - 9):
+        step.append(abs(img[:, x - 8 : x].mean() - img[:, x + 1 : x + 9].mean()))
+    step = [0.0] * 8 + step + [0.0] * 8
+    hits = [x for x in range(img.shape[1] - 1) if strong[x] > 0.65 and step[x] > 12]
+    merged: list[list[int]] = []
+    for x in hits:
+        if not merged or x - merged[-1][-1] > 5:
+            merged.append([x])
+        else:
+            merged[-1].append(x)
+    return [int(sum(g) / len(g)) for g in merged]
+
+
+# ##################################################################
+# forbidden block
+# the world-bible forbidden list as prompt text (no horses in a dragon book)
+def _forbidden_block(storyboard: dict) -> str:
+    forbidden = (storyboard.get("world_bible") or {}).get("forbidden", [])
+    if not forbidden:
+        return ""
+    return " Never show (does not exist in this world): " + ", ".join(forbidden) + "."
+
+
+# ##################################################################
 # generate scene images
 # one cinematic 16:9 still per storyboard scene → scenes/NNNN.png
 def generate_scene_images(output_dir: Path) -> list[Path]:
@@ -277,17 +313,27 @@ def generate_scene_images(output_dir: Path) -> list[Path]:
         prompt = scene["prompt"]
         if cond_note:
             prompt = f"{cond_note}Scene: {prompt}"
-        prompt = f"{prompt}{RESTRAINT}"
+        prompt = f"{prompt}{RESTRAINT}{_forbidden_block(storyboard)}"
         print(f"  scene {index + 1}/{len(scenes)} (chars: {','.join(scene.get('characters', [])) or 'none'}, chain: {'yes' if index > 0 else 'first'})")
-        qwen_image_to_file(
-            prompt,
-            dest,
-            SCENE_WIDTH,
-            SCENE_HEIGHT,
-            seed=2000 + index,
-            ref_image=cond,
-            why=f"scene {index} {scene.get('text_excerpt', '')[:60]}",
-        )
+        # Panel guard: qwen-image sometimes reproduces the reference sheet as
+        # side-by-side panels. Detect and resubmit with a fresh seed.
+        for attempt in range(3):
+            qwen_image_to_file(
+                prompt,
+                dest,
+                SCENE_WIDTH,
+                SCENE_HEIGHT,
+                seed=2000 + index + attempt * 100,
+                ref_image=cond,
+                why=f"scene {index} {scene.get('text_excerpt', '')[:60]}",
+            )
+            borders = panel_borders(dest)
+            if not borders:
+                break
+            log.warning("scene %04d panelized (borders at %s, attempt %d) — resubmitting", index, borders, attempt + 1)
+            print(f"    scene {index + 1}: panelized (borders {borders}) — retry {attempt + 1}/3")
+            if attempt < 2:
+                dest.unlink(missing_ok=True)
         written.append(dest)
     return written
 

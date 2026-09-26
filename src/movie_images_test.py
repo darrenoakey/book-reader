@@ -40,6 +40,31 @@ def test_contact_sheet() -> None:
 
 
 # ##################################################################
+# test panel borders
+# a synthetic two-panel image flags; a smooth scene-like gradient does not
+def test_panel_borders() -> None:
+    from src.movie_images import panel_borders
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        panel = Image.new("RGB", (1920, 1088), (30, 40, 60))
+        right = Image.new("RGB", (960, 1088), (210, 190, 150))
+        panel.paste(right, (960, 0))
+        panel_path = tmp / "panel.png"
+        panel.save(panel_path)
+        assert len(panel_borders(panel_path)) >= 1
+
+        smooth = Image.new("RGB", (1920, 1088))
+        px = smooth.load()
+        for y in range(1088):
+            for x in range(1920):
+                px[x, y] = (120 + x % 40, 140, 180 - y % 30)
+        smooth_path = tmp / "smooth.png"
+        smooth.save(smooth_path)
+        assert panel_borders(smooth_path) == []
+
+
+# ##################################################################
 # test qwen image real
 # one real small t2i job through the arbiter qwen-image adapter; proves
 # submit/poll/result-bytes all work and returns a genuine PNG

@@ -62,8 +62,8 @@ def _fetch(client: ArbiterClient, job_id: str, job_type: str, params: dict, outp
             current_jid = _submit(client, job_type, params)
         except ArbiterError as e:
             msg = str(e).lower()
-            if "failed" in msg or "cancelled" in msg or "timed out" in msg:
-                # job is dead — resubmit a new one
+            if "failed" in msg or "cancelled" in msg or "timed out" in msg or "not found" in msg:
+                # job is dead (or its record vanished server-side) — resubmit a new one
                 log.warning("fetch %s for %s: job died (%s) — resubmitting", job_type, output_path.name, e)
                 current_jid = _submit(client, job_type, params)
             else:

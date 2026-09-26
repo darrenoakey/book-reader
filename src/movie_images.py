@@ -87,7 +87,7 @@ def _fetch_image(client, job_id: str, params: dict, dest: Path, why: str) -> Non
             current = _submit(client, "qwen-image", params, why=why)
         except ArbiterError as e:
             msg = str(e).lower()
-            if "failed" in msg or "cancelled" in msg or "timed out" in msg:
+            if "failed" in msg or "cancelled" in msg or "timed out" in msg or "not found" in msg:
                 log.warning("qwen-image %s died (%s) — resubmitting", current, e)
                 current = _submit(client, "qwen-image", params, why=why)
             else:

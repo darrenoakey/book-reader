@@ -261,7 +261,7 @@ Full spoken text during the window (context only — the midpoint moment above i
 Characters speaking in this window (show only characters who are actually present in the action; use these exact visual descriptions if you show them):
 {cast_block}
 
-Rules: describe the SCENE (setting, action, composition, lighting, camera framing). Do not mention sound, narration, or dialogue. No text in the image. Show at most the listed characters. If no listed character is present, depict the setting/action alone.
+Rules: describe the SCENE (setting, action, composition, lighting, camera framing). Do not mention sound, narration, or dialogue. No text in the image. Show at most the listed characters. If no listed character is present, depict the setting/action alone. NEVER use negation ("no X", "never X", "without X") — describe only what IS present; exclusions are enforced through a separate channel, and negated words leak the concept into the image.
 
 TWO HARD RULES about consistency:
 - Every character you NAME anywhere in the prompt MUST also appear in the "characters" list — the list drives which reference portraits condition the image, so a named-but-unlisted character renders as a random stranger.

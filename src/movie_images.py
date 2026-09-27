@@ -112,6 +112,7 @@ def qwen_image_to_file(
     steps: int = 40,
     ref_image: Path | None = None,
     why: str | None = None,
+    negative_prompt: str | None = None,
 ) -> Path:
     if dest.exists() and dest.stat().st_size >= 1000:
         return dest
@@ -126,6 +127,12 @@ def qwen_image_to_file(
         "seed": seed,
         "force": True,
     }
+    if negative_prompt:
+        # The adapter only applies negative_prompt with true_cfg_scale > 1.
+        # World-forbidden items belong HERE, never in the positive prompt —
+        # writing "NO horses" into a prompt makes the model paint horses.
+        clean["negative_prompt"] = negative_prompt
+        clean["true_cfg_scale"] = 2.5
     if ref_image is not None:
         clean["image_file"] = stage_file(ref_image)
     reason = why or f"image {dest.name}"
@@ -287,13 +294,13 @@ def panel_borders(path: Path) -> list[int]:
 
 
 # ##################################################################
-# forbidden block
-# the world-bible forbidden list as prompt text (no horses in a dragon book)
-def _forbidden_block(storyboard: dict) -> str:
+# forbidden negative
+# the world-bible forbidden list for the NEGATIVE prompt channel — putting
+# "no horses" in the positive prompt is how we GOT horses (negation tokens
+# attract the concept)
+def _forbidden_negative(storyboard: dict) -> str:
     forbidden = (storyboard.get("world_bible") or {}).get("forbidden", [])
-    if not forbidden:
-        return ""
-    return " Never show (does not exist in this world): " + ", ".join(forbidden) + "."
+    return ", ".join(forbidden)
 
 
 # ##################################################################
@@ -315,7 +322,7 @@ def generate_scene_images(output_dir: Path) -> list[Path]:
         prompt = scene["prompt"]
         if cond_note:
             prompt = f"{cond_note}Scene: {prompt}"
-        prompt = f"{prompt}{RESTRAINT}{_forbidden_block(storyboard)}"
+        prompt = f"{prompt}{RESTRAINT}"
         print(f"  scene {index + 1}/{len(scenes)} (chars: {','.join(scene.get('characters', [])) or 'none'}, chain: {'yes' if index > 0 else 'first'})")
         # Panel guard: qwen-image sometimes reproduces the reference sheet as
         # side-by-side panels. Detect and resubmit with a fresh seed.
@@ -328,6 +335,7 @@ def generate_scene_images(output_dir: Path) -> list[Path]:
                 seed=2000 + index + attempt * 100,
                 ref_image=cond,
                 why=f"scene {index} {scene.get('text_excerpt', '')[:60]}",
+                negative_prompt=_forbidden_negative(storyboard) or None,
             )
             borders = panel_borders(dest)
             if not borders:

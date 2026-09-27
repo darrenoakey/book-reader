@@ -27,6 +27,7 @@ import tempfile
 from pathlib import Path
 
 from src.audio_synth import concat_wavs, wav_duration
+from src.title_page import TITLE_SECONDS
 
 FPS = 30
 WIDTH = 1920
@@ -111,7 +112,11 @@ def zoompan_filter(move: str, frames: int) -> str:
 # render one still into an h264 segment of EXACTLY `frames` frames
 def render_segment(image: Path, frames: int, move: str, dest: Path) -> Path:
     if dest.exists() and dest.stat().st_size > 1000:
-        return dest
+        # A cached segment is only valid for the SAME frame count — when the
+        # title card shaves frames off scene 0 its old segment must re-render.
+        if probe_frames(dest) == frames:
+            return dest
+        dest.unlink()
     dest.parent.mkdir(parents=True, exist_ok=True)
     _run(
         [
@@ -170,15 +175,34 @@ def assemble_movie(output_dir: Path, title: str) -> Path:
 
     # Frame budget per scene: round each boundary, never the durations.
     bounds = [round(float(s["start"]) * FPS) for s in scenes] + [total_frames]
+
+    # Opening title card: when title_page.png exists it holds for the first
+    # TITLE_SECONDS, carved out of scene 0's slot (total frames unchanged, so
+    # A/V sync is untouched). Scene 0 keeps at least one second of its own.
+    title_frames = 0
+    title_image = output_dir / "title_page.png"
+    if title_image.exists() and title_image.stat().st_size >= 1000:
+        first = bounds[1] - bounds[0]
+        title_frames = min(round(TITLE_SECONDS * FPS), first - FPS)
+        if title_frames < FPS:
+            title_frames = 0  # scene 0 too short to share — skip the card
+
     segments: list[Path] = []
+    if title_frames:
+        segments.append(render_segment(title_image, title_frames, "zoom-in", segments_dir / "title.mp4"))
+        print(f"    title card: {title_frames / FPS:.1f}s")
     for i, scene in enumerate(scenes):
         frames = bounds[i + 1] - bounds[i]
+        if i == 0:
+            frames -= title_frames
         if frames < 1:
             frames = FPS  # degenerate zero-width scene — give it one second
         image = output_dir / "scenes" / f"{int(scene['index']):04d}.png"
         if not image.exists():
             raise ValueError(f"scene image missing: {image} — run the sceneimages step")
-        move = MOVES[i % len(MOVES)]
+        # Offset the move cycle by one when the title card took zoom-in, so
+        # scene 0 never repeats the card's move.
+        move = MOVES[(i + (1 if title_frames else 0)) % len(MOVES)]
         segments.append(render_segment(image, frames, move, segments_dir / f"{i:04d}.mp4"))
         if (i + 1) % 10 == 0:
             print(f"    {i + 1}/{len(scenes)} segments rendered")

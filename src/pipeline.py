@@ -105,9 +105,9 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path) -> Path:
     print_step(1, "Extract chapters")
     if is_step_complete(output_dir, "extract"):
         print_skip("Already extracted")
-        title_line = (output_dir / "chapters" / "00-intro.txt").read_text().split(" by ")
-        title = title_line[0]
-        author = title_line[1].split(", narrated by")[0] if len(title_line) > 1 else "Unknown"
+        title_line = (output_dir / "chapters" / "00-intro.txt").read_text().split(" by ", 1)
+        title = title_line[0].strip()
+        author = title_line[1].split(", narrated by")[0].strip() if len(title_line) > 1 else "Unknown"
     else:
         with _time_step(output_dir, "extract"):
             title, author, written = extract_any(epub_path, output_dir)
@@ -170,7 +170,17 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path) -> Path:
             build_storyboard(output_dir, title)
         print_done("Storyboard built")
         mark_step_complete(output_dir, "storyboard")
-    print_step(9, "Generate character reference portraits (qwen-image)")
+    print_step(9, "Generate title page (qwen-image key art + tagline)")
+    if is_step_complete(output_dir, "titlepage"):
+        print_skip("Title page already generated")
+    else:
+        with _time_step(output_dir, "titlepage"):
+            from src.title_page import generate_title_page
+
+            generate_title_page(output_dir, title, author)
+        print_done("Title page generated")
+        mark_step_complete(output_dir, "titlepage")
+    print_step(10, "Generate character reference portraits (qwen-image)")
     if is_step_complete(output_dir, "refimages"):
         print_skip("Character refs already generated")
     else:
@@ -178,7 +188,7 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path) -> Path:
             refs = generate_character_refs(output_dir)
         print_done(f"Generated {len(refs)} character portraits")
         mark_step_complete(output_dir, "refimages")
-    print_step(10, "Generate scene images (qwen-image)")
+    print_step(11, "Generate scene images (qwen-image)")
     if is_step_complete(output_dir, "sceneimages"):
         print_skip("Scene images already generated")
     else:
@@ -186,7 +196,7 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path) -> Path:
             scene_images = generate_scene_images(output_dir)
         print_done(f"Generated {len(scene_images)} scene images")
         mark_step_complete(output_dir, "sceneimages")
-    print_step(11, "Assemble movie (Ken Burns pan/zoom + narration)")
+    print_step(12, "Assemble movie (Ken Burns pan/zoom + narration)")
     if is_step_complete(output_dir, "movie"):
         print_skip("Movie already assembled")
         movie_path = output_dir / "movie" / "movie.mp4"

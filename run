@@ -201,7 +201,7 @@ def main(argv: list[str]) -> int:
         "step",
         choices=[
             "extract", "characters", "voices", "clone", "scripts", "audio", "m4b",
-            "storyboard", "refimages", "sceneimages", "movie",
+            "storyboard", "titlepage", "refimages", "sceneimages", "movie",
         ],
     )
     p_step.add_argument("epub", help="Path to EPUB file (or .md/.txt story)")

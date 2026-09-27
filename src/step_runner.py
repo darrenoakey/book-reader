@@ -24,10 +24,10 @@ init(autoreset=True)
 # extract title and author from intro file
 def get_book_info(output_dir: Path) -> tuple[str, str]:
     intro = (output_dir / "chapters" / "00-intro.txt").read_text()
-    parts = intro.split(" by ")
+    parts = intro.split(" by ", 1)  # maxsplit=1: "narrated by X" also contains " by "
     title = parts[0]
     author = parts[1].split(", narrated by")[0] if len(parts) > 1 else "Unknown"
-    return title, author
+    return title.strip(), author.strip()
 
 
 # ##################################################################
@@ -94,6 +94,14 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0) -> int:
         print(f"Built storyboard: {len(scenes)} scenes")
         mark_step_complete(output_dir, "storyboard")
 
+    elif step == "titlepage":
+        title, author = get_book_info(output_dir)
+        from src.title_page import generate_title_page
+
+        page = generate_title_page(output_dir, title, author)
+        print(f"Generated {page}")
+        mark_step_complete(output_dir, "titlepage")
+
     elif step == "refimages":
         refs = generate_character_refs(output_dir)
         print(f"Generated {len(refs)} character reference portraits")
@@ -112,7 +120,7 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0) -> int:
 
     else:
         print(f"Unknown step: {step}")
-        print("Valid steps: extract, characters, voices, scripts, audio, m4b, storyboard, refimages, sceneimages, movie")
+        print("Valid steps: extract, characters, voices, scripts, audio, m4b, storyboard, titlepage, refimages, sceneimages, movie")
         return 1
 
     return 0

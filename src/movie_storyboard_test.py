@@ -1,6 +1,8 @@
 """Tests for movie_storyboard: per-book scene-seconds image frequency."""
 
 from pathlib import Path
+
+
 # ##################################################################
 # test choose scene seconds
 # scene_seconds.txt overrides the default; garbage and out-of-range fail closed

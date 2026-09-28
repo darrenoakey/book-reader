@@ -29,6 +29,24 @@ TARGET_SECONDS = 30.0
 
 
 # ##################################################################
+# choose scene seconds
+# per-book image frequency: <output>/scene_seconds.txt overrides
+# TARGET_SECONDS (written by `./run create --scene-seconds N`); a rebuilt
+# storyboard keeps its recorded value via storyboard.json scene spacing
+def choose_scene_seconds(output_dir: Path) -> float:
+    cfg = output_dir / "scene_seconds.txt"
+    if cfg.exists():
+        try:
+            value = float(cfg.read_text(encoding="utf-8").strip())
+        except ValueError:
+            raise ValueError(f"scene_seconds.txt is not a number: {cfg.read_text().strip()!r}") from None
+        if not 5.0 <= value <= 120.0:
+            raise ValueError(f"scene_seconds {value} outside 5..120s")
+        return value
+    return TARGET_SECONDS
+
+
+# ##################################################################
 # load global lines
 # flatten every chapter timeline into one global line stream with absolute
 # second offsets across the whole book
@@ -290,7 +308,7 @@ def build_storyboard(output_dir: Path, title: str) -> Path:
     if storyboard_path.exists():
         return storyboard_path
     lines = load_global_lines(output_dir)
-    windows = window_lines(lines)
+    windows = window_lines(lines, target_seconds=choose_scene_seconds(output_dir))
     style = choose_style(output_dir)
     bible = world_bible(output_dir, title)
     appearances = distill_appearances(output_dir, bible)

@@ -66,6 +66,9 @@ _out.mkdir(parents=True, exist_ok=True)
 _style = {args.style!r}
 if _style:
     (_out / "style.txt").write_text(_style, encoding="utf-8")
+_scene_seconds = {args.scene_seconds!r}
+if _scene_seconds:
+    (_out / "scene_seconds.txt").write_text(str(_scene_seconds), encoding="utf-8")
 run_pipeline(Path("{epub_path}"))
 '''
     return run_venv([str(VENV_PYTHON), "-c", code])
@@ -191,6 +194,7 @@ def main(argv: list[str]) -> int:
     p_create = sub.add_parser("create", help="Convert EPUB to audiobook")
     p_create.add_argument("epub", help="Path to EPUB file")
     p_create.add_argument("--style", default=None, help="Visual style for the movie (writes the project's style.txt override)")
+    p_create.add_argument("--scene-seconds", type=float, default=0.0, help="Seconds per scene image (default 30; writes scene_seconds.txt)")
     p_create.set_defaults(func=command_create)
 
     p_test = sub.add_parser("test", help="Run a single test target")

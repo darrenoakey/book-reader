@@ -44,10 +44,13 @@ RESTRAINT = (
     " person twice; background people are clearly different individuals."
 )
 
-# Parallel qwen-image submissions. The arbiter adapter runs max_concurrent=2
-# (verified stable 2026-09-27: two simultaneous jobs completed, second landed
-# 9s after the first instead of a full job later); extra submissions simply
-# queue server-side, so this is safe at any server-side concurrency.
+# Parallel qwen-image SUBMISSIONS. The server serializes execution
+# (max_concurrent=1 — the adapter is NOT thread-safe: 2 truly-concurrent
+# 1024px jobs die with `IndexError: index 41 is out of bounds`, observed
+# 2026-09-28; a 512px test passing was luck, no DiT overlap. max_instances=2
+# can't fit: 2x52GB > 90GB VRAM budget, and lowering the declaration risks
+# crashing spark's unified memory). This pool only overlaps submit/poll
+# bookkeeping — never rely on it for execution parallelism.
 IMAGE_WORKERS = 2
 
 # Spark's /mnt/arbiter-store is this Mac's /Volumes/ssd_4/arbiter (CIFS).

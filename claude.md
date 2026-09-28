@@ -194,3 +194,12 @@ M4B assembly auto-numbers duplicate titles: "Interlude" → "Interlude 1", "Inte
   `think:false` and burns max_tokens on a separate reasoning field — always
   use the native `/api/chat` style for thinking models.
 - **To stop a pipeline run, kill by the LOCK pid** (`kill $(cat output/<proj>/.pipeline.lock)`), never `pkill -f wrapper.sh` — the wrapper's `exec` chain leaves the venv python as an orphaned grandchild that keeps generating into the same project (happened twice; caused duplicate runners racing scene files).
+
+## Long runs: ALWAYS detached + sleep (agent rule 2026-09-27)
+`./run create` (full pipeline: TTS + qwen-image scenes + movie render) takes
+1.5-2.5h per book. NEVER run it as a foreground tool call (10-min ceiling
+kills it). Launch with nohup → log file, then use the agentd3 sleep tool in
+~20-60 min cycles, checking the log and state.jsonl on each wake. Same for
+`./run step sceneimages` / `step movie` on a full book, and for the real
+ffmpeg test files (movie_assemble_test + title_page_test ≈ 3.5 min since the
+4x anti-jitter prescale).

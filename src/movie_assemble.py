@@ -33,13 +33,47 @@ FPS = 30
 WIDTH = 1920
 HEIGHT = 1080
 
-# Ken Burns moves cycled deterministically by scene index — every scene moves,
-# no two neighbours move the same way.
-MOVES = ("zoom-in", "zoom-out", "pan-right", "pan-left", "pan-down", "pan-up")
+# Camera grammar: every move is ONE linear transition from a START view to an
+# END view, where a view is (zoom, cx, cy) — zoom factor and crop-centre as
+# frame fractions. A scene gets exactly ONE movement: constant velocity from
+# start to end across the whole segment, never a change of direction. A move
+# may combine a zoom and a pan (still one movement). STATICS hold perfectly
+# still — every STATIC_EVERY-th scene rests.
+View = tuple[float, float, float]
 
-# Stills arrive at 1920x1088; upscale 1.5x so pans/zooms crop from real
-# pixels instead of smearing (zoompan samples from the scaled input).
-_UPSCALE = f"scale={WIDTH * 3 // 2}:{HEIGHT * 3 // 2}:flags=lanczos"
+MOVES: dict[str, tuple[View, View]] = {
+    "zoom-in": ((1.00, 0.50, 0.50), (1.14, 0.50, 0.50)),
+    "zoom-out": ((1.14, 0.50, 0.50), (1.00, 0.50, 0.50)),
+    "drift-right": ((1.14, 0.34, 0.50), (1.14, 0.66, 0.50)),
+    "drift-left": ((1.14, 0.66, 0.50), (1.14, 0.34, 0.50)),
+    "rise": ((1.06, 0.50, 0.64), (1.18, 0.50, 0.42)),
+    "settle": ((1.18, 0.50, 0.40), (1.06, 0.50, 0.62)),
+    "climb": ((1.14, 0.50, 0.66), (1.14, 0.50, 0.36)),
+}
+STATICS: dict[str, tuple[View, View]] = {
+    "still-centre": ((1.12, 0.50, 0.50), (1.12, 0.50, 0.50)),
+    "still-left": ((1.14, 0.40, 0.48), (1.14, 0.40, 0.48)),
+    "still-right": ((1.14, 0.60, 0.52), (1.14, 0.60, 0.52)),
+}
+_MOVE_CYCLE = tuple(MOVES)
+_STATIC_CYCLE = tuple(STATICS)
+STATIC_EVERY = 5  # every 5th scene holds still
+
+# Anti-jitter: zoompan steps in integer source pixels, so pans judder when a
+# frame advances <1 source px. Pre-scaling the still 4x (once, cached — not
+# in the per-frame filter graph) makes each step 0.25 output px: invisible.
+_SUPER = 4
+
+
+# ##################################################################
+# scene move
+# the move for scene `index`: every STATIC_EVERY-th scene rests; the rest
+# cycle the moving moves (offset by one when a title card took zoom-in)
+def scene_move(index: int, title: bool = False) -> str:
+    if index % STATIC_EVERY == STATIC_EVERY - 1:
+        return _STATIC_CYCLE[(index // STATIC_EVERY) % len(_STATIC_CYCLE)]
+    ordinal = index - (index // STATIC_EVERY)  # count of moving scenes so far
+    return _MOVE_CYCLE[(ordinal + (1 if title else 0)) % len(_MOVE_CYCLE)]
 
 
 # ##################################################################
@@ -80,31 +114,40 @@ def probe_frames(path: Path) -> int:
 
 # ##################################################################
 # zoompan filter
-# one Ken Burns move as a complete -vf chain: upscale, animate, deliver
-# WIDTHxHEIGHT yuv420p at FPS with exactly `frames` frames per input frame
+# one camera move as a complete -vf chain: a single linear ramp from the
+# start view to the end view (constant velocity, one direction), delivering
+# WIDTHxHEIGHT yuv420p at FPS with exactly `frames` frames per input frame.
+# Input MUST be pre-scaled (see _prescaled) — there is no in-graph upscale.
+def _lerp(a: float, b: float, t: str) -> str:
+    if a == b:
+        return f"{a:g}"
+    return f"{a:g}+({b - a:g})*{t}"
+
+
 def zoompan_filter(move: str, frames: int) -> str:
     if frames < 1:
         raise ValueError("frames must be >= 1")
-    if move not in MOVES:
+    views = MOVES.get(move) or STATICS.get(move)
+    if views is None:
         raise ValueError(f"unknown move {move!r}")
+    (z0, cx0, cy0), (z1, cx1, cy1) = views
     t = f"on/{frames - 1}" if frames > 1 else "1"  # 0..1 progress over the segment
-    if move == "zoom-in":
-        z, x, y = f"1+0.12*{t}", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
-    elif move == "zoom-out":
-        z, x, y = f"1.12-0.12*{t}", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
-    elif move == "pan-right":
-        z, x, y = "1.14", f"(iw-iw/zoom)*{t}", "(ih-ih/zoom)/2"
-    elif move == "pan-left":
-        z, x, y = "1.14", f"(iw-iw/zoom)*(1-{t})", "(ih-ih/zoom)/2"
-    elif move == "pan-down":
-        z, x, y = "1.14", "(iw-iw/zoom)/2", f"(ih-ih/zoom)*{t}"
-    else:  # pan-up
-        z, x, y = "1.14", "(iw-iw/zoom)/2", f"(ih-ih/zoom)*(1-{t})"
-    return (
-        f"{_UPSCALE},"
-        f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS},"
-        "format=yuv420p"
-    )
+    z = _lerp(z0, z1, t)
+    x = f"(iw-iw/zoom)*({_lerp(cx0, cx1, t)})"
+    y = f"(ih-ih/zoom)*({_lerp(cy0, cy1, t)})"
+    return f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS},format=yuv420p"
+
+
+# ##################################################################
+# prescaled
+# the still upscaled _SUPERx, cached beside the segments (rebuilt if the
+# source image is newer) — one ffmpeg call per segment, not per frame
+def _prescaled(image: Path, cache_dir: Path) -> Path:
+    scaled = cache_dir / f"{image.stem}-{_SUPER}x.png"
+    if not scaled.exists() or scaled.stat().st_mtime < image.stat().st_mtime:
+        scaled.parent.mkdir(parents=True, exist_ok=True)
+        _run(["ffmpeg", "-y", "-i", str(image), "-vf", f"scale={WIDTH * _SUPER}:-1:flags=lanczos", str(scaled)])
+    return scaled
 
 
 # ##################################################################
@@ -114,13 +157,16 @@ def render_segment(image: Path, frames: int, move: str, dest: Path) -> Path:
     if dest.exists() and dest.stat().st_size > 1000:
         # A cached segment is only valid for the SAME frame count — when the
         # title card shaves frames off scene 0 its old segment must re-render.
+        # (The move is encoded in the filename, so a move-engine change busts
+        # the cache automatically.)
         if probe_frames(dest) == frames:
             return dest
         dest.unlink()
     dest.parent.mkdir(parents=True, exist_ok=True)
+    scaled = _prescaled(image, dest.parent / ".prescaled")
     _run(
         [
-            "ffmpeg", "-y", "-loop", "1", "-i", str(image),
+            "ffmpeg", "-y", "-loop", "1", "-i", str(scaled),
             "-vf", zoompan_filter(move, frames),
             "-frames:v", str(frames),
             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
@@ -189,7 +235,7 @@ def assemble_movie(output_dir: Path, title: str) -> Path:
 
     segments: list[Path] = []
     if title_frames:
-        segments.append(render_segment(title_image, title_frames, "zoom-in", segments_dir / "title.mp4"))
+        segments.append(render_segment(title_image, title_frames, "zoom-in", segments_dir / "title.zoom-in.mp4"))
         print(f"    title card: {title_frames / FPS:.1f}s")
     for i, scene in enumerate(scenes):
         frames = bounds[i + 1] - bounds[i]
@@ -200,10 +246,9 @@ def assemble_movie(output_dir: Path, title: str) -> Path:
         image = output_dir / "scenes" / f"{int(scene['index']):04d}.png"
         if not image.exists():
             raise ValueError(f"scene image missing: {image} — run the sceneimages step")
-        # Offset the move cycle by one when the title card took zoom-in, so
-        # scene 0 never repeats the card's move.
-        move = MOVES[(i + (1 if title_frames else 0)) % len(MOVES)]
-        segments.append(render_segment(image, frames, move, segments_dir / f"{i:04d}.mp4"))
+        # One movement per scene, assigned deterministically; every 5th rests.
+        move = scene_move(i, title=bool(title_frames))
+        segments.append(render_segment(image, frames, move, segments_dir / f"{i:04d}.{move}.mp4"))
         if (i + 1) % 10 == 0:
             print(f"    {i + 1}/{len(scenes)} segments rendered")
 
@@ -247,4 +292,4 @@ def assemble_movie(output_dir: Path, title: str) -> Path:
     return movie_path
 
 
-__all__ = ["FPS", "assemble_movie", "probe_duration", "render_segment", "zoompan_filter"]
+__all__ = ["FPS", "MOVES", "STATICS", "assemble_movie", "probe_duration", "render_segment", "scene_move", "zoompan_filter"]

@@ -108,11 +108,11 @@ def test_assemble_movie_with_title_real() -> None:
         expected_frames = round(total_seconds * FPS)
         assert probe_frames(movie) == expected_frames
         assert abs(probe_duration(movie) - total_seconds) < 0.1
-        title_seg = out / "movie" / "segments" / "title.mp4"
-        assert title_seg.exists()
+        segments_dir = out / "movie" / "segments"
+        title_seg = next(segments_dir.glob("title.*.mp4"))
         assert probe_frames(title_seg) == FPS  # capped: 2s scene − 1s reserve
         # scene 0 keeps exactly its remaining second
-        assert probe_frames(out / "movie" / "segments" / "0000.mp4") == FPS
+        assert probe_frames(next(segments_dir.glob("0000.*.mp4"))) == FPS
 
 
 # ##################################################################

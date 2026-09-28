@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -42,6 +43,12 @@ RESTRAINT = (
     " Each named character appears EXACTLY ONCE in the scene — never show the same"
     " person twice; background people are clearly different individuals."
 )
+
+# Parallel qwen-image submissions. The arbiter adapter runs max_concurrent=2
+# (verified stable 2026-09-27: two simultaneous jobs completed, second landed
+# 9s after the first instead of a full job later); extra submissions simply
+# queue server-side, so this is safe at any server-side concurrency.
+IMAGE_WORKERS = 2
 
 # Spark's /mnt/arbiter-store is this Mac's /Volumes/ssd_4/arbiter (CIFS).
 _SPARK_PREFIX = "/mnt/arbiter-store/"
@@ -204,9 +211,10 @@ def generate_character_refs(output_dir: Path) -> list[Path]:
         names = {cid: (info or {}).get("name", cid) for cid, info in characters.items()}
     refs_dir = output_dir / "refs"
     refs_dir.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
     cast = [(cid, a) for cid, a in sorted(appearances.items()) if a and a != "NONE" and cid != "narrator"]
-    for index, (cid, appearance) in enumerate(cast):
+
+    def _render_ref(item: tuple[int, tuple[str, str]]) -> Path:
+        index, (cid, appearance) = item
         dest = refs_dir / f"{cid}.png"
         name = names.get(cid, cid.replace("-", " "))
         prompt = (
@@ -216,7 +224,10 @@ def generate_character_refs(output_dir: Path) -> list[Path]:
         )
         print(f"  ref {index + 1}/{len(cast)}: {cid}")
         qwen_image_to_file(prompt, dest, REF_SIZE, REF_SIZE, seed=5000 + index, why=f"character ref {cid}")
-        written.append(dest)
+        return dest
+
+    with ThreadPoolExecutor(max_workers=IMAGE_WORKERS) as pool:
+        written = list(pool.map(_render_ref, enumerate(cast)))
     return written
 
 
@@ -232,11 +243,11 @@ def generate_character_refs(output_dir: Path) -> list[Path]:
 # whose remaining tiles are the visible characters' portraits (identity).
 # Scene 0 (no previous) uses portraits alone; a character-less scene N>0
 # conditions on the previous scene alone.
-def _scene_condition(output_dir: Path, characters: list[str], index: int) -> tuple[Path | None, str]:
+def _scene_condition(output_dir: Path, characters: list[str], index: int, prev_index: int | None) -> tuple[Path | None, str]:
     refs_dir = output_dir / "refs"
     available = [(cid, refs_dir / f"{cid}.png") for cid in characters if (refs_dir / f"{cid}.png").exists()]
-    prev = output_dir / "scenes" / f"{index - 1:04d}.png"
-    has_prev = index > 0 and prev.exists() and prev.stat().st_size >= 1000
+    prev = output_dir / "scenes" / f"{prev_index:04d}.png" if prev_index is not None else None
+    has_prev = prev is not None and prev.exists() and prev.stat().st_size >= 1000
 
     style_note = (
         "The reference sheet's FIRST tile (labelled STYLE REF) is the previous scene: "
@@ -304,48 +315,74 @@ def _forbidden_negative(storyboard: dict) -> str:
 
 
 # ##################################################################
+# latest completed scene
+# the highest-index scene still below `before_index` whose PNG is on disk —
+# with parallel workers the immediate predecessor may still be rendering, so
+# the STYLE REF is the most recent COMPLETED scene (style drift bounded: the
+# anchor is never more than IMAGE_WORKERS scenes behind)
+def _latest_completed_scene(scenes_dir: Path, before_index: int) -> int | None:
+    for j in range(before_index - 1, -1, -1):
+        prev = scenes_dir / f"{j:04d}.png"
+        if prev.exists() and prev.stat().st_size >= 1000:
+            return j
+    return None
+
+
+# ##################################################################
+# render scene
+# one scene's full cycle: condition → submit → panel guard (thread-owned)
+def _render_scene(output_dir: Path, storyboard: dict, scene: dict) -> Path:
+    scenes_dir = output_dir / "scenes"
+    index = int(scene["index"])
+    dest = scenes_dir / f"{index:04d}.png"
+    if dest.exists() and dest.stat().st_size >= 1000:
+        return dest
+    prev_index = _latest_completed_scene(scenes_dir, index)
+    cond, cond_note = _scene_condition(output_dir, scene.get("characters", []), index, prev_index)
+    prompt = scene["prompt"]
+    if cond_note:
+        prompt = f"{cond_note}Scene: {prompt}"
+    prompt = f"{prompt}{RESTRAINT}"
+    print(f"  scene {index + 1} (chars: {','.join(scene.get('characters', [])) or 'none'}, chain: {prev_index if prev_index is not None else 'first'})")
+    # Panel guard: qwen-image sometimes reproduces the reference sheet as
+    # side-by-side panels. Detect and resubmit with a fresh seed.
+    for attempt in range(3):
+        qwen_image_to_file(
+            prompt,
+            dest,
+            SCENE_WIDTH,
+            SCENE_HEIGHT,
+            seed=2000 + index + attempt * 100,
+            ref_image=cond,
+            why=f"scene {index} {scene.get('text_excerpt', '')[:60]}",
+            negative_prompt=_forbidden_negative(storyboard) or None,
+        )
+        borders = panel_borders(dest)
+        if not borders:
+            break
+        log.warning("scene %04d panelized (borders at %s, attempt %d) — resubmitting", index, borders, attempt + 1)
+        print(f"    scene {index + 1}: panelized (borders {borders}) — retry {attempt + 1}/3")
+        if attempt < 2:
+            dest.unlink(missing_ok=True)
+    return dest
+
+
+# ##################################################################
 # generate scene images
-# one cinematic 16:9 still per storyboard scene → scenes/NNNN.png
+# one cinematic 16:9 still per storyboard scene → scenes/NNNN.png. Scene 0
+# renders ALONE first: it anchors the style chain, so every later scene has
+# a completed STYLE REF when the worker pool fans out.
 def generate_scene_images(output_dir: Path) -> list[Path]:
     storyboard = _load_storyboard(output_dir)
-    scenes = storyboard["scenes"]
+    scenes = sorted(storyboard["scenes"], key=lambda s: int(s["index"]))
     scenes_dir = output_dir / "scenes"
     scenes_dir.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
-    for scene in scenes:
-        index = int(scene["index"])
-        dest = scenes_dir / f"{index:04d}.png"
-        if dest.exists() and dest.stat().st_size >= 1000:
-            written.append(dest)
-            continue
-        cond, cond_note = _scene_condition(output_dir, scene.get("characters", []), index)
-        prompt = scene["prompt"]
-        if cond_note:
-            prompt = f"{cond_note}Scene: {prompt}"
-        prompt = f"{prompt}{RESTRAINT}"
-        print(f"  scene {index + 1}/{len(scenes)} (chars: {','.join(scene.get('characters', [])) or 'none'}, chain: {'yes' if index > 0 else 'first'})")
-        # Panel guard: qwen-image sometimes reproduces the reference sheet as
-        # side-by-side panels. Detect and resubmit with a fresh seed.
-        for attempt in range(3):
-            qwen_image_to_file(
-                prompt,
-                dest,
-                SCENE_WIDTH,
-                SCENE_HEIGHT,
-                seed=2000 + index + attempt * 100,
-                ref_image=cond,
-                why=f"scene {index} {scene.get('text_excerpt', '')[:60]}",
-                negative_prompt=_forbidden_negative(storyboard) or None,
-            )
-            borders = panel_borders(dest)
-            if not borders:
-                break
-            log.warning("scene %04d panelized (borders at %s, attempt %d) — resubmitting", index, borders, attempt + 1)
-            print(f"    scene {index + 1}: panelized (borders {borders}) — retry {attempt + 1}/3")
-            if attempt < 2:
-                dest.unlink(missing_ok=True)
-        written.append(dest)
-    return written
+    if scenes:
+        _render_scene(output_dir, storyboard, scenes[0])
+    if len(scenes) > 1:
+        with ThreadPoolExecutor(max_workers=IMAGE_WORKERS) as pool:
+            list(pool.map(lambda s: _render_scene(output_dir, storyboard, s), scenes[1:]))
+    return [scenes_dir / f"{int(s['index']):04d}.png" for s in scenes]
 
 
 __all__ = [

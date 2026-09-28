@@ -11,7 +11,16 @@ from pathlib import Path
 from PIL import Image
 
 from src.audio_synth import wav_duration
-from src.movie_assemble import FPS, assemble_movie, probe_duration, render_segment, zoompan_filter
+from src.movie_assemble import (
+    FPS,
+    MOVES,
+    STATICS,
+    assemble_movie,
+    probe_duration,
+    render_segment,
+    scene_move,
+    zoompan_filter,
+)
 
 
 # ##################################################################
@@ -34,13 +43,32 @@ def _make_still(path: Path, color: tuple[int, int, int]) -> None:
 
 # ##################################################################
 # test zoompan filter
-# every move produces a complete, well-formed filter string
+# every move (moving or static) produces a complete, well-formed filter
+# string carrying exactly one linear start→end ramp
 def test_zoompan_filter_shapes() -> None:
-    for move in ("zoom-in", "zoom-out", "pan-right", "pan-left", "pan-down", "pan-up"):
+    for move in list(MOVES) + list(STATICS):
         f = zoompan_filter(move, 90)
-        assert "scale=" in f and "zoompan=" in f and "d=90" in f
+        assert "zoompan=" in f and "d=90" in f
         assert "s=1920x1080" in f and f"fps={FPS}" in f
         assert "format=yuv420p" in f
+        assert "scale=" not in f  # pre-scaled input, never an in-graph upscale
+
+
+# ##################################################################
+# test move grammar
+# moving moves change the view in ONE direction; statics hold perfectly
+# still; every 5th scene rests; a title card shifts scene 0 off zoom-in
+def test_move_grammar() -> None:
+    for start, end in MOVES.values():
+        assert start != end
+    for start, end in STATICS.values():
+        assert start == end
+    assert STATICS  # the grammar MUST contain rest frames
+    assert scene_move(4) in STATICS and scene_move(9) in STATICS
+    assert scene_move(0) == "zoom-in"
+    assert scene_move(0, title=True) != "zoom-in"
+    for i in range(20):
+        assert scene_move(i) in MOVES or scene_move(i) in STATICS
 
 
 # ##################################################################

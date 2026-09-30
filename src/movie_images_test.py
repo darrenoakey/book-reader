@@ -51,11 +51,16 @@ def test_style_and_cast_condition_sheet() -> None:
         refs.mkdir()
         _make_portrait(root / "style-reference.png", (70, 100, 140))
         _make_portrait(refs / "ira.png", (210, 120, 80))
-        condition, note = _scene_condition(root, ["ira"], 0, None)
+        scenes = root / "scenes"
+        scenes.mkdir()
+        _make_portrait(scenes / "0000.png", (30, 40, 50))
+        (root / "image_reference_mode.txt").write_text("style-and-cast-only\n", encoding="utf-8")
+        condition, note = _scene_condition(root, ["ira"], 1, 0)
         assert condition is not None
-        assert condition.name == "0000.png"
+        assert condition.name == "0001.png"
         assert "STYLE REFERENCE" in note
         assert "not a scene" in note
+        assert "PREVIOUS SCENE" not in note
         assert "ira" in note
 
 

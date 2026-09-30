@@ -255,8 +255,11 @@ def _scene_condition(
     available = [(cid, refs_dir / f"{cid}.png") for cid in characters if (refs_dir / f"{cid}.png").exists()]
     style_image = output_dir / "style-reference.png"
     has_style_image = style_image.is_file()
+    mode_path = output_dir / "image_reference_mode.txt"
+    mode = mode_path.read_text(encoding="utf-8").strip() if mode_path.exists() else ""
+    use_previous_scene = mode != "style-and-cast-only"
     prev = output_dir / "scenes" / f"{prev_index:04d}.png" if prev_index is not None else None
-    has_prev = prev is not None and prev.exists() and prev.stat().st_size >= 1000
+    has_prev = use_previous_scene and prev is not None and prev.exists() and prev.stat().st_size >= 1000
 
     tiles: list[tuple[str, Path]] = []
     if has_style_image:

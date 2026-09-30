@@ -69,6 +69,16 @@ def source_fingerprint(source: Path) -> str:
 
 
 # ##################################################################
+# verify hour runtime
+# prove the production interpreter can import the complete runner and bind this source without calling an LLM, TTS, or image service.
+def verify_hour_runtime(source: Path) -> dict[str, str]:
+    source = source.resolve()
+    if not source.is_file():
+        raise ValueError(f"input source is not a file: {source}")
+    return {"source": str(source), "sha256": source_fingerprint(source), "output": str(get_output_dir(source))}
+
+
+# ##################################################################
 # hour ledger
 # load the durable sequence ledger, rejecting a different source at the same output path.
 def load_ledger(project: Path, source: Path) -> dict:
@@ -203,6 +213,8 @@ def prepare_hour_directory(project: Path, hour_dir: Path) -> None:
         if (project / name).exists():
             link_shared(hour_dir, project, name)
     (hour_dir / "scene_seconds.txt").write_text(f"{SCENE_SECONDS:g}\n", encoding="utf-8")
+    # Hourly productions deliberately use only the clean style asset and canonical cast portraits.
+    (hour_dir / "image_reference_mode.txt").write_text("style-and-cast-only\n", encoding="utf-8")
 
 
 # ##################################################################

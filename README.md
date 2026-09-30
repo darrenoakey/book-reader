@@ -51,9 +51,9 @@ Give it an EPUB (or a plain `.md` / `.txt` story) and it produces:
 
 ## Long-book hourly production
 
-`./run hour SOURCE --hour N` produces exactly one durable production hour from a full source. It extracts the source once, analyzes and scripts only the chapters needed for that hour, and records the next chapter/piece cursor in `hours.json` only after the 720p movie succeeds. The output is `output/<source-stem>/hours/hour-NNN/movie/movie.mp4` and is rejected if it exceeds 3600 seconds. Chapter order is numeric even after chapter 99.
+`./run hour SOURCE --hour N` produces exactly one durable production hour from a full source. It extracts the source once, analyzes and scripts only the chapters needed for that hour, and records the next chapter/piece cursor in `hours.json` only after the 854×480 movie succeeds. The output is `output/<source-stem>/hours/hour-NNN/movie/movie.mp4` and is rejected if it exceeds 3600 seconds. Chapter order is numeric even after chapter 99.
 
-The project-root `characters.json`, `voices.json`, `breeze_voices.json`, `voices/`, and `refs/` are shared across hours. Existing identities, Breeze reference clips, and portraits are never replaced; later hours append new cast only. Hour scenes are 20 seconds (about three images per minute), generated only through the sanctioned `qwen-image` / Qwen-Image-2.1 Diffusers route at 864×480, centre-cropped and rendered as an 854×480 Ken Burns movie. No IGS route is used.
+The project-root `characters.json`, `voices.json`, `breeze_voices.json`, `voices/`, and `refs/` are shared across hours. Existing identities, Breeze reference clips, and portraits are never replaced; later hours append new cast only. Hour scenes are 20 seconds (about three images per minute), generated only through the sanctioned `qwen-image` / Qwen-Image-2.1 Diffusers route at 864×480, centre-cropped and rendered as an 854×480 Ken Burns movie. No IGS route is used. Hourly scenes condition only on the clean style reference and canonical character portraits; they never use a previous scene as an image reference.
 
 ## The inspect UI
 

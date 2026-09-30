@@ -64,6 +64,27 @@ def test_ledger_rejects_changed_source() -> None:
 
 
 # ##################################################################
+# test ambient cli enters venv
+# invoke the public facade from the ambient interpreter and prove its hour runtime import happens in the installed venv.
+def test_hour_verify_only_cli_uses_venv() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "book.txt"
+        source.write_text("A brief source for runtime verification.", encoding="utf-8")
+        project = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [str(project / "run"), "hour", str(source), "--verify-only"],
+            cwd=project,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "sha256" in result.stdout
+        assert str(source) in result.stdout
+
+
+# ##################################################################
 # test window respects cap
 # choose only complete real spoken-piece WAVs that fit the remaining strict duration budget.
 def test_synthesis_window_respects_remaining_duration() -> None:

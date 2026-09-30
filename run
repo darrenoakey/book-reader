@@ -83,7 +83,7 @@ run_pipeline(Path("{epub_path}"), resolution={args.resolution!r})
 
 # ##################################################################
 # command hour
-# produce exactly one bounded, resumable 480p production hour from a full source book
+# dispatch bounded production inside the venv so optional GPU client imports never run in the ambient facade interpreter.
 def command_hour(args: argparse.Namespace) -> int:
     ensure_venv()
     source = Path(args.source).resolve()
@@ -93,11 +93,16 @@ def command_hour(args: argparse.Namespace) -> int:
     installed = command_install(args)
     if installed:
         return installed
-    from src.hour_runner import run_hour
-
-    movie = run_hour(source, hour_index=args.hour)
-    print(f"Completed hour {args.hour}: {movie}")
-    return 0
+    code = f'''
+from pathlib import Path
+from src.hour_runner import run_hour, verify_hour_runtime
+_source = Path({str(source)!r})
+if {args.verify_only!r}:
+    print(verify_hour_runtime(_source))
+else:
+    print(f"Completed hour {args.hour}: {{run_hour(_source, hour_index={args.hour!r})}}")
+'''
+    return run_venv([str(VENV_PYTHON), "-c", code])
 
 
 # ##################################################################
@@ -240,6 +245,7 @@ def main(argv: list[str]) -> int:
     p_hour = sub.add_parser("hour", help="Produce one resumable, no-longer-than-3600s 480p movie hour")
     p_hour.add_argument("source", help="Full EPUB, Markdown, or text input")
     p_hour.add_argument("--hour", type=int, default=1, help="1-based production hour number")
+    p_hour.add_argument("--verify-only", action="store_true", help="Verify the venv runtime import and source identity without production work")
     p_hour.set_defaults(func=command_hour)
 
     p_test = sub.add_parser("test", help="Run a single test target")

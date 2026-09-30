@@ -19,19 +19,33 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
-LLM_HOST = os.environ.get("BOOK_LLM_HOST", "http://10.0.0.254:8400").rstrip("/")
-LLM_MODEL = os.environ.get("BOOK_LLM_MODEL", "local-coder")
-MAX_CONCURRENT = int(os.environ.get("BOOK_LLM_CONCURRENCY", "4"))
-# ollama = native Ollama /api/chat with think=false (no reasoning-field token
-# burn — the OpenAI-compat shim ignores think and reasoning eats max_tokens);
-# anything else = OpenAI-compatible /v1/chat/completions (arbiter).
-LLM_STYLE = os.environ.get("BOOK_LLM_STYLE", "openai").lower()
+import tomllib
+
+
+# ##################################################################
+# load llm config
+# read optional non-secret machine settings from the project-local TOML file; defaults preserve the arbiter route.
+def load_llm_config(path: Path) -> tuple[str, str, int, str]:
+    values: dict = {}
+    if path.is_file():
+        with path.open("rb") as stream:
+            values = tomllib.load(stream).get("llm", {})
+    host = str(values.get("host", "http://10.0.0.254:8400")).rstrip("/")
+    model = str(values.get("model", "local-coder"))
+    concurrency = int(values.get("concurrency", 4))
+    style = str(values.get("style", "openai")).lower()
+    if not host.startswith(("http://", "https://")) or concurrency < 1 or style not in {"openai", "ollama"}:
+        raise ValueError("local/config.toml [llm] has invalid host, concurrency, or style")
+    return host, model, concurrency, style
+
+
+LLM_HOST, LLM_MODEL, MAX_CONCURRENT, LLM_STYLE = load_llm_config(Path(__file__).resolve().parent.parent / "local" / "config.toml")
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 

@@ -1,5 +1,8 @@
 import asyncio
+import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 
 from src.llm import ask
@@ -60,15 +63,23 @@ def chunk_text(text: str, chunk_size: int = 4000, overlap: int = 0) -> list[str]
 
 
 # ##################################################################
-# generate chapter script
-# convert chapter text to speaker-attributed jsonl — every chunk MUST succeed
-async def _process_chunk(chunk: str, speakers_list: str, label: str) -> list[dict]:
-    prompt = f"""Output JSONL only. No explanations. No markdown. Just JSONL lines.
+# script integrity
+# a script is only ever accepted whole: every chunk must parse completely,
+# use known speakers and cover the source text. Anything else raises —
+# there is NO all-narrator fallback.
+CHUNK_SIZE = 4000
+MAX_ATTEMPTS = 6
+RETRY_DELAY_SECONDS = 5
+SCRIPT_VERSION = 2
+MIN_COVERAGE = 0.7
+MAX_COVERAGE = 1.4
+META_SUFFIX = ".meta.json"
+_PROMPT_TEMPLATE = """Output JSONL only. No explanations. No markdown. Just JSONL lines.
 
-Valid speakers: {speakers_list}
+Valid speakers: @@SPEAKERS@@
 
 Convert to audiobook script. Each line MUST be exactly this JSON format:
-{{"speaker_id": "<one of the valid speakers>", "text": "<spoken words>"}}
+{"speaker_id": "<one of the valid speakers>", "text": "<spoken words>"}
 
 THE ONE HARD RULE: a character speaks ONLY text wrapped in quotation marks
 (straight " " or ' ', or curly “ ” or ‘ ’). If text is NOT inside quotation
@@ -90,51 +101,226 @@ Therefore:
 EXAMPLES:
 Input: "We have to leave now," Bob said, glancing at the door.
 Output:
-{{"speaker_id": "bob", "text": "We have to leave now,"}}
-{{"speaker_id": "narrator", "text": "Bob said, glancing at the door."}}
+{"speaker_id": "bob", "text": "We have to leave now,"}
+{"speaker_id": "narrator", "text": "Bob said, glancing at the door."}
 
 Input: The rain hammered the roof. "I won't," she snapped, "go back there."
 Output:
-{{"speaker_id": "narrator", "text": "The rain hammered the roof."}}
-{{"speaker_id": "jane", "text": "I won't,"}}
-{{"speaker_id": "narrator", "text": "she snapped,"}}
-{{"speaker_id": "jane", "text": "go back there."}}
+{"speaker_id": "narrator", "text": "The rain hammered the roof."}
+{"speaker_id": "jane", "text": "I won't,"}
+{"speaker_id": "narrator", "text": "she snapped,"}
+{"speaker_id": "jane", "text": "go back there."}
 
 Input (clipped action prose, NO quotation marks — ALL narrator):
 He didn't look back. Looked forward. Toward her. He vaulted a mailbox. Servos whined. He breathed. In. Out.
 Output:
-{{"speaker_id": "narrator", "text": "He didn't look back. Looked forward. Toward her. He vaulted a mailbox. Servos whined. He breathed. In. Out."}}
+{"speaker_id": "narrator", "text": "He didn't look back. Looked forward. Toward her. He vaulted a mailbox. Servos whined. He breathed. In. Out."}
 
 (Use the actual valid speaker_ids above, not "bob"/"jane", matching whoever is speaking.)
 
 TEXT:
-{chunk}
+@@CHUNK@@
 
 OUTPUT (JSONL only, nothing else):"""
-    response = await query_haiku(prompt)
-    parsed = parse_jsonl_response(response)
-    attempt = 0
-    while not parsed and attempt < 5:
-        attempt += 1
-        response = await query_haiku(prompt)
-        parsed = parse_jsonl_response(response)
-        if not parsed:
-            print(f"  {label} parse retry {attempt}")
-            await asyncio.sleep(5)
-    if not parsed:
-        # All-narrator fallback for chunks the model can't structure (e.g.
-        # pure narration with no dialogue keeps producing unparseable output).
-        print(f"  {label} giving up after {attempt} retries — narrator fallback")
-        parsed = [{"narrator": chunk}]
-    return parsed
 
 
-async def generate_chapter_script(chapter_text: str, chapter_title: str, speaker_ids: list[str]) -> list[dict]:
+class ScriptGenerationError(Exception):
+    """Raised when a script cannot be produced or validated; never papered over."""
+
+
+def build_prompt(chunk: str, speakers_list: str) -> str:
+    return _PROMPT_TEMPLATE.replace("@@SPEAKERS@@", speakers_list).replace(
+        "@@CHUNK@@", chunk
+    )
+
+
+def _entry_pair(entry: object) -> tuple[str, str]:
+    if not isinstance(entry, dict) or len(entry) != 1:
+        raise ScriptGenerationError(f"malformed script entry: {entry!r}"[:200])
+    ((speaker, text),) = entry.items()
+    if not isinstance(speaker, str) or not isinstance(text, str):
+        raise ScriptGenerationError(f"malformed script entry: {entry!r}"[:200])
+    return speaker, text
+
+
+def parse_jsonl_strict(text: str) -> list[dict]:
+    """Parse a model response; any non-blank, non-fence line that is not a valid entry rejects the whole response."""
+    result = []
+    for raw in text.strip().split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("```"):
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ScriptGenerationError(f"unparseable line: {line[:80]!r}") from exc
+        if (
+            isinstance(entry, dict)
+            and "text" in entry
+            and ("speaker_id" in entry or "speaker" in entry)
+        ):
+            entry = {entry.get("speaker_id", entry.get("speaker")): entry["text"]}
+        _entry_pair(entry)
+        result.append(entry)
+    if not result:
+        raise ScriptGenerationError("empty response")
+    return result
+
+
+def _letters(text: str) -> int:
+    return sum(1 for ch in text if ch.isalnum())
+
+
+def validate_chunk(parsed: list[dict], chunk: str, speaker_ids: list[str]) -> None:
+    allowed = set(speaker_ids)
+    total = 0
+    for entry in parsed:
+        speaker, text = _entry_pair(entry)
+        if speaker not in allowed:
+            raise ScriptGenerationError(f"unknown speaker {speaker!r}")
+        if not text.strip():
+            raise ScriptGenerationError("empty text line")
+        total += _letters(text)
+    source = _letters(chunk)
+    if source and not (MIN_COVERAGE * source <= total <= MAX_COVERAGE * source):
+        raise ScriptGenerationError(
+            f"coverage {total}/{source} letters outside accepted range"
+        )
+
+
+def validate_script_lines(
+    lines: list[dict], chapter_text: str, speaker_ids: list[str]
+) -> None:
+    """Validate a whole canonical script (title line + body) against its source chapter."""
+    if not lines:
+        raise ScriptGenerationError("empty script")
+    for entry in lines:
+        _entry_pair(entry)
+    body = lines[1:]
+    if chapter_text.strip() and not body:
+        raise ScriptGenerationError("script has no body")
+    if body:
+        validate_chunk(body, chapter_text, speaker_ids)
+
+
+# ##################################################################
+# fingerprint + atomic cache
+# canonical script = <script_dir>/<stem>.jsonl plus <stem>.jsonl.meta.json holding the
+# input fingerprint and content hash. Consumers (hour runner) reuse via load_cached_script.
+def script_fingerprint(
+    chapter_text: str,
+    chapter_title: str,
+    speaker_ids: list[str],
+    is_intro: bool = False,
+) -> str:
+    material = json.dumps(
+        {
+            "version": SCRIPT_VERSION,
+            "prompt": hashlib.sha256(_PROMPT_TEMPLATE.encode()).hexdigest(),
+            "chunk_size": CHUNK_SIZE,
+            "text": hashlib.sha256(chapter_text.encode()).hexdigest(),
+            "title": chapter_title,
+            "speakers": sorted(speaker_ids),
+            "intro": is_intro,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def meta_path_for(script_path: Path) -> Path:
+    return script_path.with_name(script_path.name + META_SUFFIX)
+
+
+def _read_lines(script_path: Path) -> list[dict] | None:
+    try:
+        return [
+            json.loads(x)
+            for x in script_path.read_text(encoding="utf-8").splitlines()
+            if x.strip()
+        ]
+    except (OSError, ValueError):
+        return None
+
+
+def load_cached_script(script_path: Path, fingerprint: str) -> list[dict] | None:
+    """Return the script lines if script_path is a complete canonical script for this fingerprint, else None."""
+    try:
+        meta = json.loads(meta_path_for(script_path).read_text(encoding="utf-8"))
+        payload = script_path.read_bytes()
+    except (OSError, ValueError):
+        return None
+    if (
+        meta.get("fingerprint") != fingerprint
+        or meta.get("sha256") != hashlib.sha256(payload).hexdigest()
+    ):
+        return None
+    lines = _read_lines(script_path)
+    return lines or None
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def write_canonical_script(
+    script_path: Path, lines: list[dict], fingerprint: str
+) -> None:
+    """Atomically publish script then meta; a script without matching meta is never treated as cached."""
+    payload = "".join(
+        json.dumps(line, ensure_ascii=False) + "\n" for line in lines
+    ).encode("utf-8")
+    meta = {
+        "fingerprint": fingerprint,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "version": SCRIPT_VERSION,
+    }
+    meta_path_for(script_path).unlink(missing_ok=True)
+    _atomic_write(script_path, payload)
+    _atomic_write(meta_path_for(script_path), json.dumps(meta).encode("utf-8"))
+
+
+# ##################################################################
+# generate chapter script
+# convert chapter text to speaker-attributed jsonl — every chunk MUST succeed
+async def _process_chunk(chunk: str, speaker_ids: list[str], label: str) -> list[dict]:
     speakers_list = ", ".join(speaker_ids)
-    chunks = chunk_text(chapter_text, chunk_size=4000)
+    prompt = build_prompt(chunk, speakers_list)
+    last_error = "no attempt"
+    for attempt in range(MAX_ATTEMPTS):
+        if attempt:
+            print(f"  {label} retry {attempt}: {last_error}")
+            await asyncio.sleep(RETRY_DELAY_SECONDS)
+        response = await query_haiku(prompt)
+        try:
+            parsed = parse_jsonl_strict(response)
+            validate_chunk(parsed, chunk, speaker_ids)
+            return parsed
+        except ScriptGenerationError as exc:
+            last_error = str(exc)
+    raise ScriptGenerationError(
+        f"{label}: no valid script after {MAX_ATTEMPTS} attempts ({last_error})"
+    )
+
+
+async def generate_chapter_script(
+    chapter_text: str, chapter_title: str, speaker_ids: list[str]
+) -> list[dict]:
+    chunks = [c for c in chunk_text(chapter_text, chunk_size=CHUNK_SIZE) if c.strip()]
     chunk_results = await asyncio.gather(
         *(
-            _process_chunk(c, speakers_list, f"{chapter_title} chunk {i + 1}/{len(chunks)}")
+            _process_chunk(
+                c, speaker_ids, f"{chapter_title} chunk {i + 1}/{len(chunks)}"
+            )
             for i, c in enumerate(chunks)
         )
     )
@@ -147,19 +333,23 @@ async def generate_chapter_script(chapter_text: str, chapter_title: str, speaker
 # ##################################################################
 # generate script for chapter file
 # process a single chapter file to jsonl
-async def generate_script_for_file(chapter_path: Path, script_dir: Path, speaker_ids: list[str]) -> Path:
+async def generate_script_for_file(
+    chapter_path: Path, script_dir: Path, speaker_ids: list[str]
+) -> Path:
     script_name = chapter_path.stem + ".jsonl"
     script_path = script_dir / script_name
-    if script_path.exists():
-        return script_path
     chapter_text = chapter_path.read_text(encoding="utf-8")
     chapter_title = chapter_path.stem.split("-", 1)[-1].replace("_", " ").title()
-    if chapter_path.name == "00-intro.txt":
+    is_intro = chapter_path.name == "00-intro.txt"
+    fingerprint = script_fingerprint(chapter_text, chapter_title, speaker_ids, is_intro)
+    if load_cached_script(script_path, fingerprint) is not None:
+        return script_path
+    if is_intro:
         lines = [{"narrator": chapter_text}]
     else:
         lines = await generate_chapter_script(chapter_text, chapter_title, speaker_ids)
-    payload = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines)
-    await asyncio.to_thread(script_path.write_text, payload, encoding="utf-8")
+        validate_script_lines(lines, chapter_text, speaker_ids)
+    await asyncio.to_thread(write_canonical_script, script_path, lines, fingerprint)
     return script_path
 
 
@@ -184,12 +374,14 @@ async def generate_single_script(output_dir: Path, chapter_num: int) -> Path:
     script_dir.mkdir(parents=True, exist_ok=True)
     chapter_files = sorted(chapters_dir.glob("*.txt"))
     if chapter_num < 0 or chapter_num >= len(chapter_files):
-        raise ValueError(f"Chapter {chapter_num} not found (have {len(chapter_files)} chapters)")
+        raise ValueError(
+            f"Chapter {chapter_num} not found (have {len(chapter_files)} chapters)"
+        )
     chapter_path = chapter_files[chapter_num]
     script_name = chapter_path.stem + ".jsonl"
     script_path = script_dir / script_name
-    if script_path.exists():
-        script_path.unlink()
+    script_path.unlink(missing_ok=True)
+    meta_path_for(script_path).unlink(missing_ok=True)
     return await generate_script_for_file(chapter_path, script_dir, speaker_ids)
 
 
@@ -210,7 +402,14 @@ async def generate_all_scripts(output_dir: Path) -> list[Path]:
     script_dir.mkdir(parents=True, exist_ok=True)
     chapter_files = sorted(chapters_dir.glob("*.txt"))
     print(f"Generating {len(chapter_files)} chapter scripts in parallel...")
-    return list(await asyncio.gather(*(generate_script_for_file(p, script_dir, speaker_ids) for p in chapter_files)))
+    return list(
+        await asyncio.gather(
+            *(
+                generate_script_for_file(p, script_dir, speaker_ids)
+                for p in chapter_files
+            )
+        )
+    )
 
 
 # ##################################################################

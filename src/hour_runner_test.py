@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from src.hour_runner import HOUR_MAX_SECONDS, chapter_order, load_ledger, synthesize_window
+from src.hour_runner import HOUR_MAX_SECONDS, canonical_character_id, chapter_order, load_ledger, synthesize_window
 
 
 # ##################################################################
@@ -45,6 +45,18 @@ def test_numeric_chapter_order() -> None:
         "00099-part.txt",
         "00100-part.txt",
     ]
+
+
+# ##################################################################
+# test display-name aliases
+# preserve an established identity for an equivalent display name while keeping distinct near-spellings separate.
+def test_display_name_aliases_do_not_merge_near_names() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        cast = {"ren": {"name": "Ren"}, "ron": {"name": "Ron"}, "captain": {"name": "Captain Vale"}}
+        assert canonical_character_id(root, cast, "captain_vale", "CAPTAIN VALE") == "captain"
+        assert canonical_character_id(root, cast, "ren_alias", "Ren") == "ren"
+        assert canonical_character_id(root, cast, "ron_alias", "Ron") == "ron"
 
 
 # ##################################################################
@@ -91,15 +103,15 @@ def test_synthesis_window_respects_remaining_duration() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         hour = root / "hour"
-        lines = hour / "audio" / ".lines_00001-part"
+        lines = root / "audio_cache" / ".lines_00001-part"
         lines.mkdir(parents=True)
         tone_wav(lines / "00000.wav", 0.8)
         tone_wav(lines / "00001.wav", 0.8)
         (hour / "script").mkdir(parents=True)
         script = hour / "script" / "00001-part.jsonl"
         script.write_text('{"narrator": "One."}\n{"narrator": "Two."}\n', encoding="utf-8")
-        (hour / "breeze_voices.json").write_text('{"narrator": {}}', encoding="utf-8")
-        selected, count = synthesize_window(hour, script, 1.0, 0)
+        (root / "breeze_voices.json").write_text('{"narrator": {"ref_wav": "voices/narrator.wav", "ref_text": "Listen."}}', encoding="utf-8")
+        selected, count = synthesize_window(root, script, 1.0, 0)
         assert count == 1
         assert len(selected) == 1
         assert selected[0]["duration"] <= HOUR_MAX_SECONDS

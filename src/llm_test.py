@@ -6,8 +6,10 @@ changed request/response shape fails the suite immediately.
 """
 
 import asyncio
+import tempfile
+from pathlib import Path
 
-from src.llm import LLM_HOST, LLM_MODEL, ask, ask_sync, strip_think
+from src.llm import LLM_HOST, LLM_MODEL, ask, ask_sync, load_llm_config, strip_think
 
 
 # ##################################################################
@@ -16,6 +18,19 @@ from src.llm import LLM_HOST, LLM_MODEL, ask, ask_sync, strip_think
 def test_config_targets_arbiter() -> None:
     assert LLM_MODEL == "local-coder"
     assert LLM_HOST.endswith(":8400")
+
+
+# ##################################################################
+# test local toml config
+# load a real temporary TOML configuration without reading process environment variables.
+def test_load_local_toml_config() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "config.toml"
+        path.write_text(
+            "[llm]\nhost = 'http://10.0.0.42:11434'\nmodel = 'qwen3.6:35b-a3b'\nconcurrency = 2\nstyle = 'ollama'\n",
+            encoding="utf-8",
+        )
+        assert load_llm_config(path) == ("http://10.0.0.42:11434", "qwen3.6:35b-a3b", 2, "ollama")
 
 
 # ##################################################################

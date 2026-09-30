@@ -47,7 +47,7 @@ async def query_haiku(prompt: str) -> str:
 # ##################################################################
 # analyze chapter
 # extract character information from a single chapter
-async def analyze_chapter(chapter_path: Path, chapter_num: int) -> dict:
+async def analyze_chapter(chapter_path: Path, chapter_num: int, established_characters: str = "") -> dict:
     text = chapter_path.read_text(encoding="utf-8")
     prompt = f"""Analyze this chapter and identify characters who speak or have internal monologue.
 
@@ -86,6 +86,7 @@ Rules:
 - Include ONLY characters who actually speak (quoted dialogue) or have internal monologue
 - Do NOT include characters who are merely mentioned
 - Character IDs: lowercase with underscores (e.g., "jean_tannen")
+- Established canonical identities (reuse these exact IDs whenever the person is the same): {established_characters or '(none yet)'}
 - voice must focus on VOICE generation; look must focus on what a viewer SEES
 - EXCLUDE from both: plot roles, story function, relationships to other characters, emotional descriptions
 - NO cross-character references (don't mention other characters in the descriptions)

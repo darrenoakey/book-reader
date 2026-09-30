@@ -118,14 +118,34 @@ def load_cast(project: Path) -> dict:
 
 
 # ##################################################################
+# cast aliases
+# map only exact normalized display-name matches so spelling/case aliases keep one identity without merging distinct names such as Ren and Ron.
+def canonical_character_id(project: Path, cast: dict, candidate_id: str, name: str) -> str:
+    aliases_path = project / "character_aliases.json"
+    aliases = json.loads(aliases_path.read_text(encoding="utf-8")) if aliases_path.exists() else {}
+    if candidate_id in aliases:
+        return aliases[candidate_id]
+    normalized = "".join(char for char in name.casefold() if char.isalnum())
+    for established_id, info in cast.items():
+        established = "".join(char for char in str(info.get("name", "")).casefold() if char.isalnum())
+        if normalized and normalized == established:
+            aliases[candidate_id] = established_id
+            atomic_json(aliases_path, aliases)
+            return established_id
+    return candidate_id
+
+
+# ##################################################################
 # extend cast
 # analyze one upcoming chapter only, append its new information, and retain established identities.
 async def extend_cast(project: Path, chapter: Path, chapter_number: int, title: str, author: str) -> dict:
     cast = load_cast(project)
-    found = merge_character_info([await analyze_chapter(chapter, chapter_number)])
+    known = ", ".join(f"{cid}={info.get('name', cid)}" for cid, info in cast.items())
+    found = merge_character_info([await analyze_chapter(chapter, chapter_number, known)])
     if "narrator" not in cast:
         cast["narrator"] = await create_narrator_entry(title, author, chapter.read_text(encoding="utf-8")[:3000])
     for char_id, info in found.items():
+        char_id = canonical_character_id(project, cast, char_id, str(info.get("name", char_id)))
         if char_id not in cast:
             cast[char_id] = info
             continue
@@ -220,10 +240,16 @@ def prepare_hour_directory(project: Path, hour_dir: Path) -> None:
 # ##################################################################
 # script for chapter
 # create one chapter script against the current shared cast, avoiding any full-book script pass.
-def script_for_chapter(hour_dir: Path, chapter: Path, cast: dict) -> Path:
+def script_for_chapter(project: Path, hour_dir: Path, chapter: Path, cast: dict) -> Path:
+    shared_dir = project / "script_cache"
+    shared_dir.mkdir(exist_ok=True)
+    canonical = asyncio.run(generate_script_for_file(chapter, shared_dir, sorted(cast)))
     script_dir = hour_dir / "script"
     script_dir.mkdir(exist_ok=True)
-    return asyncio.run(generate_script_for_file(chapter, script_dir, sorted(cast)))
+    hour_script = script_dir / canonical.name
+    if not hour_script.exists():
+        hour_script.symlink_to(os.path.relpath(canonical, script_dir))
+    return canonical
 
 
 # ##################################################################
@@ -240,12 +266,12 @@ def copy_chapter_context(hour_dir: Path, chapter: Path) -> None:
 # ##################################################################
 # synthesize window
 # synthesize only an upcoming chapter, then select complete spoken pieces that fit the strict hour cap.
-def synthesize_window(hour_dir: Path, script: Path, remaining: float, start_piece: int) -> tuple[list[dict], int]:
-    audio_dir = hour_dir / "audio"
+def synthesize_window(project: Path, script: Path, remaining: float, start_piece: int) -> tuple[list[dict], int]:
+    audio_dir = project / "audio_cache"
     audio_dir.mkdir(exist_ok=True)
-    _, paths, jobs, metadata = plan_chapter(script, audio_dir, hour_dir / "voices", tts_engine.speaker_set(hour_dir))
+    _, paths, jobs, metadata = plan_chapter(script, audio_dir, project / "voices", tts_engine.speaker_set(project))
     if jobs:
-        tts_engine.synthesize_jobs(jobs, hour_dir)
+        tts_engine.synthesize_jobs(jobs, project)
     selected: list[dict] = []
     elapsed = 0.0
     for index, meta in enumerate(metadata[start_piece:], start=start_piece):
@@ -351,9 +377,9 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
         extend_appearances(project, cast)
         prepare_hour_directory(project, hour_dir)
         copy_chapter_context(hour_dir, chapters[chapter_index])
-        script = script_for_chapter(hour_dir, chapters[chapter_index], cast)
+        script = script_for_chapter(project, hour_dir, chapters[chapter_index], cast)
         start_piece = piece_cursor if chapter_index == chapter_cursor else 0
-        candidates, _ = synthesize_window(hour_dir, script, remaining, start_piece)
+        candidates, _ = synthesize_window(project, script, remaining, start_piece)
         if not candidates:
             if all_selected:
                 break
@@ -363,9 +389,7 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
             raise RuntimeError("internal selection exceeded hour budget")
         all_selected.extend(candidates)
         remaining -= elapsed
-        all_metadata = plan_chapter(script, hour_dir / "audio", hour_dir / "voices", tts_engine.speaker_set(hour_dir))[
-            3
-        ]
+        all_metadata = plan_chapter(script, project / "audio_cache", project / "voices", tts_engine.speaker_set(project))[3]
         consumed = start_piece + len(candidates)
         if consumed < len(all_metadata):
             next_chapter, next_piece = chapter_index, consumed

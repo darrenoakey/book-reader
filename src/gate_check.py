@@ -24,6 +24,10 @@ MOVIE_PATHS = {
     "src/dep_install_test.py",
     "src/hour_runner.py",
     "src/hour_runner_test.py",
+    "src/llm.py",
+    "src/llm_test.py",
+    "src/script_generate.py",
+    "src/script_generate_test.py",
     "src/movie_images.py",
     "src/movie_images_test.py",
     "src/arbiter_tts.py",
@@ -49,6 +53,8 @@ MOVIE_TESTS = (
     "src/text_ingest_test.py",
     "src/movie_storyboard_test.py",
     "src/movie_images_test.py",
+    "src/llm_test.py::test_load_local_toml_config",
+    "src/script_generate_test.py",
 )
 
 

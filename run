@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from src.movie_resolution import DEFAULT_RESOLUTION, SUPPORTED_RESOLUTIONS
+
 import setproctitle
 
 setproctitle.setproctitle("book-reader")
@@ -69,7 +71,7 @@ if _style:
 _scene_seconds = {args.scene_seconds!r}
 if _scene_seconds:
     (_out / "scene_seconds.txt").write_text(str(_scene_seconds), encoding="utf-8")
-run_pipeline(Path("{epub_path}"))
+run_pipeline(Path("{epub_path}"), resolution={args.resolution!r})
 '''
     return run_venv([str(VENV_PYTHON), "-c", code])
 
@@ -84,7 +86,9 @@ def command_test(args: argparse.Namespace) -> int:
     log = TEST_OUT / (target.replace("/", "_").replace("::", "_") + ".log")
     cmd = [str(VENV_PYTHON), "-m", "pytest", "-q", target, "--maxfail=1", "--disable-warnings"]
     with open(log, "w") as f:
-        rc = run_venv(cmd)
+        rc = subprocess.call(cmd, cwd=PROJECT_ROOT, stdout=f, stderr=subprocess.STDOUT)
+    if rc:
+        print(log.read_text())
     print(f"Test output written to {log}")
     return rc
 
@@ -101,7 +105,10 @@ def command_lint(args: argparse.Namespace) -> int:
 # command check
 # run full test suite and quality gates
 def command_check(args: argparse.Namespace) -> int:
-    return subprocess.call(["dazpycheck"], cwd=PROJECT_ROOT)
+    installed = command_install(args)
+    if installed:
+        return installed
+    return run_venv([str(VENV_PYTHON), "-m", "src.gate_check"])
 
 
 # ##################################################################
@@ -116,6 +123,7 @@ def command_step(args: argparse.Namespace) -> int:
     cmd = [str(VENV_PYTHON), "-m", "src.step_runner", args.step, str(epub_path)]
     if args.max_chapters:
         cmd.extend(["--max-chapters", str(args.max_chapters)])
+    cmd.extend(["--resolution", str(args.resolution)])
     return run_venv(cmd)
 
 
@@ -195,6 +203,7 @@ def main(argv: list[str]) -> int:
     p_create.add_argument("epub", help="Path to EPUB file")
     p_create.add_argument("--style", default=None, help="Visual style for the movie (writes the project's style.txt override)")
     p_create.add_argument("--scene-seconds", type=float, default=0.0, help="Seconds per scene image (default 30; writes scene_seconds.txt)")
+    p_create.add_argument("--resolution", type=int, choices=sorted(SUPPORTED_RESOLUTIONS), default=DEFAULT_RESOLUTION, help="Movie vertical resolution (default: 720)")
     p_create.set_defaults(func=command_create)
 
     p_test = sub.add_parser("test", help="Run a single test target")
@@ -217,6 +226,7 @@ def main(argv: list[str]) -> int:
     )
     p_step.add_argument("epub", help="Path to EPUB file (or .md/.txt story)")
     p_step.add_argument("--max-chapters", type=int, default=0, help="Limit to first N chapters")
+    p_step.add_argument("--resolution", type=int, choices=sorted(SUPPORTED_RESOLUTIONS), default=DEFAULT_RESOLUTION, help="Movie vertical resolution (default: 720)")
     p_step.set_defaults(func=command_step)
 
     p_serve = sub.add_parser("serve", help="Run the inspect web UI")

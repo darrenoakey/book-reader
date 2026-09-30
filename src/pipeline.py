@@ -12,7 +12,7 @@ from src.audio_synth import synthesize_all_chapters
 from src.character_analysis import analyze_characters_sync
 from src.epub_extract import get_output_dir
 from src.m4b_assemble import assemble_m4b
-from src.movie_assemble import assemble_movie
+from src.movie_assemble import DEFAULT_RESOLUTION, assemble_movie, movie_has_resolution
 from src.movie_images import generate_character_refs, generate_scene_images
 from src.movie_storyboard import build_storyboard
 from src.script_generate import generate_scripts_sync
@@ -87,17 +87,17 @@ def release_lock(lock: Path) -> None:
 # ##################################################################
 # run pipeline
 # execute the full book-reader pipeline
-def run_pipeline(epub_path: Path) -> Path:
+def run_pipeline(epub_path: Path, resolution: int = DEFAULT_RESOLUTION) -> Path:
     output_dir = get_output_dir(epub_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     lock = acquire_lock(output_dir)
     try:
-        return _run_pipeline_locked(epub_path, output_dir)
+        return _run_pipeline_locked(epub_path, output_dir, resolution)
     finally:
         release_lock(lock)
 
 
-def _run_pipeline_locked(epub_path: Path, output_dir: Path) -> Path:
+def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int) -> Path:
     print(f"{Fore.CYAN}Book Reader Pipeline{Style.RESET_ALL}")
     print(f"  Input: {epub_path}")
     print(f"  Output: {output_dir}")
@@ -197,12 +197,12 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path) -> Path:
         print_done(f"Generated {len(scene_images)} scene images")
         mark_step_complete(output_dir, "sceneimages")
     print_step(12, "Assemble movie (Ken Burns pan/zoom + narration)")
-    if is_step_complete(output_dir, "movie"):
-        print_skip("Movie already assembled")
+    if is_step_complete(output_dir, "movie") and movie_has_resolution(output_dir, resolution):
+        print_skip(f"Movie already assembled at {resolution}p")
         movie_path = output_dir / "movie" / "movie.mp4"
     else:
         with _time_step(output_dir, "movie"):
-            movie_path = assemble_movie(output_dir, title)
+            movie_path = assemble_movie(output_dir, title, resolution)
         print_done(f"Created {movie_path.name}")
         mark_step_complete(output_dir, "movie")
     total = time.time() - pipeline_t0

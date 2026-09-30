@@ -8,7 +8,7 @@ from src.audio_synth import synthesize_all_chapters
 from src.character_analysis import analyze_characters_sync
 from src.epub_extract import get_output_dir
 from src.m4b_assemble import assemble_m4b
-from src.movie_assemble import assemble_movie
+from src.movie_assemble import DEFAULT_RESOLUTION, SUPPORTED_RESOLUTIONS, assemble_movie
 from src.movie_images import generate_character_refs, generate_scene_images
 from src.movie_storyboard import build_storyboard
 from src.script_generate import generate_scripts_sync
@@ -33,7 +33,7 @@ def get_book_info(output_dir: Path) -> tuple[str, str]:
 # ##################################################################
 # run step
 # execute a single pipeline step
-def run_step(step: str, epub_path: Path, max_chapters: int = 0) -> int:
+def run_step(step: str, epub_path: Path, max_chapters: int = 0, resolution: int = DEFAULT_RESOLUTION) -> int:
     output_dir = get_output_dir(epub_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -114,7 +114,7 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0) -> int:
 
     elif step == "movie":
         title, _ = get_book_info(output_dir)
-        movie = assemble_movie(output_dir, title)
+        movie = assemble_movie(output_dir, title, resolution)
         print(f"Created {movie}")
         mark_step_complete(output_dir, "movie")
 
@@ -136,8 +136,9 @@ def main() -> int:
     parser.add_argument("step")
     parser.add_argument("epub_path")
     parser.add_argument("--max-chapters", type=int, default=0, help="Limit to first N chapters")
+    parser.add_argument("--resolution", type=int, choices=sorted(SUPPORTED_RESOLUTIONS), default=DEFAULT_RESOLUTION, help="Movie vertical resolution (default: 720)")
     args = parser.parse_args()
-    return run_step(args.step, Path(args.epub_path), max_chapters=args.max_chapters)
+    return run_step(args.step, Path(args.epub_path), max_chapters=args.max_chapters, resolution=args.resolution)
 
 
 if __name__ == "__main__":

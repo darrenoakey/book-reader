@@ -9,17 +9,17 @@ main_branch = "main"
 # Preserve relevant coverage; run broader/external suites only when intentionally
 # relevant. Product growth must not increase standard release time. Exit nonzero
 # on any relevant failure; support concurrent worktrees.
-check = "./run check"
+check = "./run install && .venv/bin/python -m src.gate_check"
 
 # Deploy command. cwd = the canonical checkout. Must rebuild/restart prod,
 # health-check, exit nonzero on unhealthy, and be idempotent (safe to re-run).
 deploy = "./run deploy"
 
 # Optional health-only probe. Empty = re-run `deploy` as the health probe.
-health = ""
+health = "./run health"
 
 # Informational: the auto/service name this repo deploys.
-service = "book-reader"
+service = "book-reader-inspect"
 
 # Persistent worktree base for this repo (gate lives at <base>/gate).
 worktree_base = "/Volumes/Gumby/worktrees/greenline/book-reader"

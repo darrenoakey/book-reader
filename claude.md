@@ -168,7 +168,9 @@ M4B assembly auto-numbers duplicate titles: "Interlude" → "Interlude 1", "Inte
 - **Scene offsets** are global seconds across the concatenated chapter WAVs in
   sorted-timeline order — the movie audio must be exactly that concatenation
   (no chimes/announcements; those exist only in the M4B).
-- **zoompan**: stills are upscaled to 2880x1620 first so pans have travel room;
+- **Resolution**: `./run create` and `./run step movie` accept `--resolution 720|1080`; 720p is the default. Segments and 4x prescaled stills live under `movie/<resolution>p/`, while `movie/movie.mp4` is the selected final render. The pipeline only skips a completed movie when ffprobe confirms its dimensions match the requested resolution, so switching resolution reuses source images/audio but rerenders safely.
+- **Resolution verification**: `src/movie_resolution_test.py`, `movie_assemble_test.py`, and `title_page_test.py` are real ffmpeg renders. Run those long tests detached and inspect their log rather than holding an agent turn open.
+- **zoompan**: stills are upscaled to four times the requested output width first so pans have travel room;
   expressions use `on/(frames-1)` so moves hit their endpoint exactly.
 - **qwen-image result is file-only** (`{"file": "result.png"}`) — resolve via
   `local_result("/mnt/arbiter-store/output/jobs/<id>/result.png")`; inline

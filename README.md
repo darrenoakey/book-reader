@@ -40,8 +40,8 @@ Give it an EPUB (or a plain `.md` / `.txt` story) and it produces:
 
 ```bash
 ./run install                     # one-time: create venv + deps
-./run create book.epub            # full pipeline (EPUB or .md/.txt)
-./run step audio book.epub        # run a single step
+./run create book.epub --resolution 720  # full pipeline, 720p default (or 1080p)
+./run step movie book.epub --resolution 1080  # render just the movie at 1080p
 ./run serve                       # inspect UI
 ./run deploy                      # register the UI as an auto service (port 8769)
 ./run test <target>               # run tests

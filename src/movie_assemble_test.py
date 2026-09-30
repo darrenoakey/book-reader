@@ -49,7 +49,7 @@ def test_zoompan_filter_shapes() -> None:
     for move in list(MOVES) + list(STATICS):
         f = zoompan_filter(move, 90)
         assert "zoompan=" in f and "d=90" in f
-        assert "s=1920x1080" in f and f"fps={FPS}" in f
+        assert "s=1280x720" in f and f"fps={FPS}" in f
         assert "format=yuv420p" in f
         assert "scale=" not in f  # pre-scaled input, never an in-graph upscale
 

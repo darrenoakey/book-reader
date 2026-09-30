@@ -2,7 +2,9 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import tempfile
+import unicodedata
 from pathlib import Path
 
 from src.llm import ask
@@ -188,19 +190,32 @@ def validate_chunk(parsed: list[dict], chunk: str, speaker_ids: list[str]) -> No
         )
 
 
+def normalized_words(text: str) -> list[str]:
+    return re.findall(r"[\w]+", unicodedata.normalize("NFKC", text).casefold())
+
+
+# ##################################################################
+# validate script lines
+# reject a script that loses, invents, or reorders source prose before it reaches audio.
 def validate_script_lines(
-    lines: list[dict], chapter_text: str, speaker_ids: list[str]
+    lines: list[dict], chapter_text: str, speaker_ids: list[str], include_title: bool = False
 ) -> None:
-    """Validate a whole canonical script (title line + body) against its source chapter."""
-    if not lines:
-        raise ScriptGenerationError("empty script")
-    for entry in lines:
-        _entry_pair(entry)
-    body = lines[1:]
-    if chapter_text.strip() and not body:
-        raise ScriptGenerationError("script has no body")
-    if body:
-        validate_chunk(body, chapter_text, speaker_ids)
+    body = lines if include_title else lines[1:]
+    source_words = normalized_words(chapter_text)
+    script_words: list[str] = []
+    allowed = set(speaker_ids)
+    if not source_words or not body:
+        raise ScriptGenerationError("script has no source coverage")
+    for entry in body:
+        speaker, text = _entry_pair(entry)
+        if speaker not in allowed or not text.strip():
+            raise ScriptGenerationError("script has unknown speaker or empty text")
+        script_words.extend(normalized_words(text))
+    if script_words != source_words:
+        mismatch = next((i for i, pair in enumerate(zip(source_words, script_words)) if pair[0] != pair[1]), min(len(source_words), len(script_words)))
+        expected = source_words[mismatch] if mismatch < len(source_words) else "<end>"
+        actual = script_words[mismatch] if mismatch < len(script_words) else "<end>"
+        raise ScriptGenerationError(f"script source coverage differs at word {mismatch}: expected {expected!r}, got {actual!r}")
 
 
 # ##################################################################

@@ -19,6 +19,18 @@ from src.script_generate import (
 
 
 # ##################################################################
+# test exact source coverage
+# fail closed on a dropped source word rather than creating an incomplete audiobook.
+def test_validate_script_requires_exact_source_order() -> None:
+    from src.script_generate import ScriptGenerationError, validate_script_lines
+
+    valid = [{"narrator": "Chapter"}, {"narrator": "One two three."}]
+    validate_script_lines(valid, "One two three.", ["narrator"])
+    with pytest.raises(ScriptGenerationError, match="coverage"):
+        validate_script_lines([{"narrator": "Chapter"}, {"narrator": "One three."}], "One two three.", ["narrator"])
+
+
+# ##################################################################
 # test parse jsonl response
 # verify jsonl parsing from plain and markdown responses
 def test_parse_jsonl_response() -> None:

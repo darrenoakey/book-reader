@@ -72,7 +72,7 @@ def chunk_text(text: str, chunk_size: int = 4000, overlap: int = 0) -> list[str]
 CHUNK_SIZE = 4000
 MAX_ATTEMPTS = 6
 RETRY_DELAY_SECONDS = 5
-SCRIPT_VERSION = 2
+SCRIPT_VERSION = 3
 MIN_COVERAGE = 0.7
 MAX_COVERAGE = 1.4
 META_SUFFIX = ".meta.json"
@@ -235,7 +235,6 @@ def script_fingerprint(
             "chunk_size": CHUNK_SIZE,
             "text": hashlib.sha256(chapter_text.encode()).hexdigest(),
             "title": chapter_title,
-            "speakers": sorted(speaker_ids),
             "intro": is_intro,
         },
         sort_keys=True,
@@ -258,17 +257,16 @@ def _read_lines(script_path: Path) -> list[dict] | None:
         return None
 
 
-def load_cached_script(script_path: Path, fingerprint: str) -> list[dict] | None:
-    """Return the script lines if script_path is a complete canonical script for this fingerprint, else None."""
+def load_cached_script(script_path: Path, fingerprint: str, allow_legacy: bool = False) -> list[dict] | None:
+    """Return verified canonical lines; v2 cache remains immutable when explicitly accepted by a source validator."""
     try:
         meta = json.loads(meta_path_for(script_path).read_text(encoding="utf-8"))
         payload = script_path.read_bytes()
     except (OSError, ValueError):
         return None
-    if (
-        meta.get("fingerprint") != fingerprint
-        or meta.get("sha256") != hashlib.sha256(payload).hexdigest()
-    ):
+    if meta.get("sha256") != hashlib.sha256(payload).hexdigest():
+        return None
+    if meta.get("fingerprint") != fingerprint and not (allow_legacy and meta.get("version") == 2):
         return None
     lines = _read_lines(script_path)
     return lines or None
@@ -357,8 +355,15 @@ async def generate_script_for_file(
     chapter_title = chapter_path.stem.split("-", 1)[-1].replace("_", " ").title()
     is_intro = chapter_path.name == "00-intro.txt"
     fingerprint = script_fingerprint(chapter_text, chapter_title, speaker_ids, is_intro)
-    if load_cached_script(script_path, fingerprint) is not None:
-        return script_path
+    cached = load_cached_script(script_path, fingerprint, allow_legacy=True)
+    if cached is not None:
+        if is_intro:
+            return script_path
+        try:
+            validate_script_lines(cached, chapter_text, speaker_ids)
+            return script_path
+        except ScriptGenerationError:
+            pass
     if is_intro:
         lines = [{"narrator": chapter_text}]
     else:

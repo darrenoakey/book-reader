@@ -217,6 +217,13 @@ def link_shared(hour_dir: Path, project: Path, name: str) -> None:
 # make the hour see the canonical cast and Breeze reference files while retaining hour-local script/audio/movie outputs.
 def prepare_hour_directory(project: Path, hour_dir: Path) -> None:
     hour_dir.mkdir(parents=True, exist_ok=True)
+    intro = project / "chapters" / "00-intro.txt"
+    if intro.exists():
+        hour_chapters = hour_dir / "chapters"
+        hour_chapters.mkdir(exist_ok=True)
+        intro_copy = hour_chapters / intro.name
+        if not intro_copy.exists():
+            shutil.copyfile(intro, intro_copy)
     (project / "refs").mkdir(exist_ok=True)
     for name in (
         "characters.json",

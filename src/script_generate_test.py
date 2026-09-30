@@ -140,8 +140,17 @@ def test_fingerprint_changes_with_inputs() -> None:
     base = script_fingerprint("text", "T", ["narrator", "a"])
     assert base == script_fingerprint("text", "T", ["a", "narrator"])
     assert base != script_fingerprint("text2", "T", ["narrator", "a"])
-    assert base != script_fingerprint("text", "T", ["narrator"])
+    assert base == script_fingerprint("text", "T", ["narrator"])
     assert base != script_fingerprint("text", "T", ["narrator", "a"], True)
+
+
+# ##################################################################
+# test roster expansion preserves script cache key
+# later cast growth cannot regenerate a chapter and change cached piece indices.
+def test_fingerprint_ignores_growing_roster() -> None:
+    initial = script_fingerprint("same prose", "Part", ["narrator", "ren"])
+    expanded = script_fingerprint("same prose", "Part", ["narrator", "ren", "new_character"])
+    assert initial == expanded
 
 
 def test_strict_parse_rejects_partial_output() -> None:

@@ -19,13 +19,31 @@ def immutable_spans(text: str) -> list[str]:
     return spans
 
 
+def assignment_objects(response: str) -> list[object]:
+    decoder = json.JSONDecoder()
+    position = 0
+    objects: list[object] = []
+    while position < len(response):
+        while position < len(response) and response[position].isspace():
+            position += 1
+        if position == len(response):
+            break
+        item, position = decoder.raw_decode(response, position)
+        if isinstance(item, list):
+            if objects or position != len(response.rstrip()):
+                raise ValueError("classifier response mixes array with other JSON values")
+            return item
+        objects.append(item)
+    return objects
+
+
+# ##################################################################
+# parse assignments
+# accept valid JSON arrays or whitespace-delimited pretty JSON objects while enforcing a complete, exact assignment bijection.
 def parse_assignments(response: str, start: int, count: int, speakers: set[str]) -> dict[int, str]:
     seen: dict[int, str] = {}
-    for raw in response.splitlines():
-        if not raw.strip():
-            continue
-        item = json.loads(raw)
-        if set(item) != {"index", "speaker_id"} or not isinstance(item["index"], int) or not isinstance(item["speaker_id"], str):
+    for item in assignment_objects(response):
+        if not isinstance(item, dict) or set(item) != {"index", "speaker_id"} or not isinstance(item["index"], int) or not isinstance(item["speaker_id"], str):
             raise ValueError("classifier output must contain only index and speaker_id")
         index, speaker = item["index"], item["speaker_id"]
         if index in seen or index < start or index >= start + count or speaker not in speakers:

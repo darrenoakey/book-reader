@@ -20,14 +20,17 @@ from pathlib import Path
 from src import tts_engine
 from src.audio_synth import concat_wavs, plan_chapter, wav_duration, write_timeline
 from src.breeze_voices import prepare_breeze_voices
-from src.character_analysis import analyze_chapter, create_narrator_entry, merge_character_info
+from src.character_analysis import (
+    analyze_chapter,
+    create_narrator_entry,
+    merge_character_info,
+)
 from src.epub_extract import get_output_dir
 from src.llm import ask_sync
 from src.movie_assemble import assemble_movie, probe_duration
 from src.movie_images import generate_character_refs, generate_scene_images
 from src.movie_storyboard import build_storyboard
 from src.pipeline import acquire_lock, release_lock
-from src.script_generate import generate_script_for_file
 from src.text_ingest import extract_any
 from src.voice_description import _voice_description_for_one, parse_json_response
 
@@ -250,7 +253,34 @@ def prepare_hour_directory(project: Path, hour_dir: Path) -> None:
 def script_for_chapter(project: Path, hour_dir: Path, chapter: Path, cast: dict) -> Path:
     shared_dir = project / "script_cache"
     shared_dir.mkdir(exist_ok=True)
-    canonical = asyncio.run(generate_script_for_file(chapter, shared_dir, sorted(cast)))
+    canonical = shared_dir / f"{chapter.stem}.jsonl"
+    source = chapter.read_text(encoding="utf-8")
+    metadata = canonical.with_name(canonical.name + ".hour.meta.json")
+    if canonical.exists():
+        payload = canonical.read_bytes()
+        try:
+            lines = [json.loads(line) for line in payload.decode("utf-8").splitlines() if line.strip()]
+            meta_path = metadata if metadata.exists() else canonical.with_name(canonical.name + ".meta.json")
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if meta.get("sha256") != hashlib.sha256(payload).hexdigest():
+                raise ValueError("payload hash mismatch")
+            if metadata.exists():
+                if meta.get("mode") != "immutable-spans" or meta.get("source_sha256") != hashlib.sha256(source.encode()).hexdigest():
+                    raise ValueError("hourly source metadata mismatch")
+                if any(next(iter(line)) not in cast for line in lines):
+                    raise ValueError("hourly script has an unknown speaker")
+                if "".join(next(iter(line.values())) for line in lines) != source:
+                    raise ValueError("hourly immutable spans do not reconstruct source")
+            else:
+                from src.script_generate import validate_script_lines
+                validate_script_lines(lines, source, sorted(cast))
+            return canonical
+        except (OSError, ValueError, StopIteration, json.JSONDecodeError) as error:
+            raise RuntimeError(f"existing canonical script {canonical.name} failed read-only validation: {error}") from error
+    from src.hourly_spans import generate_hourly_script_sync
+    generate_hourly_script_sync(chapter, canonical, sorted(cast))
+    payload = canonical.read_bytes()
+    atomic_json(metadata, {"mode": "immutable-spans", "source_sha256": hashlib.sha256(source.encode()).hexdigest(), "sha256": hashlib.sha256(payload).hexdigest()})
     script_dir = hour_dir / "script"
     script_dir.mkdir(exist_ok=True)
     hour_script = script_dir / canonical.name

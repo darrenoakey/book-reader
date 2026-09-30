@@ -29,8 +29,8 @@ from src.arbiter_tts import _client, _submit
 log = logging.getLogger(__name__)
 
 # Scene stills are 16:9, both dimensions snapped to /16 (model requirement).
-SCENE_WIDTH = 1920
-SCENE_HEIGHT = 1088
+SCENE_WIDTH = 864
+SCENE_HEIGHT = 480
 REF_SIZE = 1024
 LABEL_BAND = 56  # px of label strip under each contact-sheet tile
 
@@ -63,7 +63,7 @@ _LOCAL_PREFIX = "/Volumes/ssd_4/arbiter/"
 # map a spark-side /mnt/arbiter-store path to the local CIFS mount
 def _mount_resolve(spark_path: str) -> Path | None:
     if spark_path.startswith(_SPARK_PREFIX):
-        local = Path(_LOCAL_PREFIX + spark_path[len(_SPARK_PREFIX):])
+        local = Path(_LOCAL_PREFIX + spark_path[len(_SPARK_PREFIX) :])
         if local.exists():
             return local
     return None
@@ -179,7 +179,9 @@ def build_contact_sheet(items: list[tuple[str, Path]], dest: Path, tile: int = R
         img = Image.open(path).convert("RGB")
         if img.width != img.height:  # centre-crop to square
             side = min(img.width, img.height)
-            img = img.crop(((img.width - side) // 2, (img.height - side) // 2, (img.width + side) // 2, (img.height + side) // 2))
+            img = img.crop(
+                ((img.width - side) // 2, (img.height - side) // 2, (img.width + side) // 2, (img.height + side) // 2)
+            )
         x0 = _MARGIN + i * (tile + _GAP)
         sheet.paste(img.resize((tile, tile), Image.LANCZOS), (x0, TITLE_BAND))
         label = name.replace("-", " ").title()
@@ -246,38 +248,49 @@ def generate_character_refs(output_dir: Path) -> list[Path]:
 # whose remaining tiles are the visible characters' portraits (identity).
 # Scene 0 (no previous) uses portraits alone; a character-less scene N>0
 # conditions on the previous scene alone.
-def _scene_condition(output_dir: Path, characters: list[str], index: int, prev_index: int | None) -> tuple[Path | None, str]:
+def _scene_condition(
+    output_dir: Path, characters: list[str], index: int, prev_index: int | None
+) -> tuple[Path | None, str]:
     refs_dir = output_dir / "refs"
     available = [(cid, refs_dir / f"{cid}.png") for cid in characters if (refs_dir / f"{cid}.png").exists()]
+    style_image = output_dir / "style-reference.png"
+    has_style_image = style_image.is_file()
     prev = output_dir / "scenes" / f"{prev_index:04d}.png" if prev_index is not None else None
     has_prev = prev is not None and prev.exists() and prev.stat().st_size >= 1000
 
-    style_note = (
-        "The reference sheet's FIRST tile (labelled STYLE REF) is the previous scene: "
-        "match its art style, palette, and lighting EXACTLY — same medium, same rendering. "
-        "Paint a NEW scene, do not copy its composition. "
-    ) if has_prev else ""
-
-    if not available:
-        if not has_prev:
-            return None, ""
-        return prev, (
-            "The reference image is the previous scene: match its art style, palette, and "
-            "lighting EXACTLY — same medium, same rendering. Paint a NEW scene, do not copy "
-            "its composition. "
-        )
-
-    if not has_prev and len(available) == 1:
+    tiles: list[tuple[str, Path]] = []
+    if has_style_image:
+        tiles.append(("STYLE REFERENCE", style_image))
+    if has_prev:
+        tiles.append(("PREVIOUS SCENE", prev))
+    tiles.extend(available)
+    if not tiles:
+        return None, ""
+    if len(tiles) == 1 and not has_style_image and not has_prev:
         cid, path = available[0]
         return path, f"The reference image is a portrait of {cid.replace('-', ' ')}; keep this exact face, hair, and clothing."
 
-    tiles: list[tuple[str, Path]] = ([("STYLE REF", prev)] if has_prev else []) + available
     sheet = build_contact_sheet(tiles, output_dir / "scenes" / ".sheets" / f"{index:04d}.png")
     names = ", ".join(cid.replace("-", " ") for cid, _ in available)
+    style_note = (
+        "The tile labelled STYLE REFERENCE controls only medium, palette, lighting, and texture. "
+        "It is not a scene, layout, character, or subject to reproduce. "
+        if has_style_image
+        else ""
+    )
+    previous_note = (
+        "The tile labelled PREVIOUS SCENE controls continuity of medium and palette only; paint a new composition. "
+        if has_prev
+        else ""
+    )
+    character_note = (
+        f"Character portrait tiles ({names}) are likeness lookup only; use their exact faces, hair, and clothing. "
+        if names
+        else ""
+    )
     return sheet, (
-        f"{style_note}The reference image is a CHARACTER REFERENCE SHEET: separate labelled "
-        f"portrait panels ({names}) for likeness lookup only. Do NOT reproduce its layout — "
-        "paint ONE continuous cinematic scene using these exact faces, hair, and clothing. "
+        f"{style_note}{previous_note}{character_note}The reference is a labelled lookup sheet, never a layout: "
+        "paint ONE continuous cinematic scene, never panels, borders, labels, or duplicate subjects. "
     )
 
 
@@ -346,7 +359,9 @@ def _render_scene(output_dir: Path, storyboard: dict, scene: dict) -> Path:
     if cond_note:
         prompt = f"{cond_note}Scene: {prompt}"
     prompt = f"{prompt}{RESTRAINT}"
-    print(f"  scene {index + 1} (chars: {','.join(scene.get('characters', [])) or 'none'}, chain: {prev_index if prev_index is not None else 'first'})")
+    print(
+        f"  scene {index + 1} (chars: {','.join(scene.get('characters', [])) or 'none'}, chain: {prev_index if prev_index is not None else 'first'})"
+    )
     # Panel guard: qwen-image sometimes reproduces the reference sheet as
     # side-by-side panels. Detect and resubmit with a fresh seed.
     for attempt in range(3):

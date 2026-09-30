@@ -23,10 +23,7 @@ import json
 from pathlib import Path
 
 # ~15 words with a natural intensity shift; short clips clone best.
-REFERENCE_TEXT = (
-    "Listen to me. I have waited my whole life for this moment, "
-    "and I am not giving up now."
-)
+REFERENCE_TEXT = "Listen to me. I have waited my whole life for this moment, and I am not giving up now."
 
 
 # ##################################################################

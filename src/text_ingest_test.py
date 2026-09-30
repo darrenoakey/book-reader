@@ -46,9 +46,8 @@ def test_chunk_paragraphs() -> None:
 # a "Title / by Author / body" markdown story ingests with correct title,
 # author, intro file, and numbered chapter files
 def test_ingest_dragonboy_shape() -> None:
-    story = (
-        "Smallest Dragonboy\n\nby Anne McCaffrey\n\n"
-        + "\n\n".join(" ".join(["Keevan walked on"] * 80) for _ in range(12))
+    story = "Smallest Dragonboy\n\nby Anne McCaffrey\n\n" + "\n\n".join(
+        " ".join(["Keevan walked on"] * 80) for _ in range(12)
     )
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)

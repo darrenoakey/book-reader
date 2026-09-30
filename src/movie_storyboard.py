@@ -90,13 +90,18 @@ def window_lines(lines: list[dict], target_seconds: float = TARGET_SECONDS) -> l
             scenes[-1].extend(current)  # tail too short — fold into previous
         else:
             scenes.append(current)
+
     def _mid_text(s: list[dict]) -> str:
         # The still hangs on screen for the WHOLE window, so it must depict
         # what is being said at the window's temporal MIDPOINT (a 5s scene is
         # judged at 2.5s), not the opening or closing beat.
         mid = (s[0]["start"] + s[-1]["end"]) / 2
-        line = min(s, key=lambda l: min(abs(mid - l["start"]), abs(mid - l["end"]))
-                   if not (l["start"] <= mid <= l["end"]) else 0.0)
+        line = min(
+            s,
+            key=lambda l: min(abs(mid - l["start"]), abs(mid - l["end"]))
+            if not (l["start"] <= mid <= l["end"])
+            else 0.0,
+        )
         return line["text"]
 
     return [
@@ -161,7 +166,7 @@ def distill_locations(output_dir: Path, bible: dict) -> dict:
     full = "\n\n".join(p.read_text(encoding="utf-8") for p in chapters[1:])
     prompt = f"""You are the production designer on an animated film. Locations are characters too: find every NAMED or clearly-recurring LOCATION in this text (buildings, rooms, caverns, grounds, halls — places the action returns to), and for each, harvest EVERY visual detail the text gives and distill ONE canonical visual description.
 
-World rules (respect them): {bible.get('world_summary', '')} {' '.join(bible.get('rules', []))}
+World rules (respect them): {bible.get("world_summary", "")} {" ".join(bible.get("rules", []))}
 
 Text:
 {full[:12000]}
@@ -177,6 +182,8 @@ Output JSON only: {{"<loc_id>": {{"name": "...", "description": "..."}}, ...}}. 
     locations = parse_json_response(ask_sync(prompt, max_tokens=3000))
     path.write_text(json.dumps(locations, indent=2), encoding="utf-8")
     return locations
+
+
 def distill_appearances(output_dir: Path, bible: dict | None = None) -> dict:
     path = output_dir / "appearances.json"
     if path.exists():
@@ -268,13 +275,13 @@ def _scene_prompt(scene: dict, style: str, appearances: dict, title: str, bible:
         if appearance and appearance != "NONE":
             cast_notes.append(f"{speaker}: {appearance}")
     cast_block = "\n".join(cast_notes) or "(no named characters speak in this window)"
-    prompt = f"""You are the storyboard artist on an animated film of "{title}". Write an image prompt for ONE cinematic 16:9 still illustrating this {scene['end'] - scene['start']:.0f}-second moment of the story.
+    prompt = f"""You are the storyboard artist on an animated film of "{title}". Write an image prompt for ONE cinematic 16:9 still illustrating this {scene["end"] - scene["start"]:.0f}-second moment of the story.
 
 {_bible_block(bible)}The still stays on screen for the whole window, so it MUST depict the window's temporal midpoint. Illustrate THIS moment:
-{scene.get('mid_text') or scene['text'][:400]}
+{scene.get("mid_text") or scene["text"][:400]}
 
 Full spoken text during the window (context only — the midpoint moment above is the subject):
-{scene['text'][:1200]}
+{scene["text"][:1200]}
 
 Characters speaking in this window (show only characters who are actually present in the action; use these exact visual descriptions if you show them):
 {cast_block}
@@ -321,7 +328,13 @@ def build_storyboard(output_dir: Path, title: str) -> Path:
             print(f"    {window['index'] + 1}/{len(windows)} scene prompts")
     storyboard_path.write_text(
         json.dumps(
-            {"style": style, "appearances": appearances, "locations": locations, "world_bible": bible, "scenes": scenes},
+            {
+                "style": style,
+                "appearances": appearances,
+                "locations": locations,
+                "world_bible": bible,
+                "scenes": scenes,
+            },
             indent=2,
         ),
         encoding="utf-8",

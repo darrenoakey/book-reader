@@ -40,13 +40,20 @@ Give it an EPUB (or a plain `.md` / `.txt` story) and it produces:
 
 ```bash
 ./run install                     # one-time: create venv + deps
-./run create book.epub --resolution 720  # full pipeline, 720p default (or 1080p)
+./run create book.epub --resolution 480  # full pipeline, 480p default (or 720p/1080p)
+./run hour full-book.txt --hour 1          # resumable first ≤3600s production hour (Breeze, Qwen-Image-2.1 864×480 sources, 854×480 final)
 ./run step movie book.epub --resolution 1080  # render just the movie at 1080p
 ./run serve                       # inspect UI
 ./run deploy                      # register the UI as an auto service (port 8769)
 ./run test <target>               # run tests
 ./run lint                        # ruff
 ```
+
+## Long-book hourly production
+
+`./run hour SOURCE --hour N` produces exactly one durable production hour from a full source. It extracts the source once, analyzes and scripts only the chapters needed for that hour, and records the next chapter/piece cursor in `hours.json` only after the 720p movie succeeds. The output is `output/<source-stem>/hours/hour-NNN/movie/movie.mp4` and is rejected if it exceeds 3600 seconds. Chapter order is numeric even after chapter 99.
+
+The project-root `characters.json`, `voices.json`, `breeze_voices.json`, `voices/`, and `refs/` are shared across hours. Existing identities, Breeze reference clips, and portraits are never replaced; later hours append new cast only. Hour scenes are 20 seconds (about three images per minute), generated only through the sanctioned `qwen-image` / Qwen-Image-2.1 Diffusers route at 864×480, centre-cropped and rendered as an 854×480 Ken Burns movie. No IGS route is used.
 
 ## The inspect UI
 

@@ -61,6 +61,9 @@ def command_create(args: argparse.Namespace) -> int:
     if not epub_path.exists():
         print(f"Error: input file not found: {epub_path}")
         return 1
+    installed = command_install(args)
+    if installed:
+        return installed
     code = f'''
 from pathlib import Path
 from src.epub_extract import get_output_dir
@@ -76,6 +79,25 @@ if _scene_seconds:
 run_pipeline(Path("{epub_path}"), resolution={args.resolution!r})
 '''
     return run_venv([str(VENV_PYTHON), "-c", code])
+
+
+# ##################################################################
+# command hour
+# produce exactly one bounded, resumable 480p production hour from a full source book
+def command_hour(args: argparse.Namespace) -> int:
+    ensure_venv()
+    source = Path(args.source).resolve()
+    if not source.exists():
+        print(f"Error: input file not found: {source}")
+        return 1
+    installed = command_install(args)
+    if installed:
+        return installed
+    from src.hour_runner import run_hour
+
+    movie = run_hour(source, hour_index=args.hour)
+    print(f"Completed hour {args.hour}: {movie}")
+    return 0
 
 
 # ##################################################################
@@ -122,6 +144,9 @@ def command_step(args: argparse.Namespace) -> int:
     if not epub_path.exists():
         print(f"Error: EPUB file not found: {epub_path}")
         return 1
+    installed = command_install(args)
+    if installed:
+        return installed
     cmd = [str(VENV_PYTHON), "-m", "src.step_runner", args.step, str(epub_path)]
     if args.max_chapters:
         cmd.extend(["--max-chapters", str(args.max_chapters)])
@@ -209,8 +234,13 @@ def main(argv: list[str]) -> int:
     p_create.add_argument("epub", help="Path to EPUB file")
     p_create.add_argument("--style", default=None, help="Visual style for the movie (writes the project's style.txt override)")
     p_create.add_argument("--scene-seconds", type=float, default=0.0, help="Seconds per scene image (default 30; writes scene_seconds.txt)")
-    p_create.add_argument("--resolution", type=int, choices=sorted(SUPPORTED_RESOLUTIONS), default=DEFAULT_RESOLUTION, help="Movie vertical resolution (default: 720)")
+    p_create.add_argument("--resolution", type=int, choices=sorted(SUPPORTED_RESOLUTIONS), default=DEFAULT_RESOLUTION, help="Movie vertical resolution (default: 480)")
     p_create.set_defaults(func=command_create)
+
+    p_hour = sub.add_parser("hour", help="Produce one resumable, no-longer-than-3600s 480p movie hour")
+    p_hour.add_argument("source", help="Full EPUB, Markdown, or text input")
+    p_hour.add_argument("--hour", type=int, default=1, help="1-based production hour number")
+    p_hour.set_defaults(func=command_hour)
 
     p_test = sub.add_parser("test", help="Run a single test target")
     p_test.add_argument("target", help="e.g. src/epub_extract_test.py::test_normalize_name")
@@ -232,7 +262,7 @@ def main(argv: list[str]) -> int:
     )
     p_step.add_argument("epub", help="Path to EPUB file (or .md/.txt story)")
     p_step.add_argument("--max-chapters", type=int, default=0, help="Limit to first N chapters")
-    p_step.add_argument("--resolution", type=int, choices=sorted(SUPPORTED_RESOLUTIONS), default=DEFAULT_RESOLUTION, help="Movie vertical resolution (default: 720)")
+    p_step.add_argument("--resolution", type=int, choices=sorted(SUPPORTED_RESOLUTIONS), default=DEFAULT_RESOLUTION, help="Movie vertical resolution (default: 480)")
     p_step.set_defaults(func=command_step)
 
     p_serve = sub.add_parser("serve", help="Run the inspect web UI")

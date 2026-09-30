@@ -32,8 +32,22 @@ def _make_gradient(path: Path) -> None:
 # real sine wav of exactly `seconds` at the pipeline rate
 def _make_tone(path: Path, seconds: float) -> None:
     r = subprocess.run(
-        ["ffmpeg", "-y", "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}", "-ar", "24000", "-ac", "1", str(path)],
-        capture_output=True, text=True, check=False,
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=440:duration={seconds}",
+            "-ar",
+            "24000",
+            "-ac",
+            "1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert r.returncode == 0, r.stderr
 
@@ -49,18 +63,26 @@ def _prepare_project(out: Path) -> float:
     _make_tone(audio_dir / "01-a.wav", 2.0)
     _make_tone(audio_dir / "02-b.wav", 2.0)
     for name in ("01-a", "02-b"):
-        (audio_dir / f"{name}.timeline.json").write_text(json.dumps({
-            "chapter": name,
-            "lines": [{"index": 0, "speaker": "narrator", "text": "hi", "start": 0.0, "end": 2.0}],
-        }))
+        (audio_dir / f"{name}.timeline.json").write_text(
+            json.dumps(
+                {
+                    "chapter": name,
+                    "lines": [{"index": 0, "speaker": "narrator", "text": "hi", "start": 0.0, "end": 2.0}],
+                }
+            )
+        )
     Image.new("RGB", (1920, 1088), (40, 60, 90)).save(scenes_dir / "0000.png")
     Image.new("RGB", (1920, 1088), (90, 60, 40)).save(scenes_dir / "0001.png")
-    (out / "storyboard.json").write_text(json.dumps({
-        "scenes": [
-            {"index": 0, "start": 0.0, "end": 2.0, "characters": []},
-            {"index": 1, "start": 2.0, "end": 4.0, "characters": []},
-        ]
-    }))
+    (out / "storyboard.json").write_text(
+        json.dumps(
+            {
+                "scenes": [
+                    {"index": 0, "start": 0.0, "end": 2.0, "characters": []},
+                    {"index": 1, "start": 2.0, "end": 4.0, "characters": []},
+                ]
+            }
+        )
+    )
     return 4.0
 
 
@@ -72,13 +94,15 @@ def test_composite_text_real() -> None:
         tmp = Path(tmpdir)
         art = tmp / "art.png"
         _make_gradient(art)
-        dest = composite_text(art, tmp / "page.png", "The Smallest Dragonboy", "Anne McCaffrey", "A small boy dares to hope")
+        dest = composite_text(
+            art, tmp / "page.png", "The Smallest Dragonboy", "Anne McCaffrey", "A small boy dares to hope"
+        )
         assert dest.stat().st_size > 1000
         img = Image.open(dest)
-        assert img.size == (1920, 1088)
+        assert img.size == (864, 480)
         # centre pixels must differ from the raw art (scrim + title ink)
-        src = Image.open(art).convert("RGB").resize((1920, 1088))
-        assert img.getpixel((960, 544)) != src.getpixel((960, 544))
+        src = Image.open(art).convert("RGB").resize((864, 480))
+        assert img.getpixel((432, 240)) != src.getpixel((432, 240))
 
 
 # ##################################################################
@@ -87,10 +111,15 @@ def test_composite_text_real() -> None:
 def test_tagline_cached() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         out = Path(tmpdir)
-        (out / "title_page.json").write_text(json.dumps({
-            "title": "The Smallest Dragonboy", "author": "Anne McCaffrey",
-            "tagline": "A small boy dares to hope",
-        }))
+        (out / "title_page.json").write_text(
+            json.dumps(
+                {
+                    "title": "The Smallest Dragonboy",
+                    "author": "Anne McCaffrey",
+                    "tagline": "A small boy dares to hope",
+                }
+            )
+        )
         assert load_or_make_tagline(out, "The Smallest Dragonboy", "Anne McCaffrey") == "A small boy dares to hope"
 
 
@@ -108,7 +137,7 @@ def test_assemble_movie_with_title_real() -> None:
         expected_frames = round(total_seconds * FPS)
         assert probe_frames(movie) == expected_frames
         assert abs(probe_duration(movie) - total_seconds) < 0.1
-        segments_dir = out / "movie" / "720p" / "segments"
+        segments_dir = out / "movie" / "480p" / "segments"
         title_seg = next(segments_dir.glob("title.*.mp4"))
         assert probe_frames(title_seg) == FPS  # capped: 2s scene − 1s reserve
         # scene 0 keeps exactly its remaining second

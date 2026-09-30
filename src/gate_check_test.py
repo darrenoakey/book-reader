@@ -32,8 +32,17 @@ def test_changed_paths(tmp_path: Path) -> None:
     source = tmp_path / "source.txt"
     source.write_text("first\n")
     subprocess.run(["git", "add", "source.txt"], cwd=tmp_path, check=True)
-    commit = ["git", "-c", "user.name=Book Reader Tests", "-c", "user.email=tests@example.invalid",
-              "-c", "commit.gpgsign=false", "commit", "-qm"]
+    commit = [
+        "git",
+        "-c",
+        "user.name=Book Reader Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+    ]
     subprocess.run([*commit, "initial"], cwd=tmp_path, check=True)
     subprocess.run(["git", "update-ref", "refs/greenline/last-green", "HEAD"], cwd=tmp_path, check=True)
     assert changed_paths(tmp_path) == []

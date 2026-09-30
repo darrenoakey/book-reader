@@ -30,8 +30,17 @@ INSPECT_SERVICE = "book-reader-inspect"
 INSPECT_PORT = 8769
 
 PIPELINE_STEPS = [
-    "extract", "characters", "voices_desc", "voices_clone",
-    "scripts", "audio", "m4b", "storyboard", "refimages", "sceneimages", "movie",
+    "extract",
+    "characters",
+    "voices_desc",
+    "voices_clone",
+    "scripts",
+    "audio",
+    "m4b",
+    "storyboard",
+    "refimages",
+    "sceneimages",
+    "movie",
 ]
 
 CONTENT_TYPES = {
@@ -68,7 +77,9 @@ def build_static_hashes() -> None:
 # resolve static tags
 # rewrite {{ static:file }} markers to cache-busted /static urls
 def resolve_static_tags(page: str) -> str:
-    return _STATIC_TAG.sub(lambda m: f"/static/{m.group(1).strip()}?v={_STATIC_HASHES.get(m.group(1).strip(), 'dev')}", page)
+    return _STATIC_TAG.sub(
+        lambda m: f"/static/{m.group(1).strip()}?v={_STATIC_HASHES.get(m.group(1).strip(), 'dev')}", page
+    )
 
 
 # ##################################################################
@@ -144,8 +155,12 @@ def project_detail(project: Path) -> dict:
             "id": cid,
             "name": info.get("name", cid),
             "bio": (info.get("bio") or info.get("description") or "")[:400],
-            "ref_image": f"/media/{project.name}/refs/{cid}.png" if (project / "refs" / f"{cid}.png").exists() else None,
-            "voice_clip": f"/media/{project.name}/voices/{cid}.wav" if (project / "voices" / f"{cid}.wav").exists() else None,
+            "ref_image": f"/media/{project.name}/refs/{cid}.png"
+            if (project / "refs" / f"{cid}.png").exists()
+            else None,
+            "voice_clip": f"/media/{project.name}/voices/{cid}.wav"
+            if (project / "voices" / f"{cid}.wav").exists()
+            else None,
         }
         for cid, info in sorted(characters.items())
     ]
@@ -162,10 +177,18 @@ def project_detail(project: Path) -> dict:
     ]
     m4bs = list(project.glob("*.m4b"))
     detail["audiobook_url"] = f"/media/{project.name}/{m4bs[0].name}" if m4bs else None
-    detail["movie_url"] = f"/media/{project.name}/movie/movie.mp4" if (project / "movie" / "movie.mp4").exists() else None
-    detail["chapters"] = [
-        p.stem for p in sorted((project / "audio").glob("*.wav")) if p.stem.endswith(".announce") is False and "." not in p.stem
-    ] if (project / "audio").exists() else []
+    detail["movie_url"] = (
+        f"/media/{project.name}/movie/movie.mp4" if (project / "movie" / "movie.mp4").exists() else None
+    )
+    detail["chapters"] = (
+        [
+            p.stem
+            for p in sorted((project / "audio").glob("*.wav"))
+            if p.stem.endswith(".announce") is False and "." not in p.stem
+        ]
+        if (project / "audio").exists()
+        else []
+    )
     return detail
 
 
@@ -250,7 +273,7 @@ class InspectHandler(SimpleHTTPRequestHandler):
             self._send(resolve_static_tags(page).encode("utf-8"), "text/html")
             return
         if path.startswith("/static/"):
-            name = path[len("/static/"):]
+            name = path[len("/static/") :]
             if "/" in name or name.startswith("."):
                 self._404("bad static path")
                 return

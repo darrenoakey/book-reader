@@ -188,7 +188,9 @@ def generate_title_page(output_dir: Path, title: str, author: str) -> Path:
         "composition, open calm sky or soft-focus space in the central area for a title overlay. "
         f"Style: {style}.{RESTRAINT}"
     )
-    negative = ", ".join(filter(None, [negative, "text, letters, words, typography, logo, title, caption, watermark, signature"]))
+    negative = ", ".join(
+        filter(None, [negative, "text, letters, words, typography, logo, title, caption, watermark, signature"])
+    )
     qwen_image_to_file(
         prompt,
         art,

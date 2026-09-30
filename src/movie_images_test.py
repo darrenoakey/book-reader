@@ -40,6 +40,26 @@ def test_contact_sheet() -> None:
 
 
 # ##################################################################
+# test style and cast condition sheet
+# combines the supplied visual reference and cast likeness into the one Qwen condition image without treating either as scene content.
+def test_style_and_cast_condition_sheet() -> None:
+    from src.movie_images import _scene_condition
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        refs = root / "refs"
+        refs.mkdir()
+        _make_portrait(root / "style-reference.png", (70, 100, 140))
+        _make_portrait(refs / "ira.png", (210, 120, 80))
+        condition, note = _scene_condition(root, ["ira"], 0, None)
+        assert condition is not None
+        assert condition.name == "0000.png"
+        assert "STYLE REFERENCE" in note
+        assert "not a scene" in note
+        assert "ira" in note
+
+
+# ##################################################################
 # test panel borders
 # a synthetic two-panel image flags; a smooth scene-like gradient does not
 def test_panel_borders() -> None:
@@ -81,6 +101,6 @@ def test_qwen_image_real() -> None:
             why="book-reader test",
         )
         assert dest.stat().st_size >= 10000
-        img = Image.open(dest)
-        assert img.format == "PNG"
-        assert img.size[0] >= 480  # snapped to /16 but in the right ballpark
+        with Image.open(dest) as img:
+            assert img.format == "PNG"
+            assert img.size[0] >= 480  # snapped to /16 but in the right ballpark

@@ -96,8 +96,14 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 def probe_duration(path: Path) -> float:
     out = _run(
         [
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
         ]
     ).stdout
     return float(out.strip())
@@ -109,8 +115,16 @@ def probe_duration(path: Path) -> float:
 def probe_resolution(path: Path) -> tuple[int, int]:
     out = _run(
         [
-            "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
-            "-of", "csv=p=0", str(path),
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            str(path),
         ]
     ).stdout.strip()
     width, height = out.split(",")
@@ -132,8 +146,17 @@ def movie_has_resolution(output_dir: Path, resolution: int) -> bool:
 def probe_frames(path: Path) -> int:
     out = _run(
         [
-            "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
-            "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(path),
+            "ffprobe",
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "csv=p=0",
+            str(path),
         ]
     ).stdout
     return int(out.strip())
@@ -171,11 +194,18 @@ def zoompan_filter(move: str, frames: int, resolution: int = DEFAULT_RESOLUTION)
 # the still upscaled _SUPERx, cached beside the segments (rebuilt if the
 # source image is newer) — one ffmpeg call per segment, not per frame
 def _prescaled(image: Path, cache_dir: Path, resolution: int) -> Path:
-    width, _ = movie_dimensions(resolution)
+    width, height = movie_dimensions(resolution)
     scaled = cache_dir / f"{image.stem}-{resolution}p-{_SUPER}x.png"
     if not scaled.exists() or scaled.stat().st_mtime < image.stat().st_mtime:
         scaled.parent.mkdir(parents=True, exist_ok=True)
-        _run(["ffmpeg", "-y", "-i", str(image), "-vf", f"scale={width * _SUPER}:-1:flags=lanczos", str(scaled)])
+        target_width, target_height = width * _SUPER, height * _SUPER
+        # Qwen scene sources are 864×480 (1.8:1); centre-crop after an
+        # aspect-preserving upscale so the 854×480 final remains true 16:9.
+        filter_graph = (
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={target_width}:{target_height}"
+        )
+        _run(["ffmpeg", "-y", "-i", str(image), "-vf", filter_graph, str(scaled)])
     return scaled
 
 
@@ -246,11 +276,26 @@ def render_segment(image: Path, frames: int, move: str, dest: Path, resolution: 
     scaled = _prescaled(image, dest.parent / ".prescaled", resolution)
     _run(
         [
-            "ffmpeg", "-y", "-loop", "1", "-i", str(scaled),
-            "-vf", zoompan_filter(move, frames, resolution),
-            "-frames:v", str(frames),
-            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-r", str(FPS), "-an", str(dest),
+            "ffmpeg",
+            "-y",
+            "-loop",
+            "1",
+            "-i",
+            str(scaled),
+            "-vf",
+            zoompan_filter(move, frames, resolution),
+            "-frames:v",
+            str(frames),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-r",
+            str(FPS),
+            "-an",
+            str(dest),
         ]
     )
     actual = probe_frames(dest)
@@ -318,7 +363,9 @@ def assemble_movie(output_dir: Path, title: str, resolution: int = DEFAULT_RESOL
 
     segments: list[Path] = []
     if title_frames:
-        segments.append(render_segment(title_image, title_frames, "zoom-in", segments_dir / "title.zoom-in.mp4", resolution))
+        segments.append(
+            render_segment(title_image, title_frames, "zoom-in", segments_dir / "title.zoom-in.mp4", resolution)
+        )
         print(f"    title card: {title_frames / FPS:.1f}s")
     for i, scene in enumerate(scenes):
         frames = bounds[i + 1] - bounds[i]
@@ -345,8 +392,17 @@ def assemble_movie(output_dir: Path, title: str, resolution: int = DEFAULT_RESOL
         try:
             _run(
                 [
-                    "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-                    "-c", "copy", str(video_only),
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(list_file),
+                    "-c",
+                    "copy",
+                    str(video_only),
                 ]
             )
         finally:
@@ -361,10 +417,24 @@ def assemble_movie(output_dir: Path, title: str, resolution: int = DEFAULT_RESOL
     movie_path = movie_dir / "movie.mp4"
     _run(
         [
-            "ffmpeg", "-y", "-i", str(video_only), "-i", str(audio_full),
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-metadata", f"title={title}",
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_only),
+            "-i",
+            str(audio_full),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-metadata",
+            f"title={title}",
             str(movie_path),
         ]
     )
@@ -379,4 +449,18 @@ def assemble_movie(output_dir: Path, title: str, resolution: int = DEFAULT_RESOL
     return movie_path
 
 
-__all__ = ["DEFAULT_RESOLUTION", "FPS", "MOVES", "STATICS", "SUPPORTED_RESOLUTIONS", "assemble_movie", "movie_dimensions", "movie_has_resolution", "probe_duration", "probe_resolution", "render_segment", "scene_move", "zoompan_filter"]
+__all__ = [
+    "DEFAULT_RESOLUTION",
+    "FPS",
+    "MOVES",
+    "STATICS",
+    "SUPPORTED_RESOLUTIONS",
+    "assemble_movie",
+    "movie_dimensions",
+    "movie_has_resolution",
+    "probe_duration",
+    "probe_resolution",
+    "render_segment",
+    "scene_move",
+    "zoompan_filter",
+]

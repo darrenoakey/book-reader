@@ -23,7 +23,9 @@ from src.movie_assemble import (
 def _make_tone(path: Path) -> None:
     result = subprocess.run(
         ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-ar", "24000", "-ac", "1", str(path)],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
 
@@ -40,9 +42,15 @@ def _prepare_project(output_dir: Path) -> None:
     _make_tone(audio_dir / "01-chapter.wav")
     (audio_dir / "01-chapter.timeline.json").write_text(json.dumps({"chapter": "01-chapter", "lines": []}))
     Image.new("RGB", (1920, 1088), (50, 80, 120)).save(scenes_dir / "0000.png")
-    (output_dir / "storyboard.json").write_text(json.dumps({"scenes": [
-        {"index": 0, "start": 0.0, "end": 1.0, "characters": []},
-    ]}))
+    (output_dir / "storyboard.json").write_text(
+        json.dumps(
+            {
+                "scenes": [
+                    {"index": 0, "start": 0.0, "end": 1.0, "characters": []},
+                ]
+            }
+        )
+    )
 
 
 # ##################################################################
@@ -53,14 +61,14 @@ def test_assembly_resolution_switch_real() -> None:
         output_dir = Path(temporary_directory)
         _prepare_project(output_dir)
         first_movie = assemble_movie(output_dir, "Resolution Test")
-        assert probe_resolution(first_movie) == (1280, 720)
+        assert probe_resolution(first_movie) == (854, 480)
         assert movie_has_resolution(output_dir, DEFAULT_RESOLUTION)
-        assert (output_dir / "movie" / "720p" / "segments").exists()
-        assert (output_dir / "movie" / "720p" / "segments" / ".prescaled").exists()
+        assert (output_dir / "movie" / "480p" / "segments").exists()
+        assert (output_dir / "movie" / "480p" / "segments" / ".prescaled").exists()
 
         same_destination = output_dir / "same-destination.mp4"
         render_segment(output_dir / "scenes" / "0000.png", 30, "zoom-in", same_destination)
-        assert probe_resolution(same_destination) == (1280, 720)
+        assert probe_resolution(same_destination) == (854, 480)
         render_segment(output_dir / "scenes" / "0000.png", 30, "zoom-in", same_destination, resolution=1080)
         assert probe_resolution(same_destination) == (1920, 1080)
 
@@ -74,7 +82,7 @@ def test_assembly_resolution_switch_real() -> None:
 
 # ##################################################################
 # test cli resolution validation
-# verifies both public commands accept their 720p default and reject unsupported choices before pipeline work starts
+# verifies both public commands accept their 480p default and reject unsupported choices before pipeline work starts
 def test_cli_resolution_validation() -> None:
     root = Path(__file__).resolve().parents[1]
     for command in (("create", "missing.txt"), ("step", "movie", "missing.txt")):
@@ -82,12 +90,16 @@ def test_cli_resolution_validation() -> None:
             [str(root / "run"), *command], cwd=root, capture_output=True, text=True, check=False
         )
         assert default_result.returncode == 1
-        assert "input file not found" in default_result.stdout.lower() or "epub file not found" in default_result.stdout.lower()
+        assert (
+            "input file not found" in default_result.stdout.lower()
+            or "epub file not found" in default_result.stdout.lower()
+        )
         result = subprocess.run(
             [str(root / "run"), *command, "--resolution", "900"], cwd=root, capture_output=True, text=True, check=False
         )
         assert result.returncode == 2
         assert "invalid choice" in result.stderr
+
 
 # ##################################################################
 # test pipeline rerenders resolution real
@@ -109,14 +121,26 @@ def test_pipeline_rerenders_when_resolution_changes_real() -> None:
             _prepare_project(output_dir)
             chapters_dir = output_dir / "chapters"
             chapters_dir.mkdir()
-            (chapters_dir / "00-intro.txt").write_text("Resolution Pipeline by Test Author, narrated by Test", encoding="utf-8")
+            (chapters_dir / "00-intro.txt").write_text(
+                "Resolution Pipeline by Test Author, narrated by Test", encoding="utf-8"
+            )
             for step in (
-                "extract", "characters", "voices_desc", "voices_clone", "scripts", "audio", "m4b", "storyboard",
-                "titlepage", "refimages", "sceneimages", "movie",
+                "extract",
+                "characters",
+                "voices_desc",
+                "voices_clone",
+                "scripts",
+                "audio",
+                "m4b",
+                "storyboard",
+                "titlepage",
+                "refimages",
+                "sceneimages",
+                "movie",
             ):
                 mark_step_complete(output_dir, step)
             assemble_movie(output_dir, "Resolution Pipeline")
-            assert movie_has_resolution(output_dir, 720)
+            assert movie_has_resolution(output_dir, 480)
             root = Path(__file__).resolve().parents[1]
             result = subprocess.run(
                 [str(root / "run"), "create", str(input_path), "--resolution", "1080"],

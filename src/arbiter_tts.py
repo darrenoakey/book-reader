@@ -339,6 +339,7 @@ def tts_breeze_many(jobs: list[dict], output_dir: Path) -> list[Path]:
         import zlib
 
         client = _client(300)
+
         # Stage this batch's distinct reference clips; the inbox is cleaned
         # after the job, so staging happens per batch, fresh every resubmit.
         def _stage() -> dict:

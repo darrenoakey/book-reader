@@ -10,15 +10,45 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MOVIE_PATHS = {
-    "run", "src/movie_assemble.py", "src/movie_resolution.py", "src/movie_assemble_test.py",
-    "src/movie_resolution_test.py", "src/pipeline.py", "src/step_runner.py",
-    "src/title_page_test.py", "src/gate_check.py", "src/gate_check_test.py",
-    "src/dep_install.py", "src/dep_install_test.py", "greenline.toml",
+    "run",
+    "src/movie_assemble.py",
+    "src/movie_resolution.py",
+    "src/movie_assemble_test.py",
+    "src/movie_resolution_test.py",
+    "src/pipeline.py",
+    "src/step_runner.py",
+    "src/title_page_test.py",
+    "src/gate_check.py",
+    "src/gate_check_test.py",
+    "src/dep_install.py",
+    "src/dep_install_test.py",
+    "src/hour_runner.py",
+    "src/hour_runner_test.py",
+    "src/movie_images.py",
+    "src/movie_images_test.py",
+    "src/arbiter_tts.py",
+    "src/breeze_voices.py",
+    "src/character_analysis.py",
+    "src/character_analysis_test.py",
+    "src/server.py",
+    "src/title_page.py",
+    "src/movie_storyboard.py",
+    "src/movie_storyboard_test.py",
+    "src/text_ingest.py",
+    "src/text_ingest_test.py",
+    "greenline.toml",
 }
 MOVIE_TESTS = (
-    "src/movie_assemble_test.py", "src/movie_resolution_test.py",
-    "src/title_page_test.py", "src/state_test.py", "src/gate_check_test.py",
+    "src/movie_assemble_test.py",
+    "src/movie_resolution_test.py",
+    "src/title_page_test.py",
+    "src/state_test.py",
+    "src/gate_check_test.py",
     "src/dep_install_test.py",
+    "src/hour_runner_test.py",
+    "src/text_ingest_test.py",
+    "src/movie_storyboard_test.py",
+    "src/movie_images_test.py",
 )
 
 
@@ -39,7 +69,10 @@ def select_tests(paths: list[str]) -> tuple[str, ...] | None:
 def changed_paths(root: Path) -> list[str]:
     result = subprocess.run(
         ["git", "diff", "--name-only", "refs/greenline/last-green", "HEAD"],
-        cwd=root, capture_output=True, text=True, check=False,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if result.returncode:
         return []

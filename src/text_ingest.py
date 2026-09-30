@@ -122,7 +122,7 @@ def ingest_text(story_path: Path, output_dir: Path, author: str = "Unknown Autho
         plain = strip_markdown(body)
         for chunk in chunk_paragraphs(plain):
             chapter_title = section_title or f"Part {number}"
-            path = chapters_dir / f"{number:02d}-{normalize_name(chapter_title)[:40]}.txt"
+            path = chapters_dir / f"{number:05d}-{normalize_name(chapter_title)[:40]}.txt"
             if not path.exists():
                 path.write_text(chunk, encoding="utf-8")
             written.append(path)

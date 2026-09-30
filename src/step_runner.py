@@ -120,7 +120,9 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0, resolution: int 
 
     else:
         print(f"Unknown step: {step}")
-        print("Valid steps: extract, characters, voices, scripts, audio, m4b, storyboard, titlepage, refimages, sceneimages, movie")
+        print(
+            "Valid steps: extract, characters, voices, scripts, audio, m4b, storyboard, titlepage, refimages, sceneimages, movie"
+        )
         return 1
 
     return 0
@@ -136,7 +138,13 @@ def main() -> int:
     parser.add_argument("step")
     parser.add_argument("epub_path")
     parser.add_argument("--max-chapters", type=int, default=0, help="Limit to first N chapters")
-    parser.add_argument("--resolution", type=int, choices=sorted(SUPPORTED_RESOLUTIONS), default=DEFAULT_RESOLUTION, help="Movie vertical resolution (default: 720)")
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        choices=sorted(SUPPORTED_RESOLUTIONS),
+        default=DEFAULT_RESOLUTION,
+        help="Movie vertical resolution (default: 720)",
+    )
     args = parser.parse_args()
     return run_step(args.step, Path(args.epub_path), max_chapters=args.max_chapters, resolution=args.resolution)
 

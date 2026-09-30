@@ -220,7 +220,9 @@ Each group = same person. IDs not in any group stay as singles."""
                 deduplicated[canonical_id]["bio"] += " " + new_bio
             new_look = info.get("look", "")
             if new_look and new_look not in deduplicated[canonical_id].get("look", ""):
-                deduplicated[canonical_id]["look"] = (deduplicated[canonical_id].get("look", "") + " " + new_look).strip()
+                deduplicated[canonical_id]["look"] = (
+                    deduplicated[canonical_id].get("look", "") + " " + new_look
+                ).strip()
             if len(info["name"]) > len(deduplicated[canonical_id]["name"]):
                 deduplicated[canonical_id]["name"] = info["name"]
     deduplicated = post_process_dedup(deduplicated)

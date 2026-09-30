@@ -310,13 +310,19 @@ async def _process_chunk(chunk: str, speaker_ids: list[str], label: str) -> list
     prompt = build_prompt(chunk, speakers_list)
     last_error = "no attempt"
     for attempt in range(MAX_ATTEMPTS):
+        request = prompt
         if attempt:
             print(f"  {label} retry {attempt}: {last_error}")
             await asyncio.sleep(RETRY_DELAY_SECONDS)
-        response = await query_haiku(prompt)
+            request += (
+                "\nREPAIR REQUIRED: Your prior response failed exact source coverage: "
+                f"{last_error}. Return every source word exactly once, in original order; "
+                "only assign speakers and remove quotation marks. Output JSONL only."
+            )
+        response = await query_haiku(request)
         try:
             parsed = parse_jsonl_strict(response)
-            validate_chunk(parsed, chunk, speaker_ids)
+            validate_script_lines(parsed, chunk, speaker_ids, include_title=True)
             return parsed
         except ScriptGenerationError as exc:
             last_error = str(exc)

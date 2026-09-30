@@ -5,9 +5,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+import setproctitle
+
+from src.dep_install import ensure_installed
+from src.gate_check import wait_for_json
 from src.movie_resolution import DEFAULT_RESOLUTION, SUPPORTED_RESOLUTIONS
 
-import setproctitle
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
 
 setproctitle.setproctitle("book-reader")
 
@@ -43,11 +49,7 @@ def run_venv(cmd: list[str]) -> int:
 # install dependencies into the virtual environment
 def command_install(args: argparse.Namespace) -> int:
     ensure_venv()
-    print("Installing dependencies...")
-    rc = run_venv([str(VENV_PIP), "install", "-r", "requirements.txt"])
-    if rc == 0:
-        print("Dependencies installed successfully")
-    return rc
+    return ensure_installed(PROJECT_ROOT, VENV, VENV_PYTHON)
 
 
 # ##################################################################
@@ -169,24 +171,28 @@ def command_deploy(args: argparse.Namespace) -> int:
     if rc != 0:
         return rc
     subprocess.call(["auto", "-q", "restart", INSPECT_SERVICE])
-    return command_health(args)
+    # Measured bind time is about 2s; allow headroom when the machine is loaded.
+    return _report_health(12.0)
+
+
+# ##################################################################
+# report health
+# Print the live inspect probe. deadline_s keeps a standalone health under 5s.
+def _report_health(deadline_s: float) -> int:
+    url = f"http://127.0.0.1:{INSPECT_PORT}/api/projects"
+    rc, payload = wait_for_json(url, deadline_s)
+    if rc == 0 and isinstance(payload, list):
+        print(f"book-reader-inspect OK: {len(payload)} projects at http://127.0.0.1:{INSPECT_PORT}")
+        return 0
+    print(f"book-reader-inspect UNHEALTHY: {payload}")
+    return 1
 
 
 # ##################################################################
 # command health
-# probe the live inspect UI
+# probe the live inspect UI. Five seconds is the readiness-probe cap.
 def command_health(args: argparse.Namespace) -> int:
-    import json as _json
-    import urllib.request
-
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{INSPECT_PORT}/api/projects", timeout=10) as resp:
-            projects = _json.loads(resp.read())
-        print(f"book-reader-inspect OK: {len(projects)} projects at http://127.0.0.1:{INSPECT_PORT}")
-        return 0
-    except OSError as e:
-        print(f"book-reader-inspect UNHEALTHY: {e}")
-        return 1
+    return _report_health(4.0)
 
 
 # ##################################################################

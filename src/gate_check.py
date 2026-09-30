@@ -1,7 +1,11 @@
 # Change-impact gate for the movie assembly surface; unrelated changes retain
 # the full repository check, including live model integrations.
+import json
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -9,11 +13,12 @@ MOVIE_PATHS = {
     "run", "src/movie_assemble.py", "src/movie_resolution.py", "src/movie_assemble_test.py",
     "src/movie_resolution_test.py", "src/pipeline.py", "src/step_runner.py",
     "src/title_page_test.py", "src/gate_check.py", "src/gate_check_test.py",
-    "greenline.toml",
+    "src/dep_install.py", "src/dep_install_test.py", "greenline.toml",
 }
 MOVIE_TESTS = (
     "src/movie_assemble_test.py", "src/movie_resolution_test.py",
     "src/title_page_test.py", "src/state_test.py", "src/gate_check_test.py",
+    "src/dep_install_test.py",
 )
 
 
@@ -52,6 +57,29 @@ def main() -> int:
     if lint:
         return lint
     return subprocess.call([sys.executable, "-m", "pytest", "-q", *tests], cwd=ROOT)
+
+
+# ##################################################################
+# wait for json
+# Restart returns before the inspect server binds. Retry until the deadline
+# so a 2s startup is not a false deploy failure. Callers own the deadline:
+# a standalone health probe must stay under five seconds.
+def wait_for_json(url: str, deadline_s: float) -> tuple[int, object]:
+    deadline = time.monotonic() + deadline_s
+    last = "no response"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 1, last
+        try:
+            with urllib.request.urlopen(url, timeout=min(0.5, remaining)) as resp:
+                return 0, json.loads(resp.read())
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError) as exc:
+            last = str(exc)
+        leftover = deadline - time.monotonic()
+        if leftover <= 0:
+            return 1, last
+        time.sleep(min(0.25, leftover))
 
 
 if __name__ == "__main__":

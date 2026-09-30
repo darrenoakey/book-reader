@@ -6,6 +6,7 @@ frame-exact A/V sync — the property the whole design exists for.
 import json
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from PIL import Image
@@ -17,6 +18,7 @@ from src.movie_assemble import (
     STATICS,
     assemble_movie,
     probe_duration,
+    probe_frames,
     render_segment,
     scene_move,
     zoompan_filter,
@@ -88,6 +90,10 @@ def test_render_segment_real() -> None:
         ).stdout.strip()
         assert out == "45"
         assert abs(probe_duration(seg) - 45 / FPS) < 0.1
+        started = time.monotonic()
+        again = render_segment(still, 45, "zoom-in", tmp / "seg-replay.mp4")
+        assert time.monotonic() - started < 2
+        assert probe_frames(again) == 45
 
 
 # ##################################################################

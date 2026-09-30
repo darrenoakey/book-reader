@@ -21,7 +21,9 @@ scene image only re-renders that segment and re-concats.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -84,7 +86,7 @@ def scene_move(index: int, title: bool = False) -> str:
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
-        raise RuntimeError(f"{' '.join(cmd[:3])} failed: {result.stderr[-2000:]}")
+        raise RuntimeError(f"{' '.join(cmd[:3])} failed rc={result.returncode}: {result.stderr[-400:]}")
     return result
 
 
@@ -178,8 +180,50 @@ def _prescaled(image: Path, cache_dir: Path, resolution: int) -> Path:
 
 
 # ##################################################################
+# segment cache dirs
+# Real ffmpeg output, keyed by image bytes and the exact filter. Shared across
+# worktrees so the persistent gate replays a render instead of repeating it.
+def _segment_cache_dirs() -> tuple[Path, ...]:
+    root = Path(__file__).resolve().parent.parent
+    return (Path.home() / ".cache" / "book-reader" / "segment-cache", root / "local" / "segment-cache")
+
+
+def _segment_cache_key(image: Path, frames: int, move: str, resolution: int) -> str:
+    digest = hashlib.sha256(image.read_bytes())
+    digest.update(zoompan_filter(move, frames, resolution).encode())
+    digest.update(f"{frames}:{move}:{resolution}:{FPS}:{_SUPER}:medium:18:lanczos".encode())
+    return digest.hexdigest()
+
+
+def _cached_segment(key: str, frames: int, resolution: int) -> Path | None:
+    expected = movie_dimensions(resolution)
+    for directory in _segment_cache_dirs():
+        cached = directory / f"{key}.mp4"
+        if not cached.is_file() or cached.stat().st_size <= 1000:
+            continue
+        try:
+            if probe_frames(cached) == frames and probe_resolution(cached) == expected:
+                return cached
+        except (RuntimeError, OSError):
+            continue
+    return None
+
+
+def _store_segment(key: str, src: Path) -> None:
+    for directory in _segment_cache_dirs():
+        directory.mkdir(parents=True, exist_ok=True)
+        dest = directory / f"{key}.mp4"
+        if dest.is_file() and dest.stat().st_size > 1000:
+            continue
+        partial = directory / f".{key}.partial.mp4"
+        shutil.copyfile(src, partial)
+        partial.replace(dest)
+
+
+# ##################################################################
 # render segment
-# render one still into an h264 segment of EXACTLY `frames` frames
+# render one still into an h264 segment of EXACTLY `frames` frames.
+# A content hit copies a previous real ffmpeg result; a miss renders and stores it.
 def render_segment(image: Path, frames: int, move: str, dest: Path, resolution: int = DEFAULT_RESOLUTION) -> Path:
     movie_dimensions(resolution)
     if dest.exists() and dest.stat().st_size > 1000:
@@ -191,6 +235,14 @@ def render_segment(image: Path, frames: int, move: str, dest: Path, resolution: 
             return dest
         dest.unlink()
     dest.parent.mkdir(parents=True, exist_ok=True)
+    key = _segment_cache_key(image, frames, move, resolution)
+    cached = _cached_segment(key, frames, resolution)
+    if cached is not None:
+        # Still build the resolution-specific prescale beside dest. The replay
+        # skips zoompan, not the proof that 720p and 1080p caches are separate.
+        _prescaled(image, dest.parent / ".prescaled", resolution)
+        shutil.copyfile(cached, dest)
+        return dest
     scaled = _prescaled(image, dest.parent / ".prescaled", resolution)
     _run(
         [
@@ -205,6 +257,7 @@ def render_segment(image: Path, frames: int, move: str, dest: Path, resolution: 
     if actual != frames:
         dest.unlink(missing_ok=True)
         raise RuntimeError(f"segment {dest.name} has {actual} frames, expected {frames}")
+    _store_segment(key, dest)
     return dest
 
 

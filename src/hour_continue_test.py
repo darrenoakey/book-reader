@@ -107,6 +107,10 @@ def test_qa_movie_real_av_decode() -> None:
         qa = qa_movie(movie)
         assert qa["resolution"] == [854, 480]
         assert qa["frames"] == "start,middle,end"
+        assert qa["av_decode"] == "ok"
+        qa_dir = movie.parent / "qa"
+        assert (qa_dir / "av_decode.log").is_file()
+        assert all((qa_dir / f"{label}.png").is_file() for label in ("start", "middle", "end"))
 
 
 # ##################################################################

@@ -6,12 +6,11 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageStat
 
 from src.epub_extract import get_output_dir
 from src.hour_runner import (
@@ -29,6 +28,7 @@ MIN_FREE_BYTES = 20 * 1024 * 1024 * 1024
 TARGET_NAME = "hour_continuation_target.json"
 PROGRESS_NAME = "hour_continuation_progress.json"
 EVENTS_NAME = "hour_continuation_events.jsonl"
+DAEMON_SLEEP_SECONDS = 3600
 
 
 # ##################################################################
@@ -138,9 +138,9 @@ def extract_nonblank_frame(movie: Path, seconds: float, destination: Path) -> No
     if result.returncode:
         raise RuntimeError(f"ffmpeg frame decode failed for {movie.name}: {result.stderr[-400:]}")
     with Image.open(destination) as frame:
-        extrema = frame.convert("RGB").getextrema()
-    if not any(high > 0 for _, high in extrema):
-        raise RuntimeError(f"decoded frame is blank for {movie.name} at {seconds:.3f}s")
+        variation = max(ImageStat.Stat(frame.convert("RGB")).stddev)
+    if variation <= 5:
+        raise RuntimeError(f"decoded frame lacks visual variation for {movie.name} at {seconds:.3f}s")
 
 
 # ##################################################################
@@ -165,11 +165,44 @@ def qa_movie(movie: Path) -> dict:
     kinds = {stream.get("codec_type") for stream in json.loads(probe.stdout).get("streams", [])}
     if not {"audio", "video"} <= kinds:
         raise RuntimeError("movie does not contain both audio and video streams")
-    with tempfile.TemporaryDirectory() as directory:
-        scratch = Path(directory)
-        for label, seconds in (("start", min(0.5, duration / 4)), ("middle", duration / 2), ("end", max(0.0, duration - 0.5))):
-            extract_nonblank_frame(movie, seconds, scratch / f"{label}.png")
-    return {"movie": str(movie), "duration_seconds": round(duration, 3), "resolution": [854, 480], "frames": "start,middle,end"}
+    qa_dir = movie.parent / "qa"
+    qa_dir.mkdir(exist_ok=True)
+    decode = subprocess.run(
+        ["ffmpeg", "-v", "error", "-xerror", "-i", str(movie), "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    (qa_dir / "av_decode.log").write_text(
+        f"returncode={decode.returncode}\n{decode.stdout}\n{decode.stderr}", encoding="utf-8"
+    )
+    if decode.returncode:
+        raise RuntimeError(f"ffmpeg full A/V decode failed for {movie.name}: {decode.stderr[-400:]}")
+    for label, seconds in (("start", min(0.5, duration / 4)), ("middle", duration / 2), ("end", max(0.0, duration - 0.5))):
+        extract_nonblank_frame(movie, seconds, qa_dir / f"{label}.png")
+    return {"movie": str(movie), "duration_seconds": round(duration, 3), "resolution": [854, 480], "frames": "start,middle,end", "av_decode": "ok"}
+
+
+# ##################################################################
+# audit completed movies
+# require a durable full A/V decode and retained visual frame evidence for every completed hour before advancing any cursor.
+def audit_completed_movies(project: Path, completed: list[tuple[int, dict]], status: dict) -> dict:
+    progress_path = project / PROGRESS_NAME
+    prior = json.loads(progress_path.read_text(encoding="utf-8")) if progress_path.exists() else {}
+    validated = prior.get("validated_hours", {})
+    if not isinstance(validated, dict):
+        validated = {}
+    for hour, entry in completed:
+        movie = project / str(entry.get("movie", ""))
+        if not movie.is_file():
+            raise RuntimeError(f"completed hour {hour} movie is missing")
+        identity = {"size": movie.stat().st_size, "mtime_ns": movie.stat().st_mtime_ns}
+        existing = validated.get(str(hour))
+        if not isinstance(existing, dict) or existing.get("identity") != identity:
+            validated[str(hour)] = {"identity": identity, "qa": qa_movie(movie)}
+    state = {**status, "status": "running", "validated_hours": validated}
+    atomic_json(progress_path, state)
+    return state
 
 
 # ##################################################################
@@ -202,40 +235,66 @@ def continuation_status(source: Path, create_target: bool = False) -> dict:
 # ##################################################################
 # continue to eof
 # idempotently run precisely the next ledger hour until the one established EOF cursor is reached; no upload action is part of this supervisor.
-def continue_to_eof(source: Path, verify_only: bool = False) -> dict:
+def hold_daemon(status: dict) -> None:
+    while True:
+        time.sleep(DAEMON_SLEEP_SECONDS)
+
+
+# ##################################################################
+# continue to eof
+# idempotently run precisely the next ledger hour until the one established EOF cursor is reached; daemon mode holds after terminal outcomes so Auto cannot repeat permanent failures.
+def continue_to_eof(source: Path, verify_only: bool = False, daemon: bool = False) -> dict:
     status = continuation_status(source, create_target=not verify_only)
     if verify_only:
         return status
     source = source.resolve()
     project = Path(status["project"])
+    previous = project / PROGRESS_NAME
+    if previous.exists() and json.loads(previous.read_text(encoding="utf-8")).get("status") == "failed":
+        failure = json.loads(previous.read_text(encoding="utf-8"))
+        if daemon:
+            hold_daemon(failure)
+        raise RuntimeError("continuation is latched failed; inspect progress and clear only after correcting the root cause")
     target = status["target"]
+    audit_completed_movies(project, completed_hours(load_ledger(project, source)), status)
     append_event(project, "continuation_started", target=target)
-    while True:
-        status = continuation_status(source)
-        cursor = (status["cursor"]["chapter"], status["cursor"]["piece"])
-        if cursor == (target["target_chapter"], target["target_piece"]):
-            atomic_json(project / PROGRESS_NAME, {**status, "status": "complete"})
-            append_event(project, "continuation_complete", completed_hours=status["completed_hours"])
-            return status
-        require_free_disk(project)
-        wait_for_active_project_run(project)
-        status = continuation_status(source)
-        cursor = (status["cursor"]["chapter"], status["cursor"]["piece"])
-        if cursor == (target["target_chapter"], target["target_piece"]):
-            continue
-        hour = status["next_hour"]
-        append_event(project, "hour_started", hour=hour, cursor={"chapter": cursor[0], "piece": cursor[1]})
-        try:
-            movie = run_hour(source, hour_index=hour)
-        except SystemExit as error:
-            if "pipeline already running" not in str(error):
-                raise
-            append_event(project, "hour_deferred_for_active_pipeline", hour=hour)
-            continue
-        qa = qa_movie(movie)
-        after = continuation_status(source)
-        after_cursor = (after["cursor"]["chapter"], after["cursor"]["piece"])
-        if after_cursor <= cursor:
-            raise RuntimeError("completed hour did not advance the source cursor")
-        atomic_json(project / PROGRESS_NAME, {**after, "status": "running", "last_qa": qa})
-        append_event(project, "hour_complete", hour=hour, qa=qa, cursor={"chapter": after_cursor[0], "piece": after_cursor[1]})
+    try:
+        while True:
+            status = continuation_status(source)
+            cursor = (status["cursor"]["chapter"], status["cursor"]["piece"])
+            if cursor == (target["target_chapter"], target["target_piece"]):
+                atomic_json(project / PROGRESS_NAME, {**status, "status": "complete"})
+                append_event(project, "continuation_complete", completed_hours=status["completed_hours"])
+                if daemon:
+                    hold_daemon(status)
+                return status
+            require_free_disk(project)
+            wait_for_active_project_run(project)
+            status = continuation_status(source)
+            cursor = (status["cursor"]["chapter"], status["cursor"]["piece"])
+            if cursor == (target["target_chapter"], target["target_piece"]):
+                continue
+            hour = status["next_hour"]
+            append_event(project, "hour_started", hour=hour, cursor={"chapter": cursor[0], "piece": cursor[1]})
+            try:
+                movie = run_hour(source, hour_index=hour)
+            except SystemExit as error:
+                if "pipeline already running" not in str(error):
+                    raise
+                append_event(project, "hour_deferred_for_active_pipeline", hour=hour)
+                continue
+            qa = qa_movie(movie)
+            after = continuation_status(source)
+            after_cursor = (after["cursor"]["chapter"], after["cursor"]["piece"])
+            if after_cursor <= cursor:
+                raise RuntimeError("completed hour did not advance the source cursor")
+            audited = audit_completed_movies(project, completed_hours(load_ledger(project, source)), after)
+            atomic_json(project / PROGRESS_NAME, {**audited, "status": "running", "last_qa": qa})
+            append_event(project, "hour_complete", hour=hour, qa=qa, cursor={"chapter": after_cursor[0], "piece": after_cursor[1]})
+    except Exception as error:
+        failure = {**continuation_status(source), "status": "failed", "error": str(error)}
+        atomic_json(project / PROGRESS_NAME, failure)
+        append_event(project, "continuation_failed", error=str(error))
+        if daemon:
+            hold_daemon(failure)
+        raise

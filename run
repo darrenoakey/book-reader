@@ -120,7 +120,7 @@ def command_continue(args: argparse.Namespace) -> int:
     code = f'''\
 from pathlib import Path
 from src.hour_continue import continue_to_eof
-print(continue_to_eof(Path({str(source)!r}), verify_only={args.verify_only!r}))
+print(continue_to_eof(Path({str(source)!r}), verify_only={args.verify_only!r}, daemon={args.daemon!r}))
 '''
     return run_venv([str(VENV_PYTHON), "-c", code])
 
@@ -271,6 +271,7 @@ def main(argv: list[str]) -> int:
     p_continue = sub.add_parser("continue", help="Resume sequential 480p hourly production to the established source EOF; never uploads")
     p_continue.add_argument("source", help="Full EPUB, Markdown, or text input")
     p_continue.add_argument("--verify-only", action="store_true", help="Read and validate source/ledger/EOF target without production work")
+    p_continue.add_argument("--daemon", action="store_true", help="Hold after completion or a blocked failure so Auto never replays a permanent error")
     p_continue.set_defaults(func=command_continue)
 
     p_test = sub.add_parser("test", help="Run a single test target")

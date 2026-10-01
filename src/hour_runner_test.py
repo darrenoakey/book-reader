@@ -7,7 +7,16 @@ from pathlib import Path
 
 import pytest
 
-from src.hour_runner import HOUR_MAX_SECONDS, canonical_character_id, chapter_order, load_ledger, synthesize_window
+from src.hour_runner import (
+    HOUR_MAX_SECONDS,
+    appearance_schema,
+    canonical_character_id,
+    chapter_order,
+    extend_appearances,
+    load_ledger,
+    synthesize_window,
+    validate_appearances,
+)
 
 
 # ##################################################################
@@ -57,6 +66,58 @@ def test_display_name_aliases_do_not_merge_near_names() -> None:
         assert canonical_character_id(root, cast, "captain_vale", "CAPTAIN VALE") == "captain"
         assert canonical_character_id(root, cast, "ren_alias", "Ren") == "ren"
         assert canonical_character_id(root, cast, "ron_alias", "Ron") == "ron"
+
+
+# ##################################################################
+# test appearance schema validation
+# enforce exact requested identities and reject partial or fabricated cache additions before any state write.
+def test_appearance_schema_requires_exact_nonempty_identity_set() -> None:
+    schema = appearance_schema(["ren", "father"])
+    assert schema["required"] == ["ren", "father"]
+    assert schema["additionalProperties"] is False
+    assert validate_appearances({"ren": "dark hair", "father": "gray beard"}, ["ren", "father"]) == {
+        "ren": "dark hair",
+        "father": "gray beard",
+    }
+    with pytest.raises(ValueError):
+        validate_appearances({"ren": "dark hair"}, ["ren", "father"])
+    with pytest.raises(ValueError):
+        validate_appearances({"ren": "dark hair", "father": "", "extra": "invented"}, ["ren", "father"])
+
+
+# ##################################################################
+# test existing appearance identity remains byte stable
+# a fully-cached project must not call the model or rewrite established appearance identities.
+def test_extend_appearances_keeps_cached_identity_bytes() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        project = Path(directory)
+        path = project / "appearances.json"
+        original = b'{"ren":"established dark hair"}\n'
+        path.write_bytes(original)
+        extend_appearances(project, {"narrator": {"name": "Narrator"}, "ren": {"look": "ignored"}})
+        assert path.read_bytes() == original
+
+
+# ##################################################################
+# test native appearance generation real
+# use a namespaced cast fixture against native Ollama and prove only the missing identity is atomically appended.
+def test_extend_appearances_real_native() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        project = Path(directory)
+        original = {"ren": "established black hair and plain traveling clothes"}
+        (project / "appearances.json").write_text(json.dumps(original), encoding="utf-8")
+        cast = {
+            "narrator": {"name": "Narrator"},
+            "ren": {"name": "Ren", "look": "must remain established"},
+            "father": {
+                "name": "Father",
+                "look": "An older ordinary human man with weathered face, gray hair, and work clothes.",
+            },
+        }
+        extend_appearances(project, cast)
+        appearances = json.loads((project / "appearances.json").read_text(encoding="utf-8"))
+        assert appearances["ren"] == original["ren"]
+        assert isinstance(appearances["father"], str) and appearances["father"].strip()
 
 
 # ##################################################################

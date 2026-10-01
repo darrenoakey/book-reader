@@ -32,7 +32,7 @@ from src.movie_images import generate_character_refs, generate_scene_images
 from src.movie_storyboard import build_storyboard
 from src.pipeline import acquire_lock, release_lock
 from src.text_ingest import extract_any
-from src.voice_description import _voice_description_for_one, parse_json_response
+from src.voice_description import _voice_description_for_one
 
 HOUR_MAX_SECONDS = 3600.0
 # Leave one second for AAC container priming while retaining a near-full natural hour.
@@ -176,31 +176,78 @@ async def extend_voices(project: Path, cast: dict) -> None:
     prepare_breeze_voices(project)
 
 
+APPEARANCE_BATCH_SIZE = 3
+APPEARANCE_ATTEMPTS = 2
+
+
+# ##################################################################
+# appearance schema
+# constrain each native model response to exactly the requested stable identities and nonempty visual descriptions.
+def appearance_schema(character_ids: list[str]) -> dict:
+    return {
+        "type": "object",
+        "properties": {character_id: {"type": "string", "minLength": 1} for character_id in character_ids},
+        "required": character_ids,
+        "additionalProperties": False,
+    }
+
+
+# ##################################################################
+# validate appearances
+# reject any partial, renamed, blank, or non-string appearance response before production state can be changed.
+def validate_appearances(value: object, character_ids: list[str]) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != set(character_ids):
+        raise ValueError("appearance response keys do not exactly match requested character IDs")
+    result: dict[str, str] = {}
+    for character_id in character_ids:
+        description = value[character_id]
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError(f"appearance response for {character_id} is not a nonempty string")
+        result[character_id] = description.strip()
+    return result
+
+
+# ##################################################################
+# generate appearance batch
+# make a small schema-constrained native request with bounded format repairs, preserving failure context and never inventing a fallback.
+def generate_appearance_batch(items: list[tuple[str, dict]]) -> dict[str, str]:
+    character_ids = [character_id for character_id, _ in items]
+    roster = "\n".join(
+        f"- {character_id}: {(info.get('look') or info.get('bio') or '')[:700]}" for character_id, info in items
+    )
+    prompt = (
+        "For each requested character, give a 50-80 word canonical visual description for an image generator. "
+        "Use source facts exactly; include age, build, hair, face, skin, clothing, and species when known. "
+        "Never describe plot or relationships. Return only the response-schema object. Characters:\n" + roster
+    )
+    last_error = "no response"
+    for attempt in range(APPEARANCE_ATTEMPTS):
+        response = ask_sync(prompt, max_tokens=1200, response_schema=appearance_schema(character_ids))
+        try:
+            return validate_appearances(json.loads(response), character_ids)
+        except (ValueError, json.JSONDecodeError) as error:
+            last_error = f"{error}; response={response[:500]!r}"
+    raise RuntimeError(f"appearance generation failed for {', '.join(character_ids)} after {APPEARANCE_ATTEMPTS} attempts: {last_error}")
+
+
 # ##################################################################
 # extend appearances
-# add a visual identity only once; established descriptions remain the portrait source for all later hours.
+# append only all-valid new visual identities in one atomic write; established descriptions are never regenerated or replaced.
 def extend_appearances(project: Path, cast: dict) -> None:
     path = project / "appearances.json"
     appearances = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    missing = {char_id: info for char_id, info in cast.items() if char_id != "narrator" and char_id not in appearances}
+    if not isinstance(appearances, dict):
+        raise TypeError("appearances cache is not an object")
+    for character_id in cast:
+        if character_id in appearances and (not isinstance(appearances[character_id], str) or not appearances[character_id].strip()):
+            raise RuntimeError(f"cached appearance for {character_id} is invalid")
+    missing = [(character_id, info) for character_id, info in cast.items() if character_id != "narrator" and character_id not in appearances]
     if not missing:
         return
-    roster = "\n".join(
-        f"- {char_id}: {(info.get('look') or info.get('bio') or '')[:700]}" for char_id, info in missing.items()
-    )
-    response = ask_sync(
-        "Output JSON only. For each character, give a 50-80 word canonical visual description for an image generator. "
-        "Use source facts exactly; include age, build, hair, face, skin, clothing, and species when known. "
-        "Never describe plot or relationships. Characters:\n" + roster,
-        max_tokens=2200,
-    )
-    generated = parse_json_response(response)
-    for char_id, info in missing.items():
-        description = generated.get(char_id)
-        if isinstance(description, str) and description.strip():
-            appearances[char_id] = description.strip()
-        else:
-            appearances[char_id] = (info.get("look") or "ordinary human, appearance unspecified").strip()
+    generated: dict[str, str] = {}
+    for start in range(0, len(missing), APPEARANCE_BATCH_SIZE):
+        generated.update(generate_appearance_batch(missing[start : start + APPEARANCE_BATCH_SIZE]))
+    appearances.update(generated)
     atomic_json(path, appearances)
 
 

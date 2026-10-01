@@ -24,6 +24,8 @@ MOVIE_PATHS = {
     "src/dep_install_test.py",
     "src/hour_runner.py",
     "src/hour_runner_test.py",
+    "src/hour_continue.py",
+    "src/hour_continue_test.py",
     "src/hourly_spans.py",
     "src/hourly_spans_test.py",
     "src/llm.py",
@@ -69,7 +71,8 @@ MOVIE_TESTS = (
 # still run the full movie set so a missing edge cannot drop coverage.
 IMPACT: dict[str, tuple[str, ...]] = {
     "run": (
-        "src/hour_runner_test.py",
+        "src/hour_runner_test.py::test_hour_verify_only_cli_uses_venv",
+        "src/hour_continue_test.py",
         "src/movie_resolution_test.py",
         "src/dep_install_test.py",
         "src/gate_check_test.py",
@@ -93,6 +96,8 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "src/dep_install_test.py": ("src/dep_install_test.py",),
     "src/hour_runner.py": ("src/hour_runner_test.py",),
     "src/hour_runner_test.py": ("src/hour_runner_test.py",),
+    "src/hour_continue.py": ("src/hour_continue_test.py",),
+    "src/hour_continue_test.py": ("src/hour_continue_test.py",),
     "src/hourly_spans.py": ("src/hourly_spans_test.py",),
     "src/hourly_spans_test.py": ("src/hourly_spans_test.py",),
     "src/llm.py": ("src/llm_test.py", "src/script_generate_test.py", "src/hourly_spans_test.py"),

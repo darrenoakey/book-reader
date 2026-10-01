@@ -20,7 +20,8 @@ def test_select_tests() -> None:
     )
     entry = select_tests(["run", "src/pipeline.py", "src/step_runner.py"])
     assert entry == (
-        "src/hour_runner_test.py",
+        "src/hour_runner_test.py::test_hour_verify_only_cli_uses_venv",
+        "src/hour_continue_test.py",
         "src/movie_resolution_test.py",
         "src/dep_install_test.py",
         "src/gate_check_test.py",
@@ -36,11 +37,13 @@ def test_select_tests() -> None:
     assert "src/movie_assemble_test.py" not in schema
     assert select_tests(["src/server.py"]) == MOVIE_TESTS
     assert select_tests(["run", "src/dep_install.py", "src/dep_install_test.py"]) == (
-        "src/hour_runner_test.py",
+        "src/hour_runner_test.py::test_hour_verify_only_cli_uses_venv",
+        "src/hour_continue_test.py",
         "src/movie_resolution_test.py",
         "src/dep_install_test.py",
         "src/gate_check_test.py",
     )
+    assert select_tests(["src/hour_continue.py", "src/hour_continue_test.py"]) == ("src/hour_continue_test.py",)
     assert select_tests(["src/audio_synth.py", "src/audio_synth_test.py"]) == ("src/audio_synth_test.py",)
     assert select_tests(["src/arbiter_tts.py", "src/arbiter_tts_test.py"]) == (
         "src/arbiter_tts_test.py",

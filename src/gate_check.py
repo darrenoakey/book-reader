@@ -61,15 +61,71 @@ MOVIE_TESTS = (
 )
 
 
+# A path maps to the tests that execute its behavior. Importers are included
+# only when their tests call the changed code. Unmapped movie-surface files
+# still run the full movie set so a missing edge cannot drop coverage.
+IMPACT: dict[str, tuple[str, ...]] = {
+    "run": (
+        "src/hour_runner_test.py",
+        "src/movie_resolution_test.py",
+        "src/dep_install_test.py",
+        "src/gate_check_test.py",
+    ),
+    "greenline.toml": ("src/gate_check_test.py",),
+    "src/movie_assemble.py": (
+        "src/movie_assemble_test.py",
+        "src/movie_resolution_test.py",
+        "src/title_page_test.py",
+    ),
+    "src/movie_assemble_test.py": ("src/movie_assemble_test.py",),
+    "src/movie_resolution.py": ("src/movie_resolution_test.py", "src/movie_assemble_test.py"),
+    "src/movie_resolution_test.py": ("src/movie_resolution_test.py",),
+    "src/pipeline.py": ("src/movie_resolution_test.py",),
+    "src/step_runner.py": ("src/movie_resolution_test.py",),
+    "src/title_page.py": ("src/title_page_test.py", "src/movie_assemble_test.py", "src/movie_resolution_test.py"),
+    "src/title_page_test.py": ("src/title_page_test.py",),
+    "src/gate_check.py": ("src/gate_check_test.py",),
+    "src/gate_check_test.py": ("src/gate_check_test.py",),
+    "src/dep_install.py": ("src/dep_install_test.py",),
+    "src/dep_install_test.py": ("src/dep_install_test.py",),
+    "src/hour_runner.py": ("src/hour_runner_test.py",),
+    "src/hour_runner_test.py": ("src/hour_runner_test.py",),
+    "src/hourly_spans.py": ("src/hourly_spans_test.py",),
+    "src/hourly_spans_test.py": ("src/hourly_spans_test.py",),
+    "src/llm.py": ("src/llm_test.py", "src/script_generate_test.py", "src/hourly_spans_test.py"),
+    "src/llm_test.py": ("src/llm_test.py",),
+    "src/script_generate.py": ("src/script_generate_test.py",),
+    "src/script_generate_test.py": ("src/script_generate_test.py",),
+    "src/movie_images.py": ("src/movie_images_test.py",),
+    "src/movie_images_test.py": ("src/movie_images_test.py",),
+    "src/arbiter_tts.py": ("src/movie_images_test.py",),
+    "src/breeze_voices.py": ("src/hour_runner_test.py",),
+    "src/movie_storyboard.py": ("src/movie_storyboard_test.py",),
+    "src/movie_storyboard_test.py": ("src/movie_storyboard_test.py",),
+    "src/text_ingest.py": ("src/text_ingest_test.py",),
+    "src/text_ingest_test.py": ("src/text_ingest_test.py",),
+    "src/state_test.py": ("src/state_test.py",),
+}
+
+
 # ##################################################################
 # select tests
-# Select the complete movie/entrypoint/title/state surface for assembly changes;
-# unknown code paths fail toward the full existing check, not reduced coverage.
+# Union the tests that execute each changed path. Unknown code fails closed
+# to the full repository check. A movie-surface file without a finer map keeps
+# the full movie set rather than silently shrinking coverage.
 def select_tests(paths: list[str]) -> tuple[str, ...] | None:
     code = [path for path in paths if not path.endswith(".md")]
     if not code or any(path not in MOVIE_PATHS for path in code):
         return None
-    return MOVIE_TESTS
+    selected: list[str] = []
+    for path in code:
+        tests = IMPACT.get(path)
+        if tests is None:
+            return MOVIE_TESTS
+        for test in tests:
+            if test not in selected:
+                selected.append(test)
+    return tuple(selected)
 
 
 # ##################################################################
@@ -91,14 +147,32 @@ def changed_paths(root: Path) -> list[str]:
 # ##################################################################
 # main
 # Lint the complete source tree and execute all impact-selected real integrations.
+def _run_tests(tests: tuple[str, ...]) -> int:
+    grouped: dict[str, list[str]] = {}
+    for node in tests:
+        grouped.setdefault(node.split("::", 1)[0], []).append(node)
+    # One process per file. The files already use private temp dirs, so the
+    # wall clock is the slowest file rather than the sum that blew the 180s budget.
+    procs = [
+        subprocess.Popen([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *nodes], cwd=ROOT)
+        for nodes in grouped.values()
+    ]
+    rc = 0
+    for proc in procs:
+        code = proc.wait()
+        if code:
+            rc = code
+    return rc
+
+
 def main() -> int:
     tests = select_tests(changed_paths(ROOT))
     if tests is None:
         return subprocess.call(["dazpycheck"], cwd=ROOT)
-    lint = subprocess.call([str(ROOT / "run"), "lint"], cwd=ROOT)
-    if lint:
-        return lint
-    return subprocess.call([sys.executable, "-m", "pytest", "-q", *tests], cwd=ROOT)
+    lint = subprocess.Popen([str(ROOT / "run"), "lint"], cwd=ROOT)
+    test_rc = _run_tests(tests)
+    lint_rc = lint.wait()
+    return lint_rc or test_rc
 
 
 # ##################################################################

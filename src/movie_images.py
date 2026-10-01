@@ -16,8 +16,10 @@ are fetched through the CIFS mount mapping
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -113,6 +115,57 @@ def _fetch_image(client, job_id: str, params: dict, dest: Path, why: str) -> Non
 # ##################################################################
 # qwen image to file
 # one qwen-image job (t2i, or edit when ref_image given) → dest PNG
+def _image_cache_dirs() -> tuple[Path, ...]:
+    root = Path(__file__).resolve().parent.parent
+    return (Path.home() / ".cache" / "book-reader" / "qwen-image-cache", root / "local" / "qwen-image-cache")
+
+
+def _image_cache_key(
+    prompt: str,
+    width: int,
+    height: int,
+    steps: int,
+    seed: int,
+    negative_prompt: str | None,
+    ref_image: Path | None,
+) -> str:
+    digest = hashlib.sha256(prompt.encode())
+    digest.update(f"\0{width}x{height}\0{steps}\0{seed}\0".encode())
+    digest.update((negative_prompt or "").encode())
+    if ref_image is not None:
+        digest.update(ref_image.read_bytes())
+    return digest.hexdigest()
+
+
+def _replay_image(key: str, dest: Path) -> bool:
+    for directory in _image_cache_dirs():
+        cached = directory / f"{key}.png"
+        if not cached.is_file() or cached.stat().st_size < 10000:
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(cached, dest)
+        return True
+    return False
+
+
+def _store_image(key: str, src: Path) -> None:
+    if not src.is_file() or src.stat().st_size < 10000:
+        return
+    for directory in _image_cache_dirs():
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f"{key}.png"
+        if target.is_file() and target.stat().st_size >= 10000:
+            continue
+        partial = directory / f".{key}.partial.png"
+        shutil.copyfile(src, partial)
+        partial.replace(target)
+
+
+# ##################################################################
+# qwen image to file
+# one qwen-image job (t2i, or edit when ref_image given) → dest PNG.
+# An identical request replays the previous real PNG; a miss still submits
+# with force so the server does not substitute its own cache.
 def qwen_image_to_file(
     prompt: str,
     dest: Path,
@@ -125,6 +178,9 @@ def qwen_image_to_file(
     negative_prompt: str | None = None,
 ) -> Path:
     if dest.exists() and dest.stat().st_size >= 1000:
+        return dest
+    key = _image_cache_key(prompt, width, height, steps, seed, negative_prompt, ref_image)
+    if _replay_image(key, dest):
         return dest
     from arbiter_client import stage_file
 
@@ -148,6 +204,7 @@ def qwen_image_to_file(
     reason = why or f"image {dest.name}"
     jid = _submit(client, "qwen-image", clean, why=reason)
     _fetch_image(client, jid, clean, dest, reason)
+    _store_image(key, dest)
     return dest
 
 

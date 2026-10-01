@@ -10,12 +10,37 @@ from src.gate_check import MOVIE_TESTS, changed_paths, select_tests, wait_for_js
 
 # ##################################################################
 # test impact selection
-# Movie changes include title-card and entrypoint coverage; unrelated paths
-# and unavailable history must retain the full pre-existing repository check.
+# Movie changes select the tests that execute the changed modules. Unrelated
+# paths and unavailable history must retain the full pre-existing repository check.
 def test_select_tests() -> None:
-    assert select_tests(["src/movie_assemble.py", "README.md"]) == MOVIE_TESTS
-    assert select_tests(["run", "src/pipeline.py", "src/step_runner.py"]) == MOVIE_TESTS
-    assert select_tests(["run", "src/dep_install.py", "src/dep_install_test.py"]) == MOVIE_TESTS
+    assert select_tests(["src/movie_assemble.py", "README.md"]) == (
+        "src/movie_assemble_test.py",
+        "src/movie_resolution_test.py",
+        "src/title_page_test.py",
+    )
+    entry = select_tests(["run", "src/pipeline.py", "src/step_runner.py"])
+    assert entry == (
+        "src/hour_runner_test.py",
+        "src/movie_resolution_test.py",
+        "src/dep_install_test.py",
+        "src/gate_check_test.py",
+    )
+    assert "src/movie_images_test.py" not in entry
+    schema = select_tests(["src/hourly_spans.py", "src/hourly_spans_test.py", "src/llm.py"])
+    assert schema == (
+        "src/hourly_spans_test.py",
+        "src/llm_test.py",
+        "src/script_generate_test.py",
+    )
+    assert "src/movie_images_test.py" not in schema
+    assert "src/movie_assemble_test.py" not in schema
+    assert select_tests(["src/server.py"]) == MOVIE_TESTS
+    assert select_tests(["run", "src/dep_install.py", "src/dep_install_test.py"]) == (
+        "src/hour_runner_test.py",
+        "src/movie_resolution_test.py",
+        "src/dep_install_test.py",
+        "src/gate_check_test.py",
+    )
     assert select_tests(["src/movie_assemble.py", "src/audio_synth.py"]) is None
     assert select_tests(["requirements.txt"]) is None
     assert select_tests([]) is None

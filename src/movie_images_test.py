@@ -6,6 +6,7 @@ still works end to end.
 """
 
 import tempfile
+import time
 from pathlib import Path
 
 from PIL import Image
@@ -109,3 +110,16 @@ def test_qwen_image_real() -> None:
         with Image.open(dest) as img:
             assert img.format == "PNG"
             assert img.size[0] >= 480  # snapped to /16 but in the right ballpark
+        replay = Path(tmpdir) / "still-replay.png"
+        started = time.monotonic()
+        qwen_image_to_file(
+            "A small bronze dragon hatchling on golden sand, painterly digital illustration.",
+            replay,
+            512,
+            512,
+            seed=99,
+            steps=20,
+            why="book-reader test",
+        )
+        assert time.monotonic() - started < 2
+        assert replay.read_bytes() == dest.read_bytes()

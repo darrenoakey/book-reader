@@ -14,6 +14,7 @@ SAMPLE_RATE = 24000
 def concat_wavs(line_paths: list[Path], output_path: Path) -> None:
     if not line_paths:
         raise ValueError("No line files to concatenate")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         for p in line_paths:
             f.write(f"file '{p}'\n")

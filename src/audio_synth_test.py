@@ -76,7 +76,8 @@ def test_concat_wavs_real() -> None:
         a, b = tmp / "a.wav", tmp / "b.wav"
         make_tone_wav(a, 0.5)
         make_tone_wav(b, 0.5)
-        out = tmp / "out.wav"
+        out = tmp / "new-hour" / "audio" / "out.wav"
+        assert not out.parent.exists()
         concat_wavs([a, b], out)
         assert out.exists()
         assert wav_duration(out) > 0.9  # ~1.0s combined

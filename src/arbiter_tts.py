@@ -22,23 +22,36 @@ def _client(timeout: float = 60) -> ArbiterClient:
 
 
 # ##################################################################
+# sanitize provenance
+# compact human provenance to a safe, bounded printable field without changing the job's prompt or source text.
+def sanitize_why(why: str | None) -> str | None:
+    if why is None:
+        return None
+    printable = "".join(character if ord(character) >= 32 and ord(character) != 127 else " " for character in why)
+    return " ".join(printable.split()).encode("utf-8")[:256].decode("utf-8", "ignore")
+
+
+# ##################################################################
 # submit
-# submit a job of given type and return its id, retrying on transient errors
+# submit a job of given type, retrying only transient failures; malformed client payloads must fail closed immediately.
 def _submit(client: ArbiterClient, job_type: str, params: dict, why: str | None = None) -> str:
-    # who/why provenance: the arbiter records this on every job so GPU work is
-    # attributable (who="book-reader", why names the output being narrated);
-    # an ambient ARBITER_WHY from a root task would override via None here.
+    # who/why provenance is independently normalized: story/scene text remains untouched in params.
+    reason = sanitize_why(why)
     last_err: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
-            return client.submit(job_type, who="book-reader", why=why, **params)
-        except (ArbiterError, ConnectionError, OSError) as e:
-            last_err = e
-            wait = min(RETRY_BACKOFF_SEC * (attempt + 1), 60)
-            log.warning(
-                "submit %s attempt %d/%d failed: %s — retrying in %ds", job_type, attempt + 1, MAX_RETRIES, e, wait
-            )
-            time.sleep(wait)
+            return client.submit(job_type, who="book-reader", why=reason, **params)
+        except ArbiterError as error:
+            if 400 <= error.status_code < 500:
+                raise RuntimeError(f"submit {job_type} rejected with HTTP {error.status_code}: {error}") from error
+            last_err = error
+        except (ConnectionError, OSError) as error:
+            last_err = error
+        wait = min(RETRY_BACKOFF_SEC * (attempt + 1), 60)
+        log.warning(
+            "submit %s attempt %d/%d failed: %s — retrying in %ds", job_type, attempt + 1, MAX_RETRIES, last_err, wait
+        )
+        time.sleep(wait)
     raise RuntimeError(f"submit {job_type} failed after {MAX_RETRIES} attempts: {last_err}")
 
 

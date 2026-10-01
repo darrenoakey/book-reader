@@ -42,6 +42,10 @@ def test_select_tests() -> None:
         "src/gate_check_test.py",
     )
     assert select_tests(["src/audio_synth.py", "src/audio_synth_test.py"]) == ("src/audio_synth_test.py",)
+    assert select_tests(["src/arbiter_tts.py", "src/arbiter_tts_test.py"]) == (
+        "src/arbiter_tts_test.py",
+        "src/movie_images_test.py",
+    )
     assert select_tests(["requirements.txt"]) is None
     assert select_tests([]) is None
     assert select_tests(["README.md"]) is None

@@ -54,6 +54,25 @@ def parse_assignments(response: str, start: int, count: int, speakers: set[str])
     return seen
 
 
+def speaker_array_schema(speaker_ids: list[str], count: int) -> dict:
+    return {
+        "type": "array",
+        "items": {"type": "string", "enum": speaker_ids},
+        "minItems": count,
+        "maxItems": count,
+    }
+
+
+# ##################################################################
+# parse speakers
+# bind each source-span position to exactly one schema-constrained speaker and reject malformed output without fallback.
+def parse_speakers(response: str, count: int, speakers: set[str]) -> list[str]:
+    values = json.loads(response)
+    if not isinstance(values, list) or len(values) != count or any(not isinstance(value, str) or value not in speakers for value in values):
+        raise ValueError("classifier schema response must be an exact list of valid speaker IDs")
+    return values
+
+
 async def classify_spans(text: str, speaker_ids: list[str]) -> list[dict]:
     spans = immutable_spans(text)
     speakers = set(speaker_ids)
@@ -64,20 +83,14 @@ async def classify_spans(text: str, speaker_ids: list[str]) -> list[dict]:
         batch = spans[start : start + BATCH_SIZE]
         indexed = "\n".join(f"{start+i}: {span}" for i, span in enumerate(batch))
         prompt = f"""Classify each immutable source span to exactly one audiobook speaker.
-Valid speakers: {', '.join(speaker_ids)}. Return JSONL only: {{\"index\": number, \"speaker_id\": \"valid id\"}}.
-Every listed index exactly once. narrator for narration and third-person prose. Direct speech may be quoted OR clearly attributed without quotes (for example, 'Klein said Look at it'); assign that speech to its named speaker when unambiguous. Never rewrite, copy, omit, or add text: the program constructs text locally from the immutable spans.
+Valid speakers: {', '.join(speaker_ids)}. Return only the JSON array specified by the response schema: one speaker ID per listed span, in exactly the listed order. narrator for narration and third-person prose. Direct speech may be quoted OR clearly attributed without quotes (for example, 'Klein said Look at it'); assign that speech to its named speaker when unambiguous. Never rewrite, copy, omit, or add text: the program constructs text locally from the immutable spans.
 
 SPANS:\n{indexed}"""
-        last = ""
-        for attempt in range(6):
-            try:
-                response = await ask(prompt + (f"\nREPAIR: {last}" if last else ""))
-                assigned.update(parse_assignments(response, start, len(batch), speakers))
-                break
-            except (ValueError, json.JSONDecodeError) as error:
-                last = str(error)
-        else:
-            raise ValueError(f"span classifier failed batch {start}: {last}")
+        response = await ask(prompt, response_schema=speaker_array_schema(speaker_ids, len(batch)))
+        try:
+            assigned.update({start + index: speaker for index, speaker in enumerate(parse_speakers(response, len(batch), speakers))})
+        except (ValueError, json.JSONDecodeError) as error:
+            raise ValueError(f"schema classifier failed batch {start}: {error}; response={response[:500]!r}") from error
     return [{assigned[index]: span} for index, span in enumerate(spans)]
 
 

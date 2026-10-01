@@ -63,7 +63,12 @@ def strip_think(text: str) -> str:
 # endpoint; retries transient failures forever with backoff (the pipeline must
 # never silently lose work). The arbiter handles model-host selection/failover.
 def ask_sync(
-    prompt: str, system: str | None = None, temperature: float = 0.2, max_tokens: int = 4096, timeout: float = 300.0
+    prompt: str,
+    system: str | None = None,
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+    timeout: float = 300.0,
+    response_schema: dict | None = None,
 ) -> str:
     messages: list[dict] = []
     if system:
@@ -71,25 +76,27 @@ def ask_sync(
     messages.append({"role": "user", "content": prompt})
     if LLM_STYLE == "ollama":
         url = f"{LLM_HOST}/api/chat"
-        payload = json.dumps(
-            {
-                "model": LLM_MODEL,
-                "messages": messages,
-                "think": False,
-                "stream": False,
-                "options": {"temperature": temperature, "num_predict": max_tokens},
-            }
-        ).encode("utf-8")
+        request = {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "think": False,
+            "stream": False,
+            "options": {"temperature": temperature, "num_predict": max_tokens},
+        }
+        if response_schema is not None:
+            request["format"] = response_schema
+        payload = json.dumps(request).encode("utf-8")
     else:
         url = f"{LLM_HOST}/v1/chat/completions"
-        payload = json.dumps(
-            {
-                "model": LLM_MODEL,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            }
-        ).encode("utf-8")
+        request = {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if response_schema is not None:
+            request["response_format"] = {"type": "json_schema", "json_schema": {"name": "response", "strict": True, "schema": response_schema}}
+        payload = json.dumps(request).encode("utf-8")
 
     attempt = 0
     while True:
@@ -147,10 +154,16 @@ def _semaphore() -> asyncio.Semaphore:
 # ##################################################################
 # ask
 # async chat completion — runs the blocking call in a worker thread
-async def ask(prompt: str, system: str | None = None, temperature: float = 0.2, max_tokens: int = 4096) -> str:
+async def ask(
+    prompt: str,
+    system: str | None = None,
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+    response_schema: dict | None = None,
+) -> str:
     async with _semaphore():
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             None,
-            lambda: ask_sync(prompt, system, temperature, max_tokens),
+            lambda: ask_sync(prompt, system, temperature, max_tokens, response_schema=response_schema),
         )

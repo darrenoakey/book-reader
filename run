@@ -119,8 +119,12 @@ def command_continue(args: argparse.Namespace) -> int:
         return installed
     code = f'''\
 from pathlib import Path
-from src.hour_continue import continue_to_eof
-print(continue_to_eof(Path({str(source)!r}), verify_only={args.verify_only!r}, daemon={args.daemon!r}))
+from src.hour_continue import clear_continuation_blocker, continue_to_eof
+_source = Path({str(source)!r})
+if {args.clear_blocker!r}:
+    print(clear_continuation_blocker(_source))
+else:
+    print(continue_to_eof(_source, verify_only={args.verify_only!r}, daemon={args.daemon!r}))
 '''
     return run_venv([str(VENV_PYTHON), "-c", code])
 
@@ -272,6 +276,7 @@ def main(argv: list[str]) -> int:
     p_continue.add_argument("source", help="Full EPUB, Markdown, or text input")
     p_continue.add_argument("--verify-only", action="store_true", help="Read and validate source/ledger/EOF target without production work")
     p_continue.add_argument("--daemon", action="store_true", help="Hold after completion or a blocked failure so Auto never replays a permanent error")
+    p_continue.add_argument("--clear-blocker", action="store_true", help="Explicitly clear a recorded permanent failure after its root cause is corrected")
     p_continue.set_defaults(func=command_continue)
 
     p_test = sub.add_parser("test", help="Run a single test target")

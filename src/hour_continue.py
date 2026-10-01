@@ -241,6 +241,24 @@ def hold_daemon(status: dict) -> None:
 
 
 # ##################################################################
+# clear continuation blocker
+# require an explicit operator action before a daemon may retry a previously latched permanent production failure.
+def clear_continuation_blocker(source: Path) -> dict:
+    status = continuation_status(source, create_target=True)
+    project = Path(status["project"])
+    progress_path = project / PROGRESS_NAME
+    if not progress_path.exists():
+        raise RuntimeError("continuation has no blocked failure to clear")
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    if progress.get("status") != "failed":
+        raise RuntimeError("continuation is not blocked by a failure")
+    ready = {**status, "status": "ready", "cleared_failure": progress.get("error", "")}
+    atomic_json(progress_path, ready)
+    append_event(project, "continuation_failure_cleared", prior_error=progress.get("error", ""))
+    return ready
+
+
+# ##################################################################
 # continue to eof
 # idempotently run precisely the next ledger hour until the one established EOF cursor is reached; daemon mode holds after terminal outcomes so Auto cannot repeat permanent failures.
 def continue_to_eof(source: Path, verify_only: bool = False, daemon: bool = False) -> dict:

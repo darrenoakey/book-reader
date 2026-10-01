@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from src.epub_extract import get_output_dir
-from src.hour_continue import continuation_status, qa_movie
+from src.hour_continue import (
+    PROGRESS_NAME,
+    clear_continuation_blocker,
+    continuation_status,
+    qa_movie,
+)
 from src.hour_runner import source_fingerprint
 
 
@@ -93,6 +98,23 @@ def test_continuation_status_uses_ledger_cursor() -> None:
             assert status["eof"] is False
             assert status["next_hour"] == 2
             assert status["cursor"] == {"chapter": 1, "piece": 3}
+        finally:
+            shutil.rmtree(project, ignore_errors=True)
+
+
+# ##################################################################
+# test explicit failure clear
+# a permanent failure remains blocked until an operator explicitly records that its root cause was addressed.
+def test_clear_blocker_requires_latched_failure() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        source, project = write_project(Path(directory), eof=False)
+        try:
+            continuation_status(source, create_target=True)
+            (project / PROGRESS_NAME).write_text(json.dumps({"status": "failed", "error": "schema rejected"}), encoding="utf-8")
+            cleared = clear_continuation_blocker(source)
+            assert cleared["status"] == "ready"
+            assert cleared["cleared_failure"] == "schema rejected"
+            assert "continuation_failure_cleared" in (project / "hour_continuation_events.jsonl").read_text(encoding="utf-8")
         finally:
             shutil.rmtree(project, ignore_errors=True)
 

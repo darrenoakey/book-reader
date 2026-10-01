@@ -294,6 +294,39 @@ def generate_character_refs(output_dir: Path) -> list[Path]:
 
 
 # ##################################################################
+# generate missing character refs
+# create only explicitly requested absent portraits during full-book cast preparation; existing anchor bytes are never opened or overwritten.
+def generate_missing_character_refs(output_dir: Path, character_ids: list[str]) -> list[Path]:
+    appearances_path = output_dir / "appearances.json"
+    characters_path = output_dir / "characters.json"
+    style_path = output_dir / "style.txt"
+    appearances = json.loads(appearances_path.read_text(encoding="utf-8"))
+    characters = json.loads(characters_path.read_text(encoding="utf-8"))
+    style = style_path.read_text(encoding="utf-8").strip() if style_path.is_file() else "cinematic animated film"
+    refs_dir = output_dir / "refs"
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for index, character_id in enumerate(character_ids):
+        dest = refs_dir / f"{character_id}.png"
+        if dest.is_file():
+            continue
+        appearance = appearances.get(character_id)
+        if not isinstance(appearance, str) or not appearance.strip() or appearance == "NONE":
+            raise RuntimeError(f"missing prepared appearance for portrait {character_id}")
+        name = (characters.get(character_id) or {}).get("name", character_id.replace("_", " "))
+        prompt = (
+            f"Head-and-shoulders character reference portrait of {name}. {appearance}. "
+            f"Facing camera, full face visible, neutral soft-lit background, face large and unmistakable. "
+            f"Style: {style}.{RESTRAINT}"
+        )
+        qwen_image_to_file(
+            prompt, dest, REF_SIZE, REF_SIZE, seed=9000 + index, why=f"prepared character ref {character_id}"
+        )
+        written.append(dest)
+    return written
+
+
+# ##################################################################
 # scene ref
 # pick the conditioning image for one scene: the single character's portrait,
 # or a labelled contact sheet when several characters appear together
@@ -328,7 +361,10 @@ def _scene_condition(
         return None, ""
     if len(tiles) == 1 and not has_style_image and not has_prev:
         cid, path = available[0]
-        return path, f"The reference image is a portrait of {cid.replace('-', ' ')}; keep this exact face, hair, and clothing."
+        return (
+            path,
+            f"The reference image is a portrait of {cid.replace('-', ' ')}; keep this exact face, hair, and clothing.",
+        )
 
     sheet = build_contact_sheet(tiles, output_dir / "scenes" / ".sheets" / f"{index:04d}.png")
     names = ", ".join(cid.replace("-", " ") for cid, _ in available)

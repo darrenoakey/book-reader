@@ -1,5 +1,6 @@
 """Real filesystem and ffmpeg tests for bounded hourly production helpers."""
 
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ from src.hour_runner import (
     chapter_order,
     extend_appearances,
     load_ledger,
+    script_for_chapter,
     synthesize_window,
     validate_appearances,
 )
@@ -121,6 +123,44 @@ def test_extend_appearances_real_native() -> None:
 
 
 # ##################################################################
+# test frozen alias script copy
+# keeps the historical immutable script byte-for-byte while producing a source-exact frozen copy that sends only the canonical original voice to new hours.
+def test_script_cache_resolves_frozen_alias_without_rewriting_history() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        project = Path(directory)
+        chapter = project / "chapters" / "01-part.txt"
+        chapter.parent.mkdir(parents=True)
+        source = "Gene said hello."
+        chapter.write_text(source, encoding="utf-8")
+        cache = project / "script_cache"
+        cache.mkdir()
+        legacy = cache / "01-part.jsonl"
+        legacy.write_text('{"gene": "Gene said hello."}\n', encoding="utf-8")
+        payload = legacy.read_bytes()
+        (cache / "01-part.jsonl.hour.meta.json").write_text(
+            json.dumps(
+                {
+                    "mode": "immutable-spans",
+                    "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        original = legacy.read_bytes()
+        frozen = script_for_chapter(
+            project,
+            project / "hours/hour-003",
+            chapter,
+            {"tiger_boy": {"name": "Tiger Boy"}, "narrator": {"name": "Narrator"}},
+            {"gene": "tiger_boy"},
+        )
+        assert legacy.read_bytes() == original
+        assert frozen.parent.name == "frozen_script_cache"
+        assert frozen.read_text(encoding="utf-8") == '{"tiger_boy": "Gene said hello."}\n'
+
+
+# ##################################################################
 # test ledger source mismatch
 # prevent a resumable project from silently continuing a different source file.
 def test_ledger_rejects_changed_source() -> None:
@@ -171,7 +211,9 @@ def test_synthesis_window_respects_remaining_duration() -> None:
         (hour / "script").mkdir(parents=True)
         script = hour / "script" / "00001-part.jsonl"
         script.write_text('{"narrator": "One."}\n{"narrator": "Two."}\n', encoding="utf-8")
-        (root / "breeze_voices.json").write_text('{"narrator": {"ref_wav": "voices/narrator.wav", "ref_text": "Listen."}}', encoding="utf-8")
+        (root / "breeze_voices.json").write_text(
+            '{"narrator": {"ref_wav": "voices/narrator.wav", "ref_text": "Listen."}}', encoding="utf-8"
+        )
         selected, count = synthesize_window(root, script, 1.0, 0)
         assert count == 1
         assert len(selected) == 1

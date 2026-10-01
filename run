@@ -106,6 +106,26 @@ else:
 
 
 # ##################################################################
+# command prepare cast
+# run or verify the durable whole-source native-Ollama cast preparation before any Hour 3+ production.
+def command_prepare_cast(args: argparse.Namespace) -> int:
+    ensure_venv()
+    source = Path(args.source).resolve()
+    if not source.is_file():
+        print(f"Error: input source is not a file: {source}")
+        return 1
+    installed = command_install(args)
+    if installed:
+        return installed
+    code = f'''\
+from pathlib import Path
+from src.cast_freeze import prepare_cast
+print(prepare_cast(Path({str(source)!r}), verify_only={args.verify_only!r}, max_batches={args.max_batches!r}))
+'''
+    return run_venv([str(VENV_PYTHON), "-c", code])
+
+
+# ##################################################################
 # command continue
 # dispatch idempotent target-preserving hourly continuation in the venv; this command never uploads completed movies.
 def command_continue(args: argparse.Namespace) -> int:
@@ -271,6 +291,12 @@ def main(argv: list[str]) -> int:
     p_hour.add_argument("--hour", type=int, default=1, help="1-based production hour number")
     p_hour.add_argument("--verify-only", action="store_true", help="Verify the venv runtime import and source identity without production work")
     p_hour.set_defaults(func=command_hour)
+
+    p_prepare = sub.add_parser("prepare-cast", help="Resumably prepare and freeze the whole-source cast; required before Hour 3+")
+    p_prepare.add_argument("source", help="Full EPUB, Markdown, or text input")
+    p_prepare.add_argument("--verify-only", action="store_true", help="Verify an existing frozen cast manifest without inference or generation")
+    p_prepare.add_argument("--max-batches", type=int, default=None, help="Process at most this many durable source batches, then exit cleanly")
+    p_prepare.set_defaults(func=command_prepare_cast)
 
     p_continue = sub.add_parser("continue", help="Resume sequential 480p hourly production to the established source EOF; never uploads")
     p_continue.add_argument("source", help="Full EPUB, Markdown, or text input")

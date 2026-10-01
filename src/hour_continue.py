@@ -179,9 +179,19 @@ def qa_movie(movie: Path) -> dict:
     )
     if decode.returncode:
         raise RuntimeError(f"ffmpeg full A/V decode failed for {movie.name}: {decode.stderr[-400:]}")
-    for label, seconds in (("start", min(0.5, duration / 4)), ("middle", duration / 2), ("end", max(0.0, duration - 0.5))):
+    for label, seconds in (
+        ("start", min(0.5, duration / 4)),
+        ("middle", duration / 2),
+        ("end", max(0.0, duration - 0.5)),
+    ):
         extract_nonblank_frame(movie, seconds, qa_dir / f"{label}.png")
-    return {"movie": str(movie), "duration_seconds": round(duration, 3), "resolution": [854, 480], "frames": "start,middle,end", "av_decode": "ok"}
+    return {
+        "movie": str(movie),
+        "duration_seconds": round(duration, 3),
+        "resolution": [854, 480],
+        "frames": "start,middle,end",
+        "av_decode": "ok",
+    }
 
 
 # ##################################################################
@@ -268,18 +278,30 @@ def continue_to_eof(source: Path, verify_only: bool = False, daemon: bool = Fals
         return status
     source = source.resolve()
     project = Path(status["project"])
+    # Completed legacy hours remain inspectable, but continuation may never enter
+    # a new hour until the full-source cast is frozen and its anchor bytes verify.
+    if not status["eof"] and status["next_hour"] >= 3:
+        from src.cast_freeze import verify_frozen_cast
+
+        verify_frozen_cast(source, project)
     previous = project / PROGRESS_NAME
     if previous.exists() and json.loads(previous.read_text(encoding="utf-8")).get("status") == "failed":
         failure = json.loads(previous.read_text(encoding="utf-8"))
         if daemon:
             hold_daemon(failure)
-        raise RuntimeError("continuation is latched failed; inspect progress and clear only after correcting the root cause")
+        raise RuntimeError(
+            "continuation is latched failed; inspect progress and clear only after correcting the root cause"
+        )
     target = status["target"]
     append_event(project, "continuation_started", target=target)
     try:
         audit_completed_movies(project, completed_hours(load_ledger(project, source)), status)
         while True:
             status = continuation_status(source)
+            # A parent can finish an hour between loop turns. Re-audit this live
+            # ledger snapshot before accepting EOF, never merely the snapshot
+            # validated before the loop began.
+            audit_completed_movies(project, completed_hours(load_ledger(project, source)), status)
             cursor = (status["cursor"]["chapter"], status["cursor"]["piece"])
             if cursor == (target["target_chapter"], target["target_piece"]):
                 atomic_json(project / PROGRESS_NAME, {**status, "status": "complete"})
@@ -310,7 +332,13 @@ def continue_to_eof(source: Path, verify_only: bool = False, daemon: bool = Fals
             audited = audit_completed_movies(project, completed_hours(load_ledger(project, source)), after)
             qa = audited["validated_hours"][str(hour)]["qa"]
             atomic_json(project / PROGRESS_NAME, {**audited, "status": "running", "last_qa": qa})
-            append_event(project, "hour_complete", hour=hour, qa=qa, cursor={"chapter": after_cursor[0], "piece": after_cursor[1]})
+            append_event(
+                project,
+                "hour_complete",
+                hour=hour,
+                qa=qa,
+                cursor={"chapter": after_cursor[0], "piece": after_cursor[1]},
+            )
     except Exception as error:
         try:
             base = continuation_status(source)

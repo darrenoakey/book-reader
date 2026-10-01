@@ -227,7 +227,9 @@ def generate_appearance_batch(items: list[tuple[str, dict]]) -> dict[str, str]:
             return validate_appearances(json.loads(response), character_ids)
         except (ValueError, json.JSONDecodeError) as error:
             last_error = f"{error}; response={response[:500]!r}"
-    raise RuntimeError(f"appearance generation failed for {', '.join(character_ids)} after {APPEARANCE_ATTEMPTS} attempts: {last_error}")
+    raise RuntimeError(
+        f"appearance generation failed for {', '.join(character_ids)} after {APPEARANCE_ATTEMPTS} attempts: {last_error}"
+    )
 
 
 # ##################################################################
@@ -239,9 +241,15 @@ def extend_appearances(project: Path, cast: dict) -> None:
     if not isinstance(appearances, dict):
         raise TypeError("appearances cache is not an object")
     for character_id in cast:
-        if character_id in appearances and (not isinstance(appearances[character_id], str) or not appearances[character_id].strip()):
+        if character_id in appearances and (
+            not isinstance(appearances[character_id], str) or not appearances[character_id].strip()
+        ):
             raise RuntimeError(f"cached appearance for {character_id} is invalid")
-    missing = [(character_id, info) for character_id, info in cast.items() if character_id != "narrator" and character_id not in appearances]
+    missing = [
+        (character_id, info)
+        for character_id, info in cast.items()
+        if character_id != "narrator" and character_id not in appearances
+    ]
     if not missing:
         return
     generated: dict[str, str] = {}
@@ -284,6 +292,8 @@ def prepare_hour_directory(project: Path, hour_dir: Path) -> None:
         "appearances.json",
         "world_bible.json",
         "locations.json",
+        "frozen_cast_manifest.json",
+        "frozen_character_aliases.json",
     ):
         link_shared(hour_dir, project, name)
     for name in ("style.txt", "style-reference.png"):
@@ -297,7 +307,9 @@ def prepare_hour_directory(project: Path, hour_dir: Path) -> None:
 # ##################################################################
 # script for chapter
 # create one chapter script against the current shared cast, avoiding any full-book script pass.
-def script_for_chapter(project: Path, hour_dir: Path, chapter: Path, cast: dict) -> Path:
+def script_for_chapter(
+    project: Path, hour_dir: Path, chapter: Path, cast: dict, aliases: dict[str, str] | None = None
+) -> Path:
     shared_dir = project / "script_cache"
     shared_dir.mkdir(exist_ok=True)
     canonical = shared_dir / f"{chapter.stem}.jsonl"
@@ -312,22 +324,65 @@ def script_for_chapter(project: Path, hour_dir: Path, chapter: Path, cast: dict)
             if meta.get("sha256") != hashlib.sha256(payload).hexdigest():
                 raise ValueError("payload hash mismatch")
             if metadata.exists():
-                if meta.get("mode") != "immutable-spans" or meta.get("source_sha256") != hashlib.sha256(source.encode()).hexdigest():
+                if (
+                    meta.get("mode") != "immutable-spans"
+                    or meta.get("source_sha256") != hashlib.sha256(source.encode()).hexdigest()
+                ):
                     raise ValueError("hourly source metadata mismatch")
-                if any(next(iter(line)) not in cast for line in lines):
-                    raise ValueError("hourly script has an unknown speaker")
                 if "".join(next(iter(line.values())) for line in lines) != source:
                     raise ValueError("hourly immutable spans do not reconstruct source")
+                unknown = [next(iter(line)) for line in lines if next(iter(line)) not in cast]
+                if unknown:
+                    if aliases is None or any(
+                        speaker not in aliases or aliases[speaker] not in cast for speaker in unknown
+                    ):
+                        raise ValueError("hourly script has an unknown speaker outside frozen aliases")
+                    frozen_dir = project / "frozen_script_cache"
+                    frozen_dir.mkdir(exist_ok=True)
+                    frozen = frozen_dir / canonical.name
+                    remapped = [
+                        {aliases.get(next(iter(line)), next(iter(line))): next(iter(line.values()))} for line in lines
+                    ]
+                    if "".join(next(iter(line.values())) for line in remapped) != source:
+                        raise ValueError("frozen alias remap changed source text")
+                    payload = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in remapped).encode("utf-8")
+                    if not frozen.exists():
+                        frozen.write_bytes(payload)
+                    elif frozen.read_bytes() != payload:
+                        raise ValueError("frozen alias script content differs from existing cache")
+                    frozen_meta = frozen.with_name(frozen.name + ".hour.meta.json")
+                    atomic_json(
+                        frozen_meta,
+                        {
+                            "mode": "immutable-spans",
+                            "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                            "legacy_script": str(canonical.relative_to(project)),
+                            "remapped_speakers": sorted(set(unknown)),
+                        },
+                    )
+                    return frozen
             else:
                 from src.script_generate import validate_script_lines
+
                 validate_script_lines(lines, source, sorted(cast))
             return canonical
         except (OSError, ValueError, StopIteration, json.JSONDecodeError) as error:
-            raise RuntimeError(f"existing canonical script {canonical.name} failed read-only validation: {error}") from error
+            raise RuntimeError(
+                f"existing canonical script {canonical.name} failed read-only validation: {error}"
+            ) from error
     from src.hourly_spans import generate_hourly_script_sync
+
     generate_hourly_script_sync(chapter, canonical, sorted(cast))
     payload = canonical.read_bytes()
-    atomic_json(metadata, {"mode": "immutable-spans", "source_sha256": hashlib.sha256(source.encode()).hexdigest(), "sha256": hashlib.sha256(payload).hexdigest()})
+    atomic_json(
+        metadata,
+        {
+            "mode": "immutable-spans",
+            "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
     script_dir = hour_dir / "script"
     script_dir.mkdir(exist_ok=True)
     hour_script = script_dir / canonical.name
@@ -429,8 +484,6 @@ def run_hour(source: Path, hour_index: int = 1) -> Path:
 def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
     if hour_index < 1:
         raise ValueError("hour index must be at least one")
-    if tts_engine.engine_name() != "breeze":
-        raise RuntimeError("hour production requires Breeze shared voice references")
     source = source.resolve()
     project = get_output_dir(source)
     project.mkdir(parents=True, exist_ok=True)
@@ -451,17 +504,33 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
     else:
         chapter_cursor, piece_cursor = 0, 0
     title, author, chapters = source_chapters(source, project)
+    # Completed Parts 1 and 2 are historical assets and may be returned above without
+    # touching a registry. Every new production hour starts only after the whole-source
+    # frozen manifest verifies the source and every voice/portrait anchor byte.
+    if hour_index >= 3:
+        from src.cast_freeze import load_approved_cast, verify_frozen_cast
+
+        frozen = verify_frozen_cast(source, project)
+        cast = load_approved_cast(source, project)
+        aliases = frozen["approved_aliases"]
+    else:
+        cast = {}
+        aliases = None
+    if tts_engine.engine_name() != "breeze":
+        raise RuntimeError("hour production requires Breeze shared voice references")
     hour_dir = project / "hours" / f"hour-{hour_index:03d}"
     all_selected: list[dict] = []
     remaining = AUDIO_MAX_SECONDS
     next_chapter, next_piece = chapter_cursor, piece_cursor
     for chapter_index in range(chapter_cursor, len(chapters)):
-        cast = asyncio.run(extend_cast(project, chapters[chapter_index], chapter_index + 1, title, author))
-        asyncio.run(extend_voices(project, cast))
-        extend_appearances(project, cast)
+        if hour_index < 3:
+            cast = asyncio.run(extend_cast(project, chapters[chapter_index], chapter_index + 1, title, author))
+            asyncio.run(extend_voices(project, cast))
+            extend_appearances(project, cast)
+        # New hours never extend cast, voice, appearance, or portrait state.
         prepare_hour_directory(project, hour_dir)
         copy_chapter_context(hour_dir, chapters[chapter_index])
-        script = script_for_chapter(project, hour_dir, chapters[chapter_index], cast)
+        script = script_for_chapter(project, hour_dir, chapters[chapter_index], cast, aliases)
         start_piece = piece_cursor if chapter_index == chapter_cursor else 0
         candidates, _ = synthesize_window(project, script, remaining, start_piece)
         if not candidates:
@@ -473,7 +542,9 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
             raise RuntimeError("internal selection exceeded hour budget")
         all_selected.extend(candidates)
         remaining -= elapsed
-        all_metadata = plan_chapter(script, project / "audio_cache", project / "voices", tts_engine.speaker_set(project))[3]
+        all_metadata = plan_chapter(
+            script, project / "audio_cache", project / "voices", tts_engine.speaker_set(project)
+        )[3]
         consumed = start_piece + len(candidates)
         if consumed < len(all_metadata):
             next_chapter, next_piece = chapter_index, consumed

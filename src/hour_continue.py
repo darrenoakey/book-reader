@@ -29,6 +29,7 @@ TARGET_NAME = "hour_continuation_target.json"
 PROGRESS_NAME = "hour_continuation_progress.json"
 EVENTS_NAME = "hour_continuation_events.jsonl"
 DAEMON_SLEEP_SECONDS = 3600
+ACTIVE_POLL_SECONDS = 10
 
 
 # ##################################################################
@@ -113,7 +114,7 @@ def wait_for_active_project_run(project: Path) -> None:
             lock.unlink(missing_ok=True)
             return
         append_event(project, "waiting_for_active_pipeline", pid=pid)
-        time.sleep(10)
+        time.sleep(ACTIVE_POLL_SECONDS)
 
 
 # ##################################################################
@@ -274,9 +275,9 @@ def continue_to_eof(source: Path, verify_only: bool = False, daemon: bool = Fals
             hold_daemon(failure)
         raise RuntimeError("continuation is latched failed; inspect progress and clear only after correcting the root cause")
     target = status["target"]
-    audit_completed_movies(project, completed_hours(load_ledger(project, source)), status)
     append_event(project, "continuation_started", target=target)
     try:
+        audit_completed_movies(project, completed_hours(load_ledger(project, source)), status)
         while True:
             status = continuation_status(source)
             cursor = (status["cursor"]["chapter"], status["cursor"]["piece"])
@@ -289,28 +290,39 @@ def continue_to_eof(source: Path, verify_only: bool = False, daemon: bool = Fals
             require_free_disk(project)
             wait_for_active_project_run(project)
             status = continuation_status(source)
+            audit_completed_movies(project, completed_hours(load_ledger(project, source)), status)
             cursor = (status["cursor"]["chapter"], status["cursor"]["piece"])
             if cursor == (target["target_chapter"], target["target_piece"]):
                 continue
             hour = status["next_hour"]
             append_event(project, "hour_started", hour=hour, cursor={"chapter": cursor[0], "piece": cursor[1]})
             try:
-                movie = run_hour(source, hour_index=hour)
+                run_hour(source, hour_index=hour)
             except SystemExit as error:
                 if "pipeline already running" not in str(error):
                     raise
                 append_event(project, "hour_deferred_for_active_pipeline", hour=hour)
                 continue
-            qa = qa_movie(movie)
             after = continuation_status(source)
             after_cursor = (after["cursor"]["chapter"], after["cursor"]["piece"])
             if after_cursor <= cursor:
                 raise RuntimeError("completed hour did not advance the source cursor")
             audited = audit_completed_movies(project, completed_hours(load_ledger(project, source)), after)
+            qa = audited["validated_hours"][str(hour)]["qa"]
             atomic_json(project / PROGRESS_NAME, {**audited, "status": "running", "last_qa": qa})
             append_event(project, "hour_complete", hour=hour, qa=qa, cursor={"chapter": after_cursor[0], "piece": after_cursor[1]})
     except Exception as error:
-        failure = {**continuation_status(source), "status": "failed", "error": str(error)}
+        try:
+            base = continuation_status(source)
+        except Exception:  # noqa: BLE001 - the failure latch must be written even if status itself fails
+            base = {"project": str(project)}
+        failure = {**base, "status": "failed", "error": str(error)}
+        try:
+            prior = json.loads((project / PROGRESS_NAME).read_text(encoding="utf-8"))
+            if isinstance(prior.get("validated_hours"), dict):
+                failure["validated_hours"] = prior["validated_hours"]
+        except (OSError, ValueError, AttributeError):
+            pass
         atomic_json(project / PROGRESS_NAME, failure)
         append_event(project, "continuation_failed", error=str(error))
         if daemon:

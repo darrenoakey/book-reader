@@ -2,15 +2,19 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
+from src import hour_continue
 from src.epub_extract import get_output_dir
 from src.hour_continue import (
     PROGRESS_NAME,
     clear_continuation_blocker,
     continuation_status,
+    continue_to_eof,
     qa_movie,
 )
 from src.hour_runner import source_fingerprint
@@ -148,4 +152,43 @@ def test_continuation_status_rejects_invalid_eof_piece() -> None:
             with pytest.raises(RuntimeError, match="EOF cursor"):
                 continuation_status(source, create_target=True)
         finally:
+            shutil.rmtree(project, ignore_errors=True)
+
+
+# ##################################################################
+# test external completion audited before advance
+# an hour finished by the parent while the supervisor waits on a live lock is QA'd (and a bad movie latches failed) before EOF or the next hour.
+def test_externally_completed_final_hour_is_audited_before_eof() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        source, project = write_project(Path(directory), eof=False)
+        movie = project / "hours/hour-001/movie.mp4"
+        movie.parent.mkdir(parents=True)
+        create_movie(movie)
+        holder = subprocess.Popen(["sleep", "2"])
+        (project / ".pipeline.lock").write_text(str(holder.pid), encoding="utf-8")
+        original_poll = hour_continue.ACTIVE_POLL_SECONDS
+        hour_continue.ACTIVE_POLL_SECONDS = 3
+
+        def finish_externally() -> None:
+            time.sleep(0.5)
+            ledger = json.loads((project / "hours.json").read_text(encoding="utf-8"))
+            ledger["hours"]["2"] = {"complete": True, "movie": "hours/hour-002/missing.mp4", "next_chapter": 2, "next_piece": 0}
+            (project / "hours.json").write_text(json.dumps(ledger), encoding="utf-8")
+
+        worker = threading.Thread(target=finish_externally)
+        reaper = threading.Thread(target=holder.wait)
+        reaper.start()
+        try:
+            worker.start()
+            with pytest.raises(RuntimeError, match="hour 2 movie is missing"):
+                continue_to_eof(source)
+            worker.join()
+            progress = json.loads((project / PROGRESS_NAME).read_text(encoding="utf-8"))
+            assert progress["status"] == "failed"
+            assert "1" in progress["validated_hours"]
+            with pytest.raises(RuntimeError, match="latched failed"):
+                continue_to_eof(source)
+        finally:
+            hour_continue.ACTIVE_POLL_SECONDS = original_poll
+            holder.wait()
             shutil.rmtree(project, ignore_errors=True)

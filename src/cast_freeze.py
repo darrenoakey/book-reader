@@ -295,7 +295,7 @@ def prepared_profile(entry: dict) -> dict:
 # ##################################################################
 # materialize profiles
 # append only missing prepared actors, then make their Breeze descriptions, clips, appearances, and portrait references once before freeze.
-def materialize_profiles(project: Path, registry: dict) -> None:
+def materialize_profiles(project: Path, registry: dict) -> dict:
     characters_path = project / "characters.json"
     characters = load_object(characters_path, "characters profile")
     added = False
@@ -332,6 +332,7 @@ def materialize_profiles(project: Path, registry: dict) -> None:
     ]
     if missing_refs:
         generate_missing_character_refs(project, missing_refs)
+    return characters
 
 
 # ##################################################################
@@ -501,11 +502,14 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
     source_text = source.read_text(encoding="utf-8")
     inactive = apply_alias_audit(project, source_text, progress["registry"], progress["aliases"])
     active = {actor_id for actor_id in progress["registry"] if actor_id not in inactive}
-    materialize_profiles(project, {actor_id: progress["registry"][actor_id] for actor_id in active})
+    characters = materialize_profiles(project, {actor_id: progress["registry"][actor_id] for actor_id in active})
     actors = {
-        actor_id: {"name": entry["name"], "bio": entry["bio"], "look": entry["look"]}
-        for actor_id, entry in progress["registry"].items()
-        if actor_id in active
+        actor_id: {
+            "name": characters[actor_id].get("name", actor_id),
+            "bio": characters[actor_id].get("bio", ""),
+            "look": characters[actor_id].get("look", ""),
+        }
+        for actor_id in active
     }
     aliases = {alias: canonical for alias, canonical in progress["aliases"].items() if canonical in actors}
     alias_payload = {"version": 1, "approved": aliases, "inactive_legacy_ids": sorted(inactive)}

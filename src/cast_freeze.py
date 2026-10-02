@@ -22,6 +22,17 @@ AUDIT_NAME = "cast_alias_audit.json"
 DISCOVERIES_NAME = "cast_preparation_discoveries.jsonl"
 BATCH_CHAPTERS = 6
 MAX_BATCH_CHARACTERS = 24
+VOICE_PROFILE_BATCH_SIZE = 4
+# The router may use the primary's 32,768-token context on any request, not
+# only the backup's 40,960-token context. Two characters/token is deliberately
+# conservative for names, punctuation, and transcription artefacts; reserve
+# structured output plus system/router framing before accepting source bytes.
+NATIVE_MIN_CONTEXT_TOKENS = 32_768
+NATIVE_RESERVED_OUTPUT_TOKENS = 3_500
+NATIVE_RESERVED_ROUTER_TOKENS = 2_500
+PREPARATION_PROMPT_MAX_CHARS = 2 * (
+    NATIVE_MIN_CONTEXT_TOKENS - NATIVE_RESERVED_OUTPUT_TOKENS - NATIVE_RESERVED_ROUTER_TOKENS
+)
 ANCHOR_IDS = {
     "ceremony_master",
     "ron_blackfire",
@@ -118,8 +129,11 @@ def discovery_schema(known_ids: list[str]) -> dict:
 # ##################################################################
 # discovery prompt
 # keeps the full-book registry compact while the complete source excerpt proves each requested identity.
-def discovery_prompt(chapters: list[Path], registry: dict) -> str:
+def discovery_prompt(chapters: list[Path], registry: dict, aliases: dict[str, str]) -> str:
     roster = "; ".join(f"{actor_id}={info.get('name', actor_id)}" for actor_id, info in sorted(registry.items()))
+    approved_aliases = "; ".join(
+        f"{alias}->{canonical}" for alias, canonical in sorted(aliases.items()) if alias != canonical
+    )
     excerpts = []
     for chapter in chapters:
         text = chapter.read_text(encoding="utf-8")
@@ -127,6 +141,7 @@ def discovery_prompt(chapters: list[Path], registry: dict) -> str:
     return f"""Extract every legitimate named or consistently role-named person/creature who speaks, has internal monologue, or is directly depicted in these source chapters. Do not invent a character for an unnamed crowd, pronoun, title, or a mere mention. Use the response schema only.
 
 Known canonical IDs (reuse a listed ID only when source evidence establishes it is the same identity): {roster or "(none)"}
+Approved source-audited aliases (always use their canonical target, never create the alias as a new identity): {approved_aliases or "(none)"}
 
 For a new identity, id must be lowercase underscore normalization of name. For an existing identity, canonical_id must be that exact known ID and id must repeat it. aliases are source spellings/titles for that same identity. Every evidence item MUST be a verbatim contiguous quote from these chapters which demonstrates the person or identity. voice_facts and look_facts may contain only facts supported by evidence or these chapters; use an empty string when unstated. Never infer a merge from similarity alone.
 
@@ -134,9 +149,32 @@ SOURCE:\n{"\n\n".join(excerpts)}"""
 
 
 # ##################################################################
+# context-safe source batch
+# takes consecutive complete chapters only while leaving native Ollama enough context for its structured response; it never truncates or skips source.
+def context_safe_batch(chapters: list[Path], start: int, registry: dict, aliases: dict[str, str]) -> tuple[list[Path], str]:
+    selected: list[Path] = []
+    prompt = ""
+    for chapter in chapters[start : start + BATCH_CHAPTERS]:
+        candidate = [*selected, chapter]
+        candidate_prompt = discovery_prompt(candidate, registry, aliases)
+        if len(candidate_prompt) > PREPARATION_PROMPT_MAX_CHARS:
+            if not selected:
+                raise RuntimeError(
+                    f"source chapter {chapter.name} exceeds safe native model context; refusing to truncate or skip it"
+                )
+            break
+        selected, prompt = candidate, candidate_prompt
+    if not selected:
+        raise RuntimeError("no source chapters fit the native model context")
+    return selected, prompt
+
+
+# ##################################################################
 # validate discovery
 # fail closed unless every model fact has exact local source evidence and every identity is schema-compatible with the current registry.
-def validate_discovery(value: object, source_text: str, known_ids: set[str]) -> list[dict]:
+def validate_discovery(
+    value: object, source_text: str, known_ids: set[str], ambiguous_new_ids: set[str] | None = None
+) -> list[dict]:
     if not isinstance(value, dict) or set(value) != {"characters"} or not isinstance(value["characters"], list):
         raise ValueError("discovery response is not the exact object schema")
     found: list[dict] = []
@@ -164,6 +202,8 @@ def validate_discovery(value: object, source_text: str, known_ids: set[str]) -> 
             raise ValueError(f"discovery selected unknown canonical ID: {canonical}")
         if canonical == "new" and (not IDENTIFIER.fullmatch(actor_id) or actor_id != normalized_id(name)):
             raise ValueError(f"new discovery ID is not deterministic for {name!r}")
+        if canonical == "new" and actor_id in (ambiguous_new_ids or set()):
+            raise ValueError(f"new discovery {actor_id!r} is source-ambiguous and requires an audit decision")
         if canonical != "new" and actor_id != canonical:
             raise ValueError(f"existing discovery changed canonical ID: {actor_id}")
         if not isinstance(aliases, list) or not all(isinstance(alias, str) and alias.strip() for alias in aliases):
@@ -215,12 +255,36 @@ def apply_discoveries(registry: dict, aliases: dict, discoveries: list[dict]) ->
 
 
 # ##################################################################
+# established identity preference
+# protects original anchors first, then the earliest existing portrait/voice asset, so a later duplicate name never replaces a live face or timbre.
+def preferred_established_identity(project: Path, first: str, second: str) -> str:
+    if first in ANCHOR_IDS:
+        return first
+    if second in ANCHOR_IDS:
+        return second
+
+    def origin(identity: str) -> tuple[float, float]:
+        portrait = project / "refs" / f"{identity}.png"
+        voice = project / "voices" / f"{identity}.wav"
+        portrait_time = portrait.stat().st_mtime if portrait.is_file() else float("inf")
+        voice_time = voice.stat().st_mtime if voice.is_file() else float("inf")
+        return portrait_time, voice_time
+
+    first_origin, second_origin = origin(first), origin(second)
+    if first_origin == (float("inf"), float("inf")):
+        return second
+    if second_origin == (float("inf"), float("inf")):
+        return first
+    return first if first_origin <= second_origin else second
+
+
+# ##################################################################
 # alias audit
 # permits only externally audited source-backed legacy mappings, leaving every legacy file and asset in place.
-def apply_alias_audit(project: Path, source_text: str, registry: dict, aliases: dict) -> set[str]:
+def apply_alias_audit(project: Path, source_text: str, registry: dict, aliases: dict) -> tuple[set[str], set[str]]:
     path = project / AUDIT_NAME
     if not path.exists():
-        return set()
+        return set(), set()
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -229,6 +293,7 @@ def apply_alias_audit(project: Path, source_text: str, registry: dict, aliases: 
     if not isinstance(records, list):
         raise TypeError("alias audit requires a records array")
     merges: dict[str, str] = {}
+    ambiguous: set[str] = set()
     for record in records:
         if not isinstance(record, dict) or set(record) != {"alias", "canonical", "evidence", "decision"}:
             raise RuntimeError("alias audit record has an invalid schema")
@@ -248,12 +313,19 @@ def apply_alias_audit(project: Path, source_text: str, registry: dict, aliases: 
             continue
         if decision not in {"merge", "ambiguous"}:
             raise RuntimeError("alias audit decision must be merge, distinct, or ambiguous")
+        if decision == "ambiguous":
+            ambiguous.add(normalized_id(alias))
+            continue
         if decision == "merge":
             alias_id = normalized_id(alias)
-            prior = merges.get(alias_id)
-            if prior is not None and prior != normalized_id(canonical):
+            canonical_id = normalized_id(canonical)
+            preferred = preferred_established_identity(project, alias_id, canonical_id)
+            merge_alias = canonical_id if preferred == alias_id else alias_id
+            merge_target = alias_id if preferred == alias_id else canonical_id
+            prior = merges.get(merge_alias)
+            if prior is not None and prior != merge_target:
                 raise RuntimeError(f"alias audit conflicts with prior alias: {alias}")
-            merges[alias_id] = normalized_id(canonical)
+            merges[merge_alias] = merge_target
 
     def resolved(actor_id: str, trail: set[str] | None = None) -> str:
         trail = trail or set()
@@ -279,7 +351,7 @@ def apply_alias_audit(project: Path, source_text: str, registry: dict, aliases: 
         aliases[alias_id] = final
         if alias_id in registry and alias_id != final:
             inactive.add(alias_id)
-    return inactive
+    return inactive, ambiguous
 
 
 # ##################################################################
@@ -311,15 +383,20 @@ def materialize_profiles(project: Path, registry: dict) -> dict:
     missing = [(actor_id, characters[actor_id]) for actor_id in registry if actor_id not in voices]
     if missing:
 
-        async def describe_missing() -> list[tuple[str, dict]]:
-            return await asyncio.gather(
-                *(_voice_description_for_one(actor_id, profile) for actor_id, profile in missing)
-            )
+        async def describe_and_checkpoint(batch: list[tuple[str, dict]]) -> None:
+            tasks = [
+                asyncio.create_task(_voice_description_for_one(actor_id, profile))
+                for actor_id, profile in batch
+            ]
+            for completed in asyncio.as_completed(tasks):
+                actor_id, description = await completed
+                # Each completed real model response is durable before waiting
+                # for another, so a restart never repeats an already-described actor.
+                voices[actor_id] = description
+                atomic_json(voices_path, voices)
 
-        described = asyncio.run(describe_missing())
-        for actor_id, description in described:
-            voices[actor_id] = description
-        atomic_json(voices_path, voices)
+        for start in range(0, len(missing), VOICE_PROFILE_BATCH_SIZE):
+            asyncio.run(describe_and_checkpoint(missing[start : start + VOICE_PROFILE_BATCH_SIZE]))
     prepare_breeze_voices(project)
 
     from src.hour_runner import extend_appearances
@@ -428,6 +505,7 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
     if verify_only:
         raise RuntimeError("no frozen cast manifest exists")
     source_sha = source_fingerprint(source)
+    source_text = source.read_text(encoding="utf-8")
     progress_path = project / PROGRESS_NAME
     if progress_path.exists():
         progress = load_object(progress_path, "cast preparation progress")
@@ -457,18 +535,31 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
             "completed_batches": [],
         }
         atomic_json(progress_path, progress)
+    if not progress.get("audit_applied"):
+        inactive, ambiguous = apply_alias_audit(project, source_text, progress["registry"], progress["aliases"])
+        progress["registry"] = {
+            actor_id: entry for actor_id, entry in progress["registry"].items() if actor_id not in inactive
+        }
+        progress["inactive_legacy_ids"] = sorted(inactive)
+        progress["ambiguous_new_ids"] = sorted(ambiguous)
+        progress["audit_applied"] = True
+        atomic_json(progress_path, progress)
+    inactive = set(progress.get("inactive_legacy_ids", []))
+    ambiguous = set(progress.get("ambiguous_new_ids", []))
     batches = 0
     while int(progress["next_chapter"]) < len(chapters):
         start = int(progress["next_chapter"])
-        batch = chapters[start : start + BATCH_CHAPTERS]
+        batch, prompt = context_safe_batch(chapters, start, progress["registry"], progress["aliases"])
         batch_text = "\n".join(path.read_text(encoding="utf-8") for path in batch)
         response = ask_sync(
-            discovery_prompt(batch, progress["registry"]),
+            prompt,
             max_tokens=3500,
             response_schema=discovery_schema(list(progress["registry"])),
         )
         try:
-            discoveries = validate_discovery(json.loads(response), batch_text, set(progress["registry"]))
+            discoveries = validate_discovery(
+                json.loads(response), batch_text, set(progress["registry"]), ambiguous
+            )
         except (ValueError, json.JSONDecodeError) as error:
             raise RuntimeError(
                 f"cast preparation batch {start}-{start + len(batch) - 1} rejected: {error}; response={response[:500]!r}"
@@ -499,8 +590,13 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
                 "next_chapter": progress["next_chapter"],
                 "actors": len(progress["registry"]),
             }
-    source_text = source.read_text(encoding="utf-8")
-    inactive = apply_alias_audit(project, source_text, progress["registry"], progress["aliases"])
+    # Reapply the audited transitive map against retained legacy profiles before
+    # publication; no inactive identifier can escape into the approved registry.
+    legacy_registry = {**load_object(project / "characters.json", "characters profile"), **progress["registry"]}
+    final_inactive, final_ambiguous = apply_alias_audit(project, source_text, legacy_registry, progress["aliases"])
+    if final_ambiguous != ambiguous:
+        raise RuntimeError("alias audit ambiguity changed during cast preparation")
+    inactive.update(final_inactive)
     active = {actor_id for actor_id in progress["registry"] if actor_id not in inactive}
     characters = materialize_profiles(project, {actor_id: progress["registry"][actor_id] for actor_id in active})
     actors = {

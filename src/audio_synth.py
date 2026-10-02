@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -130,12 +131,18 @@ def plan_chapter(
 ) -> tuple[Path, list[Path], list[dict], list[dict]]:
     chapter_name = script_path.stem
     chapter_wav = audio_dir / f"{chapter_name}.wav"
-    work_dir = audio_dir / f".lines_{chapter_name}"
+    frozen_meta_path = script_path.with_name(script_path.name + ".hour.meta.json")
+    frozen_meta = json.loads(frozen_meta_path.read_text(encoding="utf-8")) if frozen_meta_path.is_file() else {}
+    remapped_lines = set(frozen_meta.get("remapped_line_indexes", []))
+    is_remapped_frozen = bool(remapped_lines and frozen_meta.get("legacy_script"))
+    work_dir = audio_dir / (f".lines_{chapter_name}.frozen" if is_remapped_frozen else f".lines_{chapter_name}")
+    legacy_work_dir = audio_dir / f".lines_{chapter_name}"
     work_dir.mkdir(parents=True, exist_ok=True)
     line_paths: list[Path] = []
     line_meta: list[dict] = []
     jobs: list[dict] = []
     sub_idx = 0
+    raw_index = 0
     with open(script_path, "r", encoding="utf-8") as f:
         for raw in f:
             raw = raw.strip()
@@ -150,6 +157,9 @@ def plan_chapter(
                 speaker = "narrator"
             for piece in split_long_text(text):
                 line_path = work_dir / f"{sub_idx:05d}.wav"
+                legacy_path = legacy_work_dir / f"{sub_idx:05d}.wav"
+                if is_remapped_frozen and raw_index not in remapped_lines and legacy_path.is_file() and not line_path.exists():
+                    os.link(legacy_path, line_path)
                 line_paths.append(line_path)
                 line_meta.append({"index": sub_idx, "speaker": speaker, "text": piece, "path": line_path})
                 sub_idx += 1
@@ -161,6 +171,7 @@ def plan_chapter(
                             "output_path": line_path,
                         }
                     )
+            raw_index += 1
     return chapter_wav, line_paths, jobs, line_meta
 
 

@@ -15,6 +15,7 @@ from src.cast_freeze import (
     MANIFEST_NAME,
     apply_alias_audit,
     asset_hashes,
+    context_safe_batch,
     discovery_schema,
     validate_discovery,
     verify_frozen_cast,
@@ -102,6 +103,25 @@ def test_discovery_schema_is_closed_and_known_canonical_only() -> None:
 
 
 # ##################################################################
+# test context-safe source batch
+# reduces only the number of complete consecutive chapters when the compact registry and source would exceed native context, never truncating source text.
+def test_context_safe_batch_reduces_without_source_truncation() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        chapters = []
+        for index in range(3):
+            chapter = root / f"{index + 1:02d}-part.txt"
+            chapter.write_text("x" * 24_000, encoding="utf-8")
+            chapters.append(chapter)
+        batch, prompt = context_safe_batch(chapters, 0, {"narrator": {"name": "Narrator"}}, {})
+        assert [path.name for path in batch] == ["01-part.txt", "02-part.txt"]
+        assert len(prompt) <= 53_536
+        chapters[0].write_text("x" * 60_000, encoding="utf-8")
+        with pytest.raises(RuntimeError, match="refusing to truncate or skip"):
+            context_safe_batch(chapters, 0, {"narrator": {"name": "Narrator"}}, {})
+
+
+# ##################################################################
 # test source evidence rejection
 # rejects a locally plausible but non-verbatim character claim before preparation can create an identity.
 def test_discovery_requires_verbatim_source_evidence() -> None:
@@ -119,6 +139,8 @@ def test_discovery_requires_verbatim_source_evidence() -> None:
         ]
     }
     assert validate_discovery(good, "Ren said hello.", set()) == good["characters"]
+    with pytest.raises(ValueError, match="source-ambiguous"):
+        validate_discovery(good, "Ren said hello.", set(), {"ren"})
     bad = {"characters": [{**good["characters"][0], "evidence": ["Ren has blue eyes"]}]}
     with pytest.raises(ValueError, match="non-source evidence"):
         validate_discovery(bad, "Ren said hello.", set())
@@ -148,11 +170,12 @@ def test_alias_audit_flattens_transitive_merges_without_guessing() -> None:
         )
         registry = {"gene": {}, "jean": {}, "tiger_boy": {}}
         aliases = {actor_id: actor_id for actor_id in registry}
-        inactive = apply_alias_audit(project, source, registry, aliases)
+        inactive, ambiguous = apply_alias_audit(project, source, registry, aliases)
         assert aliases["gene"] == "tiger_boy"
         assert aliases["jean"] == "tiger_boy"
         assert "jin" not in aliases
         assert inactive == {"gene", "jean"}
+        assert ambiguous == {"jin"}
 
 
 # ##################################################################

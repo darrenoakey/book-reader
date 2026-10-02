@@ -274,6 +274,11 @@ def generate_character_refs(output_dir: Path) -> list[Path]:
     refs_dir = output_dir / "refs"
     refs_dir.mkdir(parents=True, exist_ok=True)
     cast = [(cid, a) for cid, a in sorted(appearances.items()) if a and a != "NONE" and cid != "narrator"]
+    if (output_dir / "frozen_cast_active_only.txt").is_file():
+        missing = [cid for cid, _ in cast if not (refs_dir / f"{cid}.png").is_file()]
+        if missing:
+            raise RuntimeError(f"frozen hour is missing approved portrait references: {', '.join(missing)}")
+        return [refs_dir / f"{cid}.png" for cid, _ in cast]
 
     def _render_ref(item: tuple[int, tuple[str, str]]) -> Path:
         index, (cid, appearance) = item

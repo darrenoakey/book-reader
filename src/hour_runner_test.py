@@ -15,6 +15,7 @@ from src.hour_runner import (
     chapter_order,
     extend_appearances,
     load_ledger,
+    prepare_hour_directory,
     script_for_chapter,
     synthesize_window,
     validate_appearances,
@@ -120,6 +121,29 @@ def test_extend_appearances_real_native() -> None:
         appearances = json.loads((project / "appearances.json").read_text(encoding="utf-8"))
         assert appearances["ren"] == original["ren"]
         assert isinstance(appearances["father"], str) and appearances["father"].strip()
+
+
+# ##################################################################
+# test frozen hour metadata view
+# keeps legacy aliases in the root cache but exposes only approved canonical IDs to all Hour 3 storyboard and TTS readers.
+def test_prepare_frozen_hour_excludes_inactive_legacy_metadata() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        project = Path(directory)
+        (project / "chapters").mkdir()
+        (project / "chapters" / "00-intro.txt").write_text("Book by Author", encoding="utf-8")
+        for name, value in (
+            ("characters.json", {"tiger_boy": {"name": "Tiger Boy"}, "gene": {"name": "Gene"}}),
+            ("voices.json", {"tiger_boy": {"description": "canonical"}, "gene": {"description": "legacy"}}),
+            ("breeze_voices.json", {"tiger_boy": {"ref_wav": "voices/tiger_boy.wav"}, "gene": {"ref_wav": "voices/gene.wav"}}),
+            ("appearances.json", {"tiger_boy": "canonical appearance", "gene": "legacy appearance"}),
+        ):
+            (project / name).write_text(json.dumps(value), encoding="utf-8")
+        hour = project / "hours/hour-003"
+        prepare_hour_directory(project, hour, {"tiger_boy": {"name": "Tiger Boy"}, "narrator": {"name": "Narrator"}})
+        assert set(json.loads((hour / "characters.json").read_text(encoding="utf-8"))) == {"tiger_boy"}
+        assert set(json.loads((hour / "voices.json").read_text(encoding="utf-8"))) == {"tiger_boy"}
+        assert set(json.loads((hour / "appearances.json").read_text(encoding="utf-8"))) == {"tiger_boy"}
+        assert (hour / "frozen_cast_active_only.txt").read_text(encoding="utf-8") == "true\n"
 
 
 # ##################################################################

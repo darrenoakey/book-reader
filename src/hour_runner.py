@@ -273,7 +273,7 @@ def link_shared(hour_dir: Path, project: Path, name: str) -> None:
 # ##################################################################
 # prepare hour directory
 # make the hour see the canonical cast and Breeze reference files while retaining hour-local script/audio/movie outputs.
-def prepare_hour_directory(project: Path, hour_dir: Path) -> None:
+def prepare_hour_directory(project: Path, hour_dir: Path, approved_cast: dict | None = None) -> None:
     hour_dir.mkdir(parents=True, exist_ok=True)
     intro = project / "chapters" / "00-intro.txt"
     if intro.exists():
@@ -283,19 +283,17 @@ def prepare_hour_directory(project: Path, hour_dir: Path) -> None:
         if not intro_copy.exists():
             shutil.copyfile(intro, intro_copy)
     (project / "refs").mkdir(exist_ok=True)
-    for name in (
-        "characters.json",
-        "voices.json",
-        "breeze_voices.json",
-        "voices",
-        "refs",
-        "appearances.json",
-        "world_bible.json",
-        "locations.json",
-        "frozen_cast_manifest.json",
-        "frozen_character_aliases.json",
-    ):
+    frozen_names = set(approved_cast or {})
+    if frozen_names:
+        # Later hours consume a local active-only metadata view. Root files keep
+        # historical aliases for cache preservation but must never steer scenes.
+        for name in ("characters.json", "voices.json", "breeze_voices.json", "appearances.json"):
+            source = json.loads((project / name).read_text(encoding="utf-8"))
+            atomic_json(hour_dir / name, {actor_id: source[actor_id] for actor_id in frozen_names if actor_id in source})
+    for name in ("voices", "refs", "world_bible.json", "locations.json", "frozen_cast_manifest.json", "frozen_character_aliases.json"):
         link_shared(hour_dir, project, name)
+    if frozen_names:
+        (hour_dir / "frozen_cast_active_only.txt").write_text("true\n", encoding="utf-8")
     for name in ("style.txt", "style-reference.png"):
         if (project / name).exists():
             link_shared(hour_dir, project, name)
@@ -332,6 +330,7 @@ def script_for_chapter(
                 if "".join(next(iter(line.values())) for line in lines) != source:
                     raise ValueError("hourly immutable spans do not reconstruct source")
                 unknown = [next(iter(line)) for line in lines if next(iter(line)) not in cast]
+                remapped_indices = [index for index, line in enumerate(lines) if next(iter(line)) not in cast]
                 if unknown:
                     if aliases is None or any(
                         speaker not in aliases or aliases[speaker] not in cast for speaker in unknown
@@ -359,6 +358,7 @@ def script_for_chapter(
                             "sha256": hashlib.sha256(payload).hexdigest(),
                             "legacy_script": str(canonical.relative_to(project)),
                             "remapped_speakers": sorted(set(unknown)),
+                            "remapped_line_indexes": remapped_indices,
                         },
                     )
                     return frozen
@@ -373,7 +373,7 @@ def script_for_chapter(
             ) from error
     from src.hourly_spans import generate_hourly_script_sync
 
-    generate_hourly_script_sync(chapter, canonical, sorted(cast))
+    generate_hourly_script_sync(chapter, canonical, sorted(cast), aliases)
     payload = canonical.read_bytes()
     atomic_json(
         metadata,
@@ -528,7 +528,7 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
             asyncio.run(extend_voices(project, cast))
             extend_appearances(project, cast)
         # New hours never extend cast, voice, appearance, or portrait state.
-        prepare_hour_directory(project, hour_dir)
+        prepare_hour_directory(project, hour_dir, cast if hour_index >= 3 else None)
         copy_chapter_context(hour_dir, chapters[chapter_index])
         script = script_for_chapter(project, hour_dir, chapters[chapter_index], cast, aliases)
         start_piece = piece_cursor if chapter_index == chapter_cursor else 0

@@ -73,7 +73,7 @@ def parse_speakers(response: str, count: int, speakers: set[str]) -> list[str]:
     return values
 
 
-async def classify_spans(text: str, speaker_ids: list[str]) -> list[dict]:
+async def classify_spans(text: str, speaker_ids: list[str], approved_aliases: dict[str, str] | None = None) -> list[dict]:
     spans = immutable_spans(text)
     speakers = set(speaker_ids)
     if "narrator" not in speakers:
@@ -82,8 +82,9 @@ async def classify_spans(text: str, speaker_ids: list[str]) -> list[dict]:
     for start in range(0, len(spans), BATCH_SIZE):
         batch = spans[start : start + BATCH_SIZE]
         indexed = "\n".join(f"{start+i}: {span}" for i, span in enumerate(batch))
+        alias_notes = ", ".join(f"{alias}->{canonical}" for alias, canonical in sorted((approved_aliases or {}).items()) if alias != canonical)
         prompt = f"""Classify each immutable source span to exactly one audiobook speaker.
-Valid speakers: {', '.join(speaker_ids)}. Return only the JSON array specified by the response schema: one speaker ID per listed span, in exactly the listed order. narrator for narration and third-person prose. Direct speech may be quoted OR clearly attributed without quotes (for example, 'Klein said Look at it'); assign that speech to its named speaker when unambiguous. Never rewrite, copy, omit, or add text: the program constructs text locally from the immutable spans.
+Valid speakers: {', '.join(speaker_ids)}. Approved aliases that must use their canonical speaker ID: {alias_notes or '(none)'}. Return only the JSON array specified by the response schema: one speaker ID per listed span, in exactly the listed order. narrator for narration and third-person prose. Direct speech may be quoted OR clearly attributed without quotes (for example, 'Klein said Look at it'); assign that speech to its named speaker when unambiguous. Never rewrite, copy, omit, or add text: the program constructs text locally from the immutable spans.
 
 SPANS:\n{indexed}"""
         response = await ask(prompt, response_schema=speaker_array_schema(speaker_ids, len(batch)))
@@ -94,9 +95,11 @@ SPANS:\n{indexed}"""
     return [{assigned[index]: span} for index, span in enumerate(spans)]
 
 
-def generate_hourly_script_sync(chapter_path: Path, script_path: Path, speaker_ids: list[str]) -> Path:
+def generate_hourly_script_sync(
+    chapter_path: Path, script_path: Path, speaker_ids: list[str], approved_aliases: dict[str, str] | None = None
+) -> Path:
     text = chapter_path.read_text(encoding="utf-8")
-    lines = asyncio.run(classify_spans(text, speaker_ids))
+    lines = asyncio.run(classify_spans(text, speaker_ids, approved_aliases))
     payload = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines)
     temporary = script_path.with_suffix(".partial")
     temporary.write_text(payload, encoding="utf-8")

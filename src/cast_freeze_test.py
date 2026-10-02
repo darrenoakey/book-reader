@@ -17,7 +17,10 @@ from src.cast_freeze import (
     asset_hashes,
     context_safe_batch,
     discovery_schema,
+    immutable_evidence_units,
+    materialize_evidence_discovery,
     validate_discovery,
+    validate_preparation_coverage,
     verify_frozen_cast,
 )
 from src.epub_extract import get_output_dir
@@ -100,6 +103,63 @@ def test_discovery_schema_is_closed_and_known_canonical_only() -> None:
     item = schema["properties"]["characters"]["items"]
     assert item["additionalProperties"] is False
     assert item["properties"]["canonical_id"]["enum"] == ["new", "ren", "ron_blackfire"]
+    source_schema = discovery_schema(["ren"], ["c00s00000", "c00s00001"])
+    source_item = source_schema["properties"]["characters"]["items"]
+    assert source_item["required"][-1] == "evidence_unit_ids"
+    assert source_item["properties"]["evidence_unit_ids"]["items"]["enum"] == ["c00s00000", "c00s00001"]
+
+
+# ##################################################################
+# test immutable evidence materialization
+# proves the native schema can only select source IDs and local code writes the byte-exact source sentence rather than LLM-provided prose.
+def test_evidence_ids_materialize_exact_source_and_ground_names() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        chapter = Path(directory) / "01-part.txt"
+        chapter.write_text("Ren said, Hello. Ron watched Ren.", encoding="utf-8")
+        units = immutable_evidence_units([chapter])
+        raw = {
+            "characters": [
+                {
+                    "canonical_id": "new",
+                    "id": "ren",
+                    "name": "Ren",
+                    "aliases": [],
+                    "voice_facts": "speaks",
+                    "look_facts": "",
+                    "evidence_unit_ids": [units[0]["id"]],
+                }
+            ]
+        }
+        materialized, citations = materialize_evidence_discovery(raw, units)
+        assert citations == [[units[0]["id"]]]
+        assert materialized["characters"][0]["evidence"] == ["Ren said, Hello."]
+        assert validate_discovery(materialized, chapter.read_text(encoding="utf-8"), set()) == materialized["characters"]
+        raw["characters"][0]["aliases"] = ["Rin"]
+        with pytest.raises(ValueError, match="lacks selected source evidence"):
+            materialize_evidence_discovery(raw, units)
+        raw["characters"][0]["aliases"] = []
+        raw["characters"][0]["evidence_unit_ids"] = ["made_up"]
+        with pytest.raises(ValueError, match="invalid immutable evidence ID"):
+            materialize_evidence_discovery(raw, units)
+
+
+# ##################################################################
+# test resumable coverage
+# rejects duplicate or skipped batch coverage without discarding any durable registry or discovery buffers.
+def test_preparation_coverage_requires_unique_consecutive_hashes() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        chapters = []
+        for index in range(2):
+            chapter = root / f"{index + 1:02d}-part.txt"
+            chapter.write_text(f"Chapter {index}.", encoding="utf-8")
+            chapters.append(chapter)
+        hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in chapters}
+        progress = {"next_chapter": 2, "completed_batches": [{"start": 0, "end": 2, "chapter_sha256": hashes}]}
+        validate_preparation_coverage(progress, chapters)
+        progress["completed_batches"].append({"start": 2, "end": 2, "chapter_sha256": {}})
+        with pytest.raises(RuntimeError, match="unique consecutive"):
+            validate_preparation_coverage(progress, chapters)
 
 
 # ##################################################################

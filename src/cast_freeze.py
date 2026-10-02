@@ -11,6 +11,7 @@ from pathlib import Path
 from src.breeze_voices import prepare_breeze_voices
 from src.epub_extract import get_output_dir
 from src.hour_runner import atomic_json, source_chapters, source_fingerprint
+from src.hourly_spans import immutable_spans
 from src.llm import LLM_STYLE, ask_sync
 from src.movie_images import generate_missing_character_refs
 from src.voice_description import _voice_description_for_one
@@ -90,10 +91,35 @@ def load_object(path: Path, label: str) -> dict:
 
 
 # ##################################################################
+# immutable evidence units
+# assigns each source sentence a stable batch-local identifier so a model selects evidence without ever reproducing source prose.
+def immutable_evidence_units(chapters: list[Path]) -> list[dict[str, str]]:
+    units: list[dict[str, str]] = []
+    for chapter_index, chapter in enumerate(chapters):
+        for sentence_index, quote in enumerate(immutable_spans(chapter.read_text(encoding="utf-8"))):
+            units.append(
+                {
+                    "id": f"c{chapter_index:02d}s{sentence_index:05d}",
+                    "chapter": chapter.name,
+                    "quote": quote,
+                }
+            )
+    if not units:
+        raise ValueError("source batch has no immutable evidence units")
+    return units
+
+
+# ##################################################################
 # source batch schema
-# asks native Ollama for a bounded set of source-backed actor discoveries, with no permissive extra fields.
-def discovery_schema(known_ids: list[str]) -> dict:
+# asks native Ollama to select only enumerated immutable source IDs; the program, never the model, materializes quotations.
+def discovery_schema(known_ids: list[str], evidence_unit_ids: list[str] | None = None) -> dict:
     known = sorted(set(known_ids))
+    evidence_property = (
+        {"type": "array", "items": {"type": "string", "enum": evidence_unit_ids}, "minItems": 1, "maxItems": 8}
+        if evidence_unit_ids is not None
+        else {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 8}
+    )
+    evidence_key = "evidence_unit_ids" if evidence_unit_ids is not None else "evidence"
     return {
         "type": "object",
         "properties": {
@@ -109,14 +135,9 @@ def discovery_schema(known_ids: list[str]) -> dict:
                         "aliases": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 12},
                         "voice_facts": {"type": "string", "maxLength": 1000},
                         "look_facts": {"type": "string", "maxLength": 1000},
-                        "evidence": {
-                            "type": "array",
-                            "items": {"type": "string", "minLength": 1},
-                            "minItems": 1,
-                            "maxItems": 8,
-                        },
+                        evidence_key: evidence_property,
                     },
-                    "required": ["canonical_id", "id", "name", "aliases", "voice_facts", "look_facts", "evidence"],
+                    "required": ["canonical_id", "id", "name", "aliases", "voice_facts", "look_facts", evidence_key],
                     "additionalProperties": False,
                 },
             }
@@ -128,24 +149,22 @@ def discovery_schema(known_ids: list[str]) -> dict:
 
 # ##################################################################
 # discovery prompt
-# keeps the full-book registry compact while the complete source excerpt proves each requested identity.
+# sends numbered immutable source sentences so model output remains compact and citations can be reconstructed exactly and locally.
 def discovery_prompt(chapters: list[Path], registry: dict, aliases: dict[str, str]) -> str:
     roster = "; ".join(f"{actor_id}={info.get('name', actor_id)}" for actor_id, info in sorted(registry.items()))
     approved_aliases = "; ".join(
         f"{alias}->{canonical}" for alias, canonical in sorted(aliases.items()) if alias != canonical
     )
-    excerpts = []
-    for chapter in chapters:
-        text = chapter.read_text(encoding="utf-8")
-        excerpts.append(f"### {chapter.name}\n{text}")
+    units = immutable_evidence_units(chapters)
+    excerpts = "\n".join(f"[{unit['id']}] {unit['quote']}" for unit in units)
     return f"""Extract every legitimate named or consistently role-named person/creature who speaks, has internal monologue, or is directly depicted in these source chapters. Do not invent a character for an unnamed crowd, pronoun, title, or a mere mention. Use the response schema only.
 
 Known canonical IDs (reuse a listed ID only when source evidence establishes it is the same identity): {roster or "(none)"}
 Approved source-audited aliases (always use their canonical target, never create the alias as a new identity): {approved_aliases or "(none)"}
 
-For a new identity, id must be lowercase underscore normalization of name. For an existing identity, canonical_id must be that exact known ID and id must repeat it. aliases are source spellings/titles for that same identity. Every evidence item MUST be a verbatim contiguous quote from these chapters which demonstrates the person or identity. voice_facts and look_facts may contain only facts supported by evidence or these chapters; use an empty string when unstated. Never infer a merge from similarity alone.
+For a new identity, id must be lowercase underscore normalization of name. For an existing identity, canonical_id must be that exact known ID and id must repeat it. aliases are source spellings/titles for that same identity. Select evidence_unit_ids only from the numbered source units. Do not copy, paraphrase, or quote source text: local code creates the exact citations from your selected IDs. name and every alias must be visibly supported by a selected unit. voice_facts and look_facts may contain only facts supported by selected units; use an empty string when unstated. Never infer a merge from similarity alone.
 
-SOURCE:\n{"\n\n".join(excerpts)}"""
+SOURCE EVIDENCE UNITS:\n{excerpts}"""
 
 
 # ##################################################################
@@ -167,6 +186,39 @@ def context_safe_batch(chapters: list[Path], start: int, registry: dict, aliases
     if not selected:
         raise RuntimeError("no source chapters fit the native model context")
     return selected, prompt
+
+
+# ##################################################################
+# materialize evidence discovery
+# turns schema-enumerated IDs into exact original citations before compatibility validation, preventing copied or paraphrased model quotations.
+def materialize_evidence_discovery(value: object, units: list[dict[str, str]]) -> tuple[dict, list[list[str]]]:
+    if not isinstance(value, dict) or set(value) != {"characters"} or not isinstance(value["characters"], list):
+        raise ValueError("evidence discovery response is not the exact object schema")
+    by_id = {unit["id"]: unit for unit in units}
+    if len(by_id) != len(units):
+        raise RuntimeError("immutable evidence unit IDs are not unique")
+    materialized: list[dict] = []
+    citations: list[list[str]] = []
+    expected = {"canonical_id", "id", "name", "aliases", "voice_facts", "look_facts", "evidence_unit_ids"}
+    for item in value["characters"]:
+        if not isinstance(item, dict) or set(item) != expected:
+            raise ValueError("evidence discovery contains an invalid character record")
+        selected = item["evidence_unit_ids"]
+        if not isinstance(selected, list) or not selected or len(selected) > 8 or any(
+            not isinstance(unit_id, str) or unit_id not in by_id for unit_id in selected
+        ):
+            raise ValueError("evidence discovery selected an invalid immutable evidence ID")
+        selected_units = [by_id[unit_id] for unit_id in selected]
+        labels = [item.get("name"), *(item.get("aliases") if isinstance(item.get("aliases"), list) else [])]
+        for label in labels:
+            if not isinstance(label, str) or not label.strip() or not any(
+                re.search(rf"(?<!\\w){re.escape(label.strip())}(?!\\w)", unit["quote"], re.IGNORECASE)
+                for unit in selected_units
+            ):
+                raise ValueError(f"discovery name or alias lacks selected source evidence: {label!r}")
+        materialized.append({key: item[key] for key in expected - {"evidence_unit_ids"}} | {"evidence": [unit["quote"] for unit in selected_units]})
+        citations.append(selected)
+    return {"characters": materialized}, citations
 
 
 # ##################################################################
@@ -483,6 +535,27 @@ def load_approved_cast(source: Path, project: Path | None = None) -> dict:
 
 
 # ##################################################################
+# validate preparation coverage
+# preserves every existing resumable buffer while rejecting duplicate, skipped, or source-drifted completed batches before a new request can append.
+def validate_preparation_coverage(progress: dict, chapters: list[Path]) -> None:
+    expected_start = 0
+    seen: set[str] = set()
+    for batch in progress.get("completed_batches", []):
+        if not isinstance(batch, dict) or set(batch) != {"start", "end", "chapter_sha256"}:
+            raise RuntimeError("cast preparation has an invalid completed batch record")
+        start, end, hashes = batch["start"], batch["end"], batch["chapter_sha256"]
+        if not isinstance(start, int) or not isinstance(end, int) or start != expected_start or end <= start or end > len(chapters):
+            raise RuntimeError("cast preparation completed batches do not have unique consecutive chapter coverage")
+        expected_hashes = {path.name: file_digest(path) for path in chapters[start:end]}
+        if not isinstance(hashes, dict) or hashes != expected_hashes or seen.intersection(hashes):
+            raise RuntimeError("cast preparation completed batches lack unique exact chapter hashes")
+        seen.update(hashes)
+        expected_start = end
+    if progress.get("next_chapter") != expected_start:
+        raise RuntimeError("cast preparation cursor does not match completed exact chapter coverage")
+
+
+# ##################################################################
 # prepare cast
 # resumes each bounded native-Ollama batch from durable progress and atomically publishes a freeze only after all chapters and assets validate.
 def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | None = None) -> dict:
@@ -511,6 +584,13 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
         progress = load_object(progress_path, "cast preparation progress")
         if progress.get("source_sha256") != source_sha or progress.get("chapter_count") != len(chapters):
             raise RuntimeError("cast preparation progress belongs to a different source")
+        if progress.get("version") not in {1, 2}:
+            raise RuntimeError("cast preparation progress has an unsupported version")
+        if progress.get("version") == 1:
+            # Version 2 changes only future discovery transport to immutable IDs;
+            # every prior registry, cursor, and completed batch stays intact.
+            progress["version"] = 2
+            atomic_json(progress_path, progress)
     else:
         base = load_object(project / "characters.json", "characters profile")
         registry = {
@@ -526,7 +606,7 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
         if not ANCHOR_IDS <= set(registry):
             raise RuntimeError("existing project is missing original Part 1 canonical anchors")
         progress = {
-            "version": 1,
+            "version": 2,
             "source_sha256": source_sha,
             "chapter_count": len(chapters),
             "next_chapter": 0,
@@ -535,6 +615,7 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
             "completed_batches": [],
         }
         atomic_json(progress_path, progress)
+    validate_preparation_coverage(progress, chapters)
     if not progress.get("audit_applied"):
         inactive, ambiguous = apply_alias_audit(project, source_text, progress["registry"], progress["aliases"])
         progress["registry"] = {
@@ -550,16 +631,16 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
     while int(progress["next_chapter"]) < len(chapters):
         start = int(progress["next_chapter"])
         batch, prompt = context_safe_batch(chapters, start, progress["registry"], progress["aliases"])
+        batch_units = immutable_evidence_units(batch)
         batch_text = "\n".join(path.read_text(encoding="utf-8") for path in batch)
         response = ask_sync(
             prompt,
             max_tokens=3500,
-            response_schema=discovery_schema(list(progress["registry"])),
+            response_schema=discovery_schema(list(progress["registry"]), [unit["id"] for unit in batch_units]),
         )
         try:
-            discoveries = validate_discovery(
-                json.loads(response), batch_text, set(progress["registry"]), ambiguous
-            )
+            materialized, evidence_unit_ids = materialize_evidence_discovery(json.loads(response), batch_units)
+            discoveries = validate_discovery(materialized, batch_text, set(progress["registry"]), ambiguous)
         except (ValueError, json.JSONDecodeError) as error:
             raise RuntimeError(
                 f"cast preparation batch {start}-{start + len(batch) - 1} rejected: {error}; response={response[:500]!r}"
@@ -568,7 +649,15 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
         with (project / DISCOVERIES_NAME).open("a", encoding="utf-8") as stream:
             stream.write(
                 json.dumps(
-                    {"start_chapter": start, "chapters": [path.name for path in batch], "discoveries": discoveries},
+                    {
+                        "start_chapter": start,
+                        "chapters": [path.name for path in batch],
+                        "evidence_units": [
+                            {"id": unit["id"], "chapter": unit["chapter"]} for unit in batch_units
+                        ],
+                        "evidence_unit_ids": evidence_unit_ids,
+                        "discoveries": discoveries,
+                    },
                     ensure_ascii=False,
                 )
                 + "\n"

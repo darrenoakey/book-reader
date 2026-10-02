@@ -13,12 +13,14 @@ from PIL import Image
 from src.cast_freeze import (
     ANCHOR_IDS,
     MANIFEST_NAME,
+    REJECTIONS_NAME,
     apply_alias_audit,
     asset_hashes,
     context_safe_batch,
     discovery_schema,
     immutable_evidence_units,
     materialize_evidence_discovery,
+    record_rejected_discovery,
     validate_discovery,
     validate_preparation_coverage,
     verify_frozen_cast,
@@ -133,7 +135,9 @@ def test_evidence_ids_materialize_exact_source_and_ground_names() -> None:
         materialized, citations = materialize_evidence_discovery(raw, units)
         assert citations == [[units[0]["id"]]]
         assert materialized["characters"][0]["evidence"] == ["Ren said, Hello."]
-        assert validate_discovery(materialized, chapter.read_text(encoding="utf-8"), set()) == materialized["characters"]
+        assert (
+            validate_discovery(materialized, chapter.read_text(encoding="utf-8"), set()) == materialized["characters"]
+        )
         raw["characters"][0]["aliases"] = ["Rin"]
         with pytest.raises(ValueError, match="lacks selected source evidence"):
             materialize_evidence_discovery(raw, units)
@@ -141,6 +145,52 @@ def test_evidence_ids_materialize_exact_source_and_ground_names() -> None:
         raw["characters"][0]["evidence_unit_ids"] = ["made_up"]
         with pytest.raises(ValueError, match="invalid immutable evidence ID"):
             materialize_evidence_discovery(raw, units)
+
+
+# ##################################################################
+# test audited global alias
+# permits an already source-audited alias for an existing canonical actor without letting the same absent label invent a new actor.
+def test_existing_canonical_can_use_only_approved_global_alias() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        chapter = Path(directory) / "01-part.txt"
+        chapter.write_text("The tiger boy watched the road.", encoding="utf-8")
+        units = immutable_evidence_units([chapter])
+        raw = {
+            "characters": [
+                {
+                    "canonical_id": "tiger_boy",
+                    "id": "tiger_boy",
+                    "name": "Jean",
+                    "aliases": ["Jean"],
+                    "voice_facts": "",
+                    "look_facts": "",
+                    "evidence_unit_ids": [units[0]["id"]],
+                }
+            ]
+        }
+        materialized, _ = materialize_evidence_discovery(raw, units, {"jean": "tiger_boy"})
+        assert materialized["characters"][0]["evidence"] == ["The tiger boy watched the road."]
+        raw["characters"][0]["canonical_id"] = "new"
+        raw["characters"][0]["id"] = "jean"
+        with pytest.raises(ValueError, match="lacks selected source evidence"):
+            materialize_evidence_discovery(raw, units, {"jean": "tiger_boy"})
+
+
+# ##################################################################
+# test rejected discovery audit
+# keeps the entire native response and immutable citations rather than truncating the data needed to diagnose a rejected batch.
+def test_rejected_discovery_audit_keeps_full_response_and_units() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        project = Path(directory)
+        chapter = project / "01-part.txt"
+        chapter.write_text("Ren said, Hello.", encoding="utf-8")
+        units = immutable_evidence_units([chapter])
+        response = "x" * 1200
+        record_rejected_discovery(project, 0, [chapter], units, response, ValueError("invalid alias"))
+        saved = json.loads((project / REJECTIONS_NAME).read_text(encoding="utf-8"))
+        assert saved["response"] == response
+        assert saved["evidence_units"] == units
+        assert saved["chapters"] == ["01-part.txt"]
 
 
 # ##################################################################

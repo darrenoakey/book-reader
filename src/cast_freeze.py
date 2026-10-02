@@ -24,6 +24,8 @@ DISCOVERIES_NAME = "cast_preparation_discoveries.jsonl"
 REJECTIONS_NAME = "cast_preparation_rejections.jsonl"
 BATCH_CHAPTERS = 6
 MAX_BATCH_CHARACTERS = 24
+EVIDENCE_REPAIR_ATTEMPTS = 2
+GENERIC_PRONOUN_ALIASES = frozenset({"i", "me", "my", "mine", "we", "us", "our", "ours", "you", "your", "yours", "he", "him", "his", "she", "her", "hers", "it", "its", "they", "them", "their", "theirs"})
 VOICE_PROFILE_BATCH_SIZE = 4
 # The router may use the primary's 32,768-token context on any request, not
 # only the backup's 40,960-token context. Two characters/token is deliberately
@@ -158,12 +160,12 @@ def discovery_prompt(chapters: list[Path], registry: dict, aliases: dict[str, st
     )
     units = immutable_evidence_units(chapters)
     excerpts = "\n".join(f"[{unit['id']}] {unit['quote']}" for unit in units)
-    return f"""Extract every legitimate named or consistently role-named person/creature who speaks, has internal monologue, or is directly depicted in these source chapters. Do not invent a character for an unnamed crowd, pronoun, title, or a mere mention. Use the response schema only.
+    return f"""Return ONLY a legitimate named or consistently role-named person/creature who is unknown to the registry, or a new source-backed alias for an existing actor. Do not repeat an unchanged known actor. Do not invent a character for an unnamed crowd, pronoun, title, or a mere mention. Use the response schema only.
 
 Known canonical IDs (reuse a listed ID only when source evidence establishes it is the same identity): {roster or "(none)"}
 Approved source-audited aliases (always use their canonical target, never create the alias as a new identity): {approved_aliases or "(none)"}
 
-For a new identity, id must be lowercase underscore normalization of name; its name and every alias must be visibly supported by a selected unit. For an existing identity, canonical_id must be that exact known ID and id must repeat it. Never introduce an alias for an existing identity: only repeat an approved source-audited alias that maps to that canonical ID, which may establish the identity globally even when absent from this batch. Select evidence_unit_ids only from the numbered source units. Do not copy, paraphrase, or quote source text: local code creates the exact citations from your selected IDs. voice_facts and look_facts may contain only facts supported by selected units; use an empty string when unstated. Never infer a merge from similarity alone.
+For a new identity, id must be lowercase underscore normalization of name; its name and every alias must be visibly supported by a selected unit. For an existing identity, canonical_id must be that exact known ID and id must repeat it. You may add a previously unknown alias only when selected units prove both the exact alias spelling and that it is the existing actor (a selected unit must name the canonical name or a pre-approved alias). Never use generic pronouns (including We) as aliases. A pre-approved source-audited alias may establish the identity globally even when absent from this batch. Select evidence_unit_ids only from the numbered source units. Do not copy, paraphrase, or quote source text: local code creates the exact citations from your selected IDs. voice_facts and look_facts may contain only facts supported by selected units; use an empty string when unstated. Never infer a merge from similarity alone.
 
 SOURCE EVIDENCE UNITS:\n{excerpts}"""
 
@@ -192,10 +194,32 @@ def context_safe_batch(
 
 
 # ##################################################################
+# source label present
+# requires a whole source label rather than accepting a coincidental substring in a selected immutable sentence.
+def source_label_present(label: str, units: list[dict[str, str]]) -> bool:
+    return any(re.search(rf"(?<!\\w){re.escape(label.strip())}(?!\\w)", unit["quote"], re.IGNORECASE) for unit in units)
+
+
+# ##################################################################
+# existing actor linked
+# proves a newly observed alias belongs to the selected existing actor by requiring a canonical name or prior audited spelling in the same evidence set.
+def existing_actor_linked(
+    canonical: str, units: list[dict[str, str]], registry: dict[str, dict] | None, approved_aliases: dict[str, str]
+) -> bool:
+    entry = (registry or {}).get(canonical, {})
+    labels = [canonical.replace("_", " "), str(entry.get("name", ""))]
+    labels.extend(alias for alias, target in approved_aliases.items() if target == canonical)
+    return any(label.strip() and normalized_id(label) not in GENERIC_PRONOUN_ALIASES and source_label_present(label, units) for label in labels)
+
+
+# ##################################################################
 # materialize evidence discovery
-# turns schema-enumerated IDs into exact original citations before compatibility validation, allowing only pre-audited global aliases for existing identities.
+# turns schema-enumerated IDs into exact original citations before compatibility validation, allowing audited aliases and source-linked new variants for existing actors.
 def materialize_evidence_discovery(
-    value: object, units: list[dict[str, str]], approved_aliases: dict[str, str] | None = None
+    value: object,
+    units: list[dict[str, str]],
+    approved_aliases: dict[str, str] | None = None,
+    registry: dict[str, dict] | None = None,
 ) -> tuple[dict, list[list[str]]]:
     if not isinstance(value, dict) or set(value) != {"characters"} or not isinstance(value["characters"], list):
         raise ValueError("evidence discovery response is not the exact object schema")
@@ -218,24 +242,28 @@ def materialize_evidence_discovery(
             raise ValueError("evidence discovery selected an invalid immutable evidence ID")
         selected_units = [by_id[unit_id] for unit_id in selected]
         canonical = item.get("canonical_id")
-        labels = [item.get("name"), *(item.get("aliases") if isinstance(item.get("aliases"), list) else [])]
+        aliases = item.get("aliases")
+        labels = [item.get("name"), *(aliases if isinstance(aliases, list) else [])]
+        alias_map = approved_aliases or {}
         for label in labels:
-            appears_in_selected_source = (
-                isinstance(label, str)
-                and label.strip()
-                and any(
-                    re.search(rf"(?<!\\w){re.escape(label.strip())}(?!\\w)", unit["quote"], re.IGNORECASE)
-                    for unit in selected_units
-                )
-            )
+            appears_in_selected_source = isinstance(label, str) and label.strip() and source_label_present(label, selected_units)
             globally_approved_existing_alias = (
                 canonical != "new"
                 and isinstance(canonical, str)
                 and isinstance(label, str)
-                and (approved_aliases or {}).get(normalized_id(label)) == canonical
+                and alias_map.get(normalized_id(label)) == canonical
             )
             if not appears_in_selected_source and not globally_approved_existing_alias:
                 raise ValueError(f"discovery name or alias lacks selected source evidence: {label!r}")
+        if canonical != "new" and isinstance(canonical, str) and isinstance(aliases, list):
+            for alias in aliases:
+                alias_id = normalized_id(alias) if isinstance(alias, str) else ""
+                if alias_id in GENERIC_PRONOUN_ALIASES and alias_map.get(alias_id) != canonical:
+                    raise ValueError(f"discovery has unapproved generic pronoun alias: {alias!r}")
+                if alias_map.get(alias_id) != canonical and not existing_actor_linked(
+                    canonical, selected_units, registry, alias_map
+                ):
+                    raise ValueError(f"discovery alias lacks selected actor link for {canonical}: {alias!r}")
         materialized.append(
             {key: item[key] for key in expected - {"evidence_unit_ids"}}
             | {"evidence": [unit["quote"] for unit in selected_units]}
@@ -245,14 +273,22 @@ def materialize_evidence_discovery(
 
 
 # ##################################################################
+# repair prompt
+# makes at most two schema-format corrections against the same complete immutable source units without retrying production discovery indefinitely.
+def repair_prompt(error: Exception, chapters: list[Path], registry: dict, aliases: dict[str, str]) -> str:
+    return f"""Your immediately prior discovery JSON was rejected by local validation: {error}. Return a replacement JSON object containing ONLY the unknown actors or new source-backed aliases that remain valid. Correct every unsupported label: include its exact witness evidence_unit_id and, for a new alias of an existing actor, an additional selected unit proving the actor link; otherwise omit that label. Generic pronouns are never aliases.\n\n{discovery_prompt(chapters, registry, aliases)}"""
+
+
+# ##################################################################
 # record rejected discovery
-# retains the complete native response and immutable unit citations so a failed batch is auditable without a lossy exception snippet.
+# retains every complete native response and immutable unit citations so each original or repair failure is auditable without a lossy exception snippet.
 def record_rejected_discovery(
-    project: Path, start: int, batch: list[Path], units: list[dict[str, str]], response: str, error: Exception
+    project: Path, start: int, batch: list[Path], units: list[dict[str, str]], response: str, error: Exception, attempt: int
 ) -> None:
     payload = {
         "start_chapter": start,
         "chapters": [path.name for path in batch],
+        "attempt": attempt,
         "error": str(error),
         "evidence_units": units,
         "response": response,
@@ -679,19 +715,29 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
         response = ask_sync(
             prompt,
             max_tokens=3500,
+            max_attempts=1,
             response_schema=discovery_schema(list(progress["registry"]), [unit["id"] for unit in batch_units]),
         )
-        try:
-            materialized, evidence_unit_ids = materialize_evidence_discovery(
-                json.loads(response), batch_units, progress["aliases"]
-            )
-            discoveries = validate_discovery(materialized, batch_text, set(progress["registry"]), ambiguous)
-        except (ValueError, json.JSONDecodeError) as error:
-            record_rejected_discovery(project, start, batch, batch_units, response, error)
-            raise RuntimeError(
-                f"cast preparation batch {start}-{start + len(batch) - 1} rejected; full response and citations saved to "
-                f"{project / REJECTIONS_NAME}: {error}"
-            ) from error
+        for attempt in range(EVIDENCE_REPAIR_ATTEMPTS + 1):
+            try:
+                materialized, evidence_unit_ids = materialize_evidence_discovery(
+                    json.loads(response), batch_units, progress["aliases"], progress["registry"]
+                )
+                discoveries = validate_discovery(materialized, batch_text, set(progress["registry"]), ambiguous)
+                break
+            except (ValueError, json.JSONDecodeError) as error:
+                record_rejected_discovery(project, start, batch, batch_units, response, error, attempt)
+                if attempt == EVIDENCE_REPAIR_ATTEMPTS:
+                    raise RuntimeError(
+                        f"cast preparation batch {start}-{start + len(batch) - 1} rejected after {attempt} repairs; full responses "
+                        f"and citations saved to {project / REJECTIONS_NAME}: {error}"
+                    ) from error
+                response = ask_sync(
+                    repair_prompt(error, batch, progress["registry"], progress["aliases"]),
+                    max_tokens=1200,
+                    max_attempts=1,
+                    response_schema=discovery_schema(list(progress["registry"]), [unit["id"] for unit in batch_units]),
+                )
         apply_discoveries(progress["registry"], progress["aliases"], discoveries)
         with (project / DISCOVERIES_NAME).open("a", encoding="utf-8") as stream:
             stream.write(

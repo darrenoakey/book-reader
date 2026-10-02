@@ -17,10 +17,12 @@ from src.cast_freeze import (
     apply_alias_audit,
     asset_hashes,
     context_safe_batch,
+    discovery_prompt,
     discovery_schema,
     immutable_evidence_units,
     materialize_evidence_discovery,
     record_rejected_discovery,
+    repair_prompt,
     validate_discovery,
     validate_preparation_coverage,
     verify_frozen_cast,
@@ -112,6 +114,20 @@ def test_discovery_schema_is_closed_and_known_canonical_only() -> None:
 
 
 # ##################################################################
+# test discovery reduction and repair
+# keeps normal batch output focused on additions and makes a repair carry a concrete validation failure plus the same numbered source units.
+def test_discovery_prompt_requests_only_additions_and_repair_has_error() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        chapter = Path(directory) / "01-part.txt"
+        chapter.write_text("Ren spoke.", encoding="utf-8")
+        prompt = discovery_prompt([chapter], {"ren": {"name": "Ren"}}, {"ren": "ren"})
+        repair = repair_prompt(ValueError("missing c00s00000"), [chapter], {"ren": {"name": "Ren"}}, {"ren": "ren"})
+        assert "Do not repeat an unchanged known actor" in prompt
+        assert "missing c00s00000" in repair
+        assert "[c00s00000] Ren spoke." in repair
+
+
+# ##################################################################
 # test immutable evidence materialization
 # proves the native schema can only select source IDs and local code writes the byte-exact source sentence rather than LLM-provided prose.
 def test_evidence_ids_materialize_exact_source_and_ground_names() -> None:
@@ -177,6 +193,53 @@ def test_existing_canonical_can_use_only_approved_global_alias() -> None:
 
 
 # ##################################################################
+# test selected alias actor link
+# accepts a new existing-actor spelling only when its own source unit and a canonical or approved spelling are both selected.
+def test_existing_alias_requires_selected_exact_witness_and_actor_link() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        chapter = Path(directory) / "01-part.txt"
+        chapter.write_text("Weey began drawing. Professor Weii taught the class.", encoding="utf-8")
+        units = immutable_evidence_units([chapter])
+        raw = {
+            "characters": [
+                {
+                    "canonical_id": "professor_wei",
+                    "id": "professor_wei",
+                    "name": "Professor Wei",
+                    "aliases": ["Weey"],
+                    "voice_facts": "",
+                    "look_facts": "",
+                    "evidence_unit_ids": [unit["id"] for unit in units],
+                }
+            ]
+        }
+        materialized, _ = materialize_evidence_discovery(
+            raw,
+            units,
+            {"weii": "professor_wei", "professor_wei": "professor_wei"},
+            {"professor_wei": {"name": "Professor Wei"}},
+        )
+        assert materialized["characters"][0]["aliases"] == ["Weey"]
+        raw["characters"][0]["evidence_unit_ids"] = [units[0]["id"]]
+        with pytest.raises(ValueError, match="lacks selected actor link"):
+            materialize_evidence_discovery(
+                raw,
+                units,
+                {"weii": "professor_wei", "professor_wei": "professor_wei"},
+                {"professor_wei": {"name": "Professor Wei"}},
+            )
+        raw["characters"][0]["aliases"] = ["We"]
+        raw["characters"][0]["evidence_unit_ids"] = [unit["id"] for unit in units]
+        with pytest.raises(ValueError, match="generic pronoun"):
+            materialize_evidence_discovery(
+                raw,
+                units,
+                {"weii": "professor_wei", "professor_wei": "professor_wei"},
+                {"professor_wei": {"name": "Professor Wei"}},
+            )
+
+
+# ##################################################################
 # test rejected discovery audit
 # keeps the entire native response and immutable citations rather than truncating the data needed to diagnose a rejected batch.
 def test_rejected_discovery_audit_keeps_full_response_and_units() -> None:
@@ -186,9 +249,10 @@ def test_rejected_discovery_audit_keeps_full_response_and_units() -> None:
         chapter.write_text("Ren said, Hello.", encoding="utf-8")
         units = immutable_evidence_units([chapter])
         response = "x" * 1200
-        record_rejected_discovery(project, 0, [chapter], units, response, ValueError("invalid alias"))
+        record_rejected_discovery(project, 0, [chapter], units, response, ValueError("invalid alias"), 1)
         saved = json.loads((project / REJECTIONS_NAME).read_text(encoding="utf-8"))
         assert saved["response"] == response
+        assert saved["attempt"] == 1
         assert saved["evidence_units"] == units
         assert saved["chapters"] == ["01-part.txt"]
 

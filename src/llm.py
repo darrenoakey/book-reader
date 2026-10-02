@@ -80,7 +80,13 @@ def load_router_config(path: Path) -> RouterConfig:
         num_ctx = int(values.get(f"{name}_num_ctx", default_ctx))
         think = bool(values.get(f"{name}_think", False))
         identity = values.get(f"{name}_identity")
-        if not url.startswith(("http://", "https://")) or not ping_host or not model or style not in {"openai", "ollama"} or num_ctx < 1024:
+        if (
+            not url.startswith(("http://", "https://"))
+            or not ping_host
+            or not model
+            or style not in {"openai", "ollama"}
+            or num_ctx < 1024
+        ):
             raise ValueError(f"local/config.toml [llm] has invalid {name} backend")
         return Backend(url, ping_host, model, style, num_ctx, think, str(identity) if identity else None)
 
@@ -96,14 +102,56 @@ LLM_HOST, LLM_MODEL, MAX_CONCURRENT, LLM_STYLE = load_llm_config(_CONFIG_PATH)
 
 
 # ##################################################################
+# classify ping result
+# distinguish ordinary ICMP nonresponse from a local execution denial so policy never turns a broken probe into backup permission.
+def classify_ping_result(returncode: int, output: str, target: str) -> bool:
+    if returncode == 0:
+        return True
+    detail = output.strip().lower()
+    denied = ("permission denied", "operation not permitted", "not permitted")
+    unreachable = (
+        "packet loss",
+        "request timeout",
+        "host is down",
+        "no route to host",
+        "unreachable",
+        "unknown host",
+        "cannot resolve",
+    )
+    if any(marker in detail for marker in denied):
+        raise RuntimeError(
+            f"ICMP probe denied for target {target}: {output.strip() or 'permission denied'}; repair ping permission before LLM routing"
+        )
+    if any(marker in detail for marker in unreachable):
+        return False
+    raise RuntimeError(
+        f"ICMP probe invalid for target {target}: {output.strip() or f'exit {returncode}'}; repair /sbin/ping before LLM routing"
+    )
+
+
+# ##################################################################
 # ping host
-# use bounded ICMP only; a failed or malformed probe is fail-closed and is never inferred from an HTTP outcome.
+# use bounded ICMP only; genuine nonresponse returns false while denied, missing, and malformed probes stop routing explicitly.
 def ping_host(host: str) -> bool:
     try:
-        result = subprocess.run(["/sbin/ping", "-c", "1", "-W", "500", host], capture_output=True, timeout=2, check=False)
-    except (OSError, subprocess.TimeoutExpired):
+        result = subprocess.run(
+            ["/sbin/ping", "-c", "1", "-W", "500", host], capture_output=True, text=True, timeout=2, check=False
+        )
+    except subprocess.TimeoutExpired:
         return False
-    return result.returncode == 0
+    except PermissionError as error:
+        raise RuntimeError(
+            f"ICMP probe denied for target {host}: {error}; repair ping permission before LLM routing"
+        ) from error
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            f"ICMP probe missing for target {host}: {error}; repair /sbin/ping before LLM routing"
+        ) from error
+    except OSError as error:
+        raise RuntimeError(
+            f"ICMP probe failed for target {host}: {error}; repair /sbin/ping before LLM routing"
+        ) from error
+    return classify_ping_result(result.returncode, result.stdout + result.stderr, host)
 
 
 # ##################################################################
@@ -115,7 +163,9 @@ def backup_identity_matches(backend: Backend) -> bool:
     if backend.ping_host not in {"127.0.0.1", "localhost", "::1"}:
         return True
     try:
-        result = subprocess.run(["/usr/sbin/scutil", "--get", "LocalHostName"], capture_output=True, text=True, timeout=2, check=False)
+        result = subprocess.run(
+            ["/usr/sbin/scutil", "--get", "LocalHostName"], capture_output=True, text=True, timeout=2, check=False
+        )
     except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0 and result.stdout.strip() == backend.expected_identity
@@ -142,23 +192,47 @@ def strip_think(text: str) -> str:
 # ##################################################################
 # request payload
 # rebuild from the selected backend on every retry so model/style/context never leak from a previous route.
-def request_for(backend: Backend, messages: list[dict], temperature: float, max_tokens: int, response_schema: dict | None) -> tuple[str, bytes]:
+def request_for(
+    backend: Backend, messages: list[dict], temperature: float, max_tokens: int, response_schema: dict | None
+) -> tuple[str, bytes]:
     if backend.style == "ollama":
-        request: dict = {"model": backend.model, "messages": messages, "think": backend.think, "stream": False, "options": {"temperature": temperature, "num_predict": max_tokens, "num_ctx": backend.num_ctx}}
+        request: dict = {
+            "model": backend.model,
+            "messages": messages,
+            "think": backend.think,
+            "stream": False,
+            "options": {"temperature": temperature, "num_predict": max_tokens, "num_ctx": backend.num_ctx},
+        }
         if response_schema is not None:
             request["format"] = response_schema
         return f"{backend.url}/api/chat", json.dumps(request).encode("utf-8")
     request = {"model": backend.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
     if response_schema is not None:
-        request["response_format"] = {"type": "json_schema", "json_schema": {"name": "response", "strict": True, "schema": response_schema}}
+        request["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "response", "strict": True, "schema": response_schema},
+        }
     return f"{backend.url}/v1/chat/completions", json.dumps(request).encode("utf-8")
 
 
 # ##################################################################
 # ask sync
 # make a central native request; only a fresh ICMP result may select backup, while permanent HTTP errors stop after a bounded number of attempts.
-def ask_sync(prompt: str, system: str | None = None, temperature: float = 0.2, max_tokens: int = 4096, timeout: float = 300.0, response_schema: dict | None = None, *, config: RouterConfig = ROUTER_CONFIG, max_attempts: int | None = None, routing_events: list[str] | None = None) -> str:
-    messages: list[dict] = ([] if not system else [{"role": "system", "content": system}]) + [{"role": "user", "content": prompt}]
+def ask_sync(
+    prompt: str,
+    system: str | None = None,
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+    timeout: float = 300.0,
+    response_schema: dict | None = None,
+    *,
+    config: RouterConfig = ROUTER_CONFIG,
+    max_attempts: int | None = None,
+    routing_events: list[str] | None = None,
+) -> str:
+    messages: list[dict] = ([] if not system else [{"role": "system", "content": system}]) + [
+        {"role": "user", "content": prompt}
+    ]
     attempt = permanent_failures = 0
     while max_attempts is None or attempt < max_attempts:
         attempt += 1
@@ -167,19 +241,31 @@ def ask_sync(prompt: str, system: str | None = None, temperature: float = 0.2, m
             routing_events.append(backend.model)
         url, payload = request_for(backend, messages, temperature, max_tokens, response_schema)
         try:
-            request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+            request = urllib.request.Request(
+                url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+            )
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 data = json.loads(response.read().decode("utf-8"))
-            content = (data.get("message") or {}).get("content", "") if backend.style == "ollama" else ((data.get("choices") or [{}])[0].get("message", {}).get("content", ""))
+            content = (
+                (data.get("message") or {}).get("content", "")
+                if backend.style == "ollama"
+                else ((data.get("choices") or [{}])[0].get("message", {}).get("content", ""))
+            )
             content = strip_think(content or "")
             if content:
                 return content
             raise RuntimeError("empty completion")
         except urllib.error.HTTPError as error:
+            if error.code in {401, 403}:
+                raise RuntimeError(
+                    f"LLM endpoint {url} denied action (HTTP {error.code}); check endpoint authorization"
+                ) from error
             if 400 <= error.code < 500:
                 permanent_failures += 1
                 if permanent_failures >= PERMANENT_HTTP_ATTEMPTS:
-                    raise RuntimeError(f"LLM {backend.model} returned permanent HTTP {error.code} after {attempt} attempts") from error
+                    raise RuntimeError(
+                        f"LLM {backend.model} returned permanent HTTP {error.code} after {attempt} attempts"
+                    ) from error
             print(f"  llm ({backend.model}) HTTP {error.code}; retrying selected route")
         except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError, RuntimeError) as error:
             print(f"  llm ({backend.model}) attempt {attempt} failed: {error}; retrying selected route")
@@ -200,9 +286,17 @@ def _semaphore() -> asyncio.Semaphore:
 # ##################################################################
 # ask async
 # preserve central routing for all coroutine callers by delegating exactly to ask_sync in a worker thread.
-async def ask_async(prompt: str, system: str | None = None, temperature: float = 0.2, max_tokens: int = 4096, response_schema: dict | None = None) -> str:
+async def ask_async(
+    prompt: str,
+    system: str | None = None,
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+    response_schema: dict | None = None,
+) -> str:
     async with _semaphore():
-        return await asyncio.get_running_loop().run_in_executor(None, lambda: ask_sync(prompt, system, temperature, max_tokens, response_schema=response_schema))
+        return await asyncio.get_running_loop().run_in_executor(
+            None, lambda: ask_sync(prompt, system, temperature, max_tokens, response_schema=response_schema)
+        )
 
 
 # Backward-compatible public name for pipeline modules already importing ask.

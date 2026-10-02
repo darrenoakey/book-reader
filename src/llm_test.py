@@ -11,8 +11,10 @@ from src.llm import (
     RouterConfig,
     ask_async,
     ask_sync,
+    classify_ping_result,
     load_llm_config,
     load_router_config,
+    ping_host,
     request_for,
     select_backend,
     strip_think,
@@ -40,12 +42,44 @@ def test_load_router_config() -> None:
 
 
 # ##################################################################
+# test real unreachable ping
+# a genuine ICMP nonresponse is the only normal condition that permits selecting backup.
+def test_ping_host_real_unreachable_is_false() -> None:
+    assert ping_host("203.0.113.1") is False
+
+
+# ##################################################################
+# test probe denial classification
+# pure probe-result policy must fail closed on local denial or malformed output rather than silently choosing backup.
+def test_ping_denial_and_invalid_probe_fail_closed() -> None:
+    with pytest.raises(RuntimeError, match="denied for target primary"):
+        classify_ping_result(2, "ping: sendto: Operation not permitted", "primary")
+    with pytest.raises(RuntimeError, match="invalid for target primary"):
+        classify_ping_result(64, "usage: ping", "primary")
+    assert classify_ping_result(2, "1 packets transmitted, 0 packets received, 100.0% packet loss", "primary") is False
+
+
+# ##################################################################
 # test live backup schema chat
 # prove the verified loopback native Ollama model accepts strict JSON schema and the full configured context payload.
 def test_backup_native_schema_chat() -> None:
-    config = RouterConfig(Backend("http://203.0.113.1:11434", "203.0.113.1", "absent", "ollama", 32768, False), BACKUP, 1)
-    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": False}
-    response = ask_sync("Reply with the JSON object {\"ok\":true} only.", response_schema=schema, max_tokens=64, timeout=90, config=config, max_attempts=1)
+    config = RouterConfig(
+        Backend("http://203.0.113.1:11434", "203.0.113.1", "absent", "ollama", 32768, False), BACKUP, 1
+    )
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+    response = ask_sync(
+        'Reply with the JSON object {"ok":true} only.',
+        response_schema=schema,
+        max_tokens=64,
+        timeout=90,
+        config=config,
+        max_attempts=1,
+    )
     assert response == '{"ok":true}'
 
 
@@ -53,7 +87,9 @@ def test_backup_native_schema_chat() -> None:
 # test pingable primary http 404 never switches
 # a live loopback primary that returns model-not-found stays selected; backup availability cannot override a successful ICMP probe.
 def test_pingable_primary_http_404_does_not_fallback() -> None:
-    primary = Backend("http://127.0.0.1:11434", "127.0.0.1", "book-reader-intentionally-missing-model", "ollama", 40960, False)
+    primary = Backend(
+        "http://127.0.0.1:11434", "127.0.0.1", "book-reader-intentionally-missing-model", "ollama", 40960, False
+    )
     events: list[str] = []
     with pytest.raises(RuntimeError, match="permanent HTTP 404"):
         ask_sync("hello", config=RouterConfig(primary, BACKUP, 1), timeout=10, max_attempts=2, routing_events=events)

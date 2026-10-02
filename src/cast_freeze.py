@@ -658,6 +658,7 @@ def verify_proposed_living_entities(batch_units: list[dict], discoveries: list[d
 # decides each pending mention separately (exact chapter/quote scope, never a global label alias), and persists the interpretive record before any mapping uses it.
 SCOPED_AUDIT_NAME = "mention-scoped-audit.json"
 ADJUDICATION_MENTIONS_PER_CALL = 12
+ADJUDICATION_MAX_ROUNDS = 4
 ADJUDICATION_MIN_CONFIDENCE = 0.7
 ADJUDICATION_SCENE_CHARS = 2400
 ADJUDICATION_OWNER_FACT_CHARS = 700
@@ -729,7 +730,9 @@ def scoped_audit_attestation(records: list[dict]) -> dict:
     return {"version": 1, "count": len(ordered), "sha256": json_digest(ordered)}
 
 
-def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[dict], registry: dict, ask, aliases: dict | None = None) -> None:
+def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[dict], registry: dict, ask, aliases: dict | None = None) -> int:
+    """Adjudicate every pending mention lacking a binding decision; returns the number of audit records written (0 means no new context)."""
+    written = 0
     references = immutable_name_references(units)
     units_by_id = {unit["id"]: unit for unit in units}
     order = [unit["id"] for unit in units]
@@ -791,8 +794,10 @@ def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[
                     records[:] = [item for item in records if item is not prior]
                 records.append(record)
                 known[scope] = record
+                written += 1
             mention_scoped_audit_index(records)
             atomic_json(project / SCOPED_AUDIT_NAME, {"records": records})
+    return written
 
 
 # ##################################################################
@@ -801,7 +806,7 @@ def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[
 def discover_batch(project: Path, start: int, batch: list[Path], batch_units: list[dict[str, str]], batch_text: str, progress: dict, ambiguous: set[str], prompt: str | None = None, ask=None) -> tuple[list[dict], list[dict]]:
     del ambiguous, prompt
     ask = ask or ask_sync
-    for adjudication_round in range(2):
+    for adjudication_round in range(ADJUDICATION_MAX_ROUNDS):
         candidates = candidate_coverage_ledger(batch_units, progress["registry"], progress["aliases"], load_scoped_audit(project))
         if not candidates:
             return [], []
@@ -820,7 +825,7 @@ def discover_batch(project: Path, start: int, batch: list[Path], batch_units: li
             response = ask(chunk_prompt, max_tokens=1800, max_attempts=1, response_schema=schema)
             for attempt in range(EVIDENCE_REPAIR_ATTEMPTS + 1):
                 try:
-                    records.extend(validate_classification_chunk(json.loads(response), chunk, progress["registry"], progress["aliases"], candidates, batch_units, pending if adjudication_round == 0 else None))
+                    records.extend(validate_classification_chunk(json.loads(response), chunk, progress["registry"], progress["aliases"], candidates, batch_units, pending))
                     break
                 except (ValueError, json.JSONDecodeError) as error:
                     record_rejected_discovery(project, start, batch, batch_units, response, RuntimeError(f"chunk {chunk_index}: {error}"), attempt)
@@ -829,7 +834,11 @@ def discover_batch(project: Path, start: int, batch: list[Path], batch_units: li
                     response = ask(f"Your chunk classification was rejected: {error}. Return the complete schema object for this chunk only.\n\n{chunk_prompt}", max_tokens=1800, max_attempts=1, response_schema=schema)
         if not pending:
             break
-        adjudicate_pending_mentions(project, pending, batch_units, progress["registry"], ask, progress["aliases"])
+        # monotonic: only mentions without a binding decision are adjudicated, so a round that writes nothing has no new context and cannot change the next classification
+        if not adjudicate_pending_mentions(project, pending, batch_units, progress["registry"], ask, progress["aliases"]):
+            break
+        if adjudication_round == ADJUDICATION_MAX_ROUNDS - 1:
+            raise RuntimeError(f"scoped adjudication did not converge within {ADJUDICATION_MAX_ROUNDS} classification rounds")
     discoveries, classifications = materialize_classifications({"classifications": records}, batch_units, candidates, progress["registry"], progress["aliases"])
     approved = verify_proposed_living_entities(batch_units, discoveries, ask)
     rejected = {item["id"] for item in discoveries} - approved

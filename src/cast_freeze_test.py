@@ -654,6 +654,59 @@ def test_discover_batch_adjudicates_each_mention_and_persists_before_mapping(tmp
 
 
 # ##################################################################
+# monotonic scoped adjudication loop on the production audit snapshot
+# a label first classified as a non-character and only proposed as an unapproved known alias in a later classification round is adjudicated rather than failing, while the 53 real audit records stay intact.
+def test_discover_batch_adjudicates_second_round_darling_with_production_snapshot(tmp_path: Path) -> None:
+    from src.cast_freeze import SCOPED_AUDIT_NAME, discover_batch
+
+    snapshot = Path(__file__).parent / "testdata" / "weakest_scoped_audit_snapshot.json"
+    records_before = json.loads(snapshot.read_text())["records"]
+    assert len(records_before) == 53
+    (tmp_path / SCOPED_AUDIT_NAME).write_text(snapshot.read_text())
+    chapter = tmp_path / "ch1.txt"
+    chapter.write_text("Young bowed to the king. Darling, said Mother softly.", encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    progress = {"registry": {"young_ren": {"name": "Young Ren"}, "mother": {"name": "Mother", "voice_facts": "Darling is what Mother calls her child."}}, "aliases": {}}
+    darling_rounds = {"count": 0}
+
+    def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
+        schema = response_schema or {}
+        if "mentions" in schema["properties"]:
+            rows = []
+            for line in prompt.splitlines():
+                if line.startswith("m") and "mention:" in line:
+                    darling = "Darling" in line
+                    rows.append({"mention_id": line.split()[0], "refers_to_person": "yes", "candidate_kind": "individual_name", "decision": "alias", "canonical": "mother" if darling else "young_ren", "confidence": 0.9, "reason": "context"})
+            return json.dumps({"mentions": rows})
+        out = []
+        for option in schema["properties"]["classifications"]["items"]["oneOf"]:
+            branches = option.get("oneOf", [option])
+            cid = branches[0]["properties"]["candidate_id"]["enum"][0]
+            row = next(line for line in prompt.splitlines() if line.startswith(cid + " label="))
+            witness = row.split("witnesses: [")[1].split("]")[0]
+            label = row.split("label='")[1].split("'")[0]
+            statuses = {b["properties"]["status"]["enum"][0]: b["properties"] for b in branches}
+            if len(branches) == 1:
+                status = next(iter(statuses))
+            elif label == "Darling":
+                darling_rounds["count"] += 1
+                status = "known" if darling_rounds["count"] > 1 and "known" in statuses else "non_character" if "non_character" in statuses else next(iter(statuses))
+            elif label == "Young":
+                status = "known" if "known" in statuses else "non_character"
+            else:
+                status = "new"
+            identity = statuses[status]["identity"]["enum"]
+            target = "mother" if label == "Darling" and "mother" in identity else "young_ren" if "young_ren" in identity else identity[0]
+            out.append({"candidate_id": cid, "status": status, "identity": target, "evidence_unit_ids": [witness]})
+        return json.dumps({"classifications": out})
+
+    discover_batch(tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=ask)
+    after = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert all(record in after for record in records_before)
+    assert any(record["label"] == "Darling" and record["decision"] == "alias" and record["canonical"] == "mother" for record in after)
+
+
+# ##################################################################
 # scoped audit freeze attestation
 # the freeze manifest attests the exact scoped record set: appended, altered, or removed records fail closed, and only validated alias records become exact references.
 def test_freeze_attests_scoped_audit_and_exports_exact_references() -> None:

@@ -172,11 +172,69 @@ def mention_scoped_audit_index(records: object) -> dict[tuple[str, str, str, int
     for record in records:
         if not isinstance(record, dict) or any(not isinstance(record.get(field), str) or not record[field] for field in SCOPED_AUDIT_FIELDS if field != "confidence") or not isinstance(record.get("confidence"), (int, float)) or type(record.get("span_start")) is not int or record["span_start"] < 0:
             raise ValueError("mention-scoped audit record is incomplete")
+        if "owners" in record and (not isinstance(record["owners"], list) or not all(isinstance(owner, str) for owner in record["owners"])):
+            raise ValueError("mention-scoped audit record has invalid offered owners")
+        if "history" in record and (not isinstance(record["history"], list) or not all(isinstance(item, dict) and isinstance(item.get("decision"), str) and isinstance(item.get("reason"), str) for item in record["history"])):
+            raise ValueError("mention-scoped audit record has invalid history")
         scope = (record["chapter_sha256"], record["quote_sha256"], record["label"], record["span_start"])
         if scope in index and index[scope] != record:
             raise ValueError("mention-scoped audit has conflicting records for one mention")
         index[scope] = record
     return index
+
+
+NON_NAME_COMPOUND_WORDS = frozenset(word.casefold() for word in NON_NAME_COMPOUND_PREFIXES)
+ADJUDICATION_ROSTER_MAX = 40
+ADJUDICATION_SNIPPET_CHARS = 80
+
+
+def label_components(text: str) -> set[str]:
+    """Normalized name words of a label, without articles/prepositions that are not part of a name."""
+    return {normalized_id(word) for word in re.split(r"[\s_]+", text) if len(word) > 1 and word.casefold() not in NON_NAME_COMPOUND_WORDS}
+
+
+def adjudication_owners(label: str, registry: dict, aliases: dict | None = None, proposed: str | None = None) -> list[str]:
+    """Candidate canonical owners for one label, led by the primary's contextual proposal, then exact name-word
+    matches, any shared name component (Ren Dove -> ren), the audited alias owner, and, only when none of those exist, a bounded
+    roster of the whole canonical cast (Mom -> mother) ordered so owners whose own profile/facts mention the label come first."""
+    label_id = normalized_id(label)
+    components = label_components(label)
+    owners: list[str] = []
+
+    def add(actor_id: str | None) -> None:
+        if actor_id in registry and actor_id != "narrator" and actor_id not in owners:
+            owners.append(actor_id)
+
+    for actor_id, info in sorted(registry.items()):
+        words = {normalized_id(word) for word in str(info.get("name", actor_id)).split()} | set(actor_id.split("_"))
+        if label_id in words or components & words:
+            add(actor_id)
+    add((aliases or {}).get(label_id))
+    if not owners:
+        needle = label.casefold()
+        mentioning = [actor_id for actor_id, info in sorted(registry.items()) if needle in json.dumps(info, ensure_ascii=False).casefold()]
+        for actor_id in [*mentioning, *sorted(registry)]:
+            add(actor_id)
+        del owners[ADJUDICATION_ROSTER_MAX:]
+    if proposed in registry and proposed != "narrator":
+        # the proposal leads but never narrows: the offered set always covers the proposal-free set, so staleness is decidable without it
+        if proposed in owners:
+            owners.remove(proposed)
+        owners.insert(0, proposed)
+    return owners
+
+
+def readjudication_due(record: dict, owners: list[str]) -> bool:
+    """A cached ambiguous decision is stale when it never saw (or was not offered) every owner now plausible for the label."""
+    if record["decision"] != "ambiguous" or not owners:
+        return False
+    offered = record.get("owners")
+    return not (isinstance(offered, list) and set(owners) <= set(offered))
+
+
+def scope_final(candidate: dict) -> bool:
+    """True when the candidate's cached scoped decision is binding rather than awaiting re-adjudication."""
+    return bool(candidate.get("scoped_audit")) and not candidate.get("scoped_stale")
 
 
 def scoped_alias_approved(candidate: dict, canonical: str) -> bool:
@@ -201,8 +259,10 @@ def candidate_coverage_ledger(units: list[dict[str, str]], registry: dict[str, d
         record = scoped.get(mention_scope(unit, reference)) if scoped else None
         if record:
             key = f"{key}@{record['decision']}:{record['canonical']}"
-        candidate = grouped.setdefault(key, {"label": label, "ref_ids": [], "has_standalone": False, "scoped": record})
+        candidate = grouped.setdefault(key, {"label": label, "ref_ids": [], "has_standalone": False, "scoped": record, "records": []})
         candidate["ref_ids"].append(ref_id)
+        if record:
+            candidate["records"].append(record)
         candidate["has_standalone"] = candidate["has_standalone"] or not reference["suffix"]
     for candidate in grouped.values():
         label_id = normalized_id(candidate["label"])
@@ -210,7 +270,10 @@ def candidate_coverage_ledger(units: list[dict[str, str]], registry: dict[str, d
         names = [actor_id for actor_id, entry in registry.items() if label_id in {normalized_id(actor_id), normalized_id(str(entry.get("name", actor_id)))}]
         candidate["known_owner"] = direct or (names[0] if len(names) == 1 else None)
         candidate["nonentity"] = False
+        candidate["stale"] = False
         if candidate["scoped"]:
+            ledger_owners = adjudication_owners(candidate["label"], registry, aliases)
+            candidate["stale"] = any(readjudication_due(item, ledger_owners) for item in candidate["records"])
             candidate["known_owner"] = candidate["scoped"]["canonical"] if candidate["scoped"]["decision"] == "alias" else None
             if candidate["scoped"]["decision"] != "alias":
                 candidate["nonentity"] = candidate["scoped"]["decision"] == "non_character"
@@ -232,7 +295,7 @@ def candidate_coverage_ledger(units: list[dict[str, str]], registry: dict[str, d
     retained = [(key, value) for key, value in grouped.items() if (" " in value["label"] or value["has_standalone"]) and (" " in value["label"] or normalized_id(value["label"]) in qualified_components or not has_lowercase_occurrence(value["label"]))]
     retained.sort(key=lambda item: (-len(item[1]["label"].split()), item[0]))
     return [
-        {"id": f"p{index:04d}", "label": value["label"], "ref_ids": value["ref_ids"], "known_owner": value["known_owner"], "nonentity": value["nonentity"], **({"scoped_audit": value["scoped"]} if value["scoped"] else {})}
+        {"id": f"p{index:04d}", "label": value["label"], "ref_ids": value["ref_ids"], "known_owner": value["known_owner"], "nonentity": value["nonentity"], **({"scoped_audit": value["scoped"]} if value["scoped"] else {}), **({"scoped_stale": True} if value["stale"] else {})}
         for index, (_, value) in enumerate(retained)
     ]
 
@@ -252,7 +315,7 @@ def discovery_schema(known_ids: list[str], candidates: list[dict], identity_cand
         scoped = candidate.get("scoped_audit")
         audited_target = candidate.get("audited_target")
         base = {"type": "object", "properties": {"candidate_id": {"type": "string", "enum": [candidate["id"]]}, "evidence_unit_ids": evidence}, "required": ["candidate_id", "status", "identity", "evidence_unit_ids"], "additionalProperties": False}
-        if scoped and scoped["decision"] != "alias":
+        if scope_final(candidate) and scoped["decision"] != "alias":
             return {**base, "properties": {**base["properties"], "status": {"type": "string", "enum": [scoped["decision"]]}, "identity": {"type": "string", "enum": ["none"]}}}
         if fixed_owner:
             return {**base, "properties": {**base["properties"], "status": {"type": "string", "enum": ["known"]}, "identity": {"type": "string", "enum": [fixed_owner]}}}
@@ -293,7 +356,7 @@ def discovery_prompt(chapters: list[Path], registry: dict, aliases: dict[str, st
     full_narrative = "\n".join(f"[{unit['id']}] {unit['quote']}" for unit in units)
     return f"""Classify EVERY candidate exactly once using only the response schema. Candidate labels and source witnesses are immutable local evidence; never copy a name, quote, offset, or invented ID into JSON.
 
-status=new means this candidate is a distinct named living person/creature and identity MUST equal its own candidate_id. A named weapon, equipment item, attack, skill, species, group, or action is non_character even when capitalized; require source behavior/description proving a living entity before new. When both a source-qualified full name and a shorter component occur, make the full name the new identity and map the shorter label only when source evidence proves it is that identity. status=known means it is the same identity as an approved canonical ID or another new candidate in the global ledger; identity MUST name that target. An alias of a new full-name owner MUST be status=known targeting that owner, never status=new with a different identity. status=non_character means the lexical capitalisation is not a person/creature. status=ambiguous means source evidence cannot safely decide; identity MUST be none. For known mappings select source units proving identity; co-occurrence in one sentence alone is NOT proof. Do not merge spelling variants on similarity. Bare Xiao is ambiguous unless a source witness identifies it. Indefinite sentence words Someone, Anyone, Everyone, Nobody, Nothing, and Something are non_character, never unresolved people. A bare surname or title fragment such as Crest is non_character unless it is an approved alias or its own selected witness explicitly identifies the same person; sharing a longer name is not identity proof. House, clan, family, place, group, team, species, and organization labels are non_character even when they mention or surround a known person; classify the exact label, never merge a house or clan into its member. Existing identities may only use their canonical name or a pre-approved alias below. A new identity may have zero aliases. Every evidence_unit_ids list must include a witness for its candidate. For an alias-to-new-identity link, include distinct witnesses for both spellings; a shared co-occurrence sentence alone is invalid.
+status=new means this candidate is a distinct named living person/creature and identity MUST equal its own candidate_id. A named weapon, equipment item, attack, skill, species, group, or action is non_character even when capitalized; require source behavior/description proving a living entity before new. When both a source-qualified full name and a shorter component occur, make the full name the new identity and map the shorter label only when source evidence proves it is that identity. status=known means it is the same identity as an approved canonical ID or another new candidate in the global ledger; identity MUST name that target. An alias of a new full-name owner MUST be status=known targeting that owner, never status=new with a different identity. status=non_character means the lexical capitalisation is not a person/creature. status=ambiguous means source evidence cannot safely decide; identity MUST be none. For known mappings select source units proving identity; co-occurrence in one sentence alone is NOT proof. Do not merge spelling variants on similarity. A kinship/role label (Mom, Dad) or a partly matching full name may be proposed status=known to an approved canonical ID when its witness context supports that person; a separate per-mention validation then decides it, so prefer a contextual known proposal over ambiguous when the cast plausibly holds the owner. Bare Xiao is ambiguous unless a source witness identifies it. Indefinite sentence words Someone, Anyone, Everyone, Nobody, Nothing, and Something are non_character, never unresolved people. A bare surname or title fragment such as Crest is non_character unless it is an approved alias or its own selected witness explicitly identifies the same person; sharing a longer name is not identity proof. House, clan, family, place, group, team, species, and organization labels are non_character even when they mention or surround a known person; classify the exact label, never merge a house or clan into its member. Existing identities may only use their canonical name or a pre-approved alias below. A new identity may have zero aliases. Every evidence_unit_ids list must include a witness for its candidate. For an alias-to-new-identity link, include distinct witnesses for both spellings; a shared co-occurrence sentence alone is invalid.
 
 Known canonical IDs: {roster or '(none)'}. Every ledger row carrying FIXED_KNOWN_OWNER MUST be status=known with exactly that identity; never create a new actor for it.
 Approved aliases: {audited or '(none)'}
@@ -537,12 +600,15 @@ def validate_classification_chunk(value: object, candidates: list[dict], registr
             canonical = record["identity"]
             if scoped_alias_approved(candidate, canonical):
                 pass
-            elif pending is not None and not candidate.get("scoped_audit") and not approved_known_label(candidate["label"], canonical, record["evidence_unit_ids"], units, registry, aliases):
+            elif pending is not None and not scope_final(candidate) and not approved_known_label(candidate["label"], canonical, record["evidence_unit_ids"], units, registry, aliases):
                 pending.append({"candidate": candidate, "proposed": canonical})
             elif not approved_known_label(candidate["label"], canonical, record["evidence_unit_ids"], units, registry, aliases):
                 raise ValueError(f"known classification assigns prose or cross-owner label to {canonical}: {candidate['label']!r}")
-        if record["status"] == "ambiguous" and pending is not None and not candidate.get("scoped_audit"):
+        if record["status"] == "ambiguous" and pending is not None and not scope_final(candidate):
             pending.append({"candidate": candidate, "proposed": None})
+        if candidate.get("scoped_stale") and pending is not None and not any(item["candidate"] is candidate for item in pending):
+            # a cached ambiguous decision is re-judged per mention whatever the primary says; it must not be silently replaced by a label-level answer
+            pending.append({"candidate": candidate, "proposed": record["identity"] if record["identity"] in registry else None})
         if record["status"] == "known" and target_candidate is not None and not candidate.get("audited_target"):
             candidate_units = {ref_id.rsplit("n", 1)[0] for ref_id in candidate["ref_ids"]}
             target_units = {ref_id.rsplit("n", 1)[0] for ref_id in target_candidate["ref_ids"]}
@@ -617,14 +683,20 @@ def bounded_scene(units_by_id: dict, order: list[str], position: int) -> str:
     return " ".join(units_by_id[order[index]]["quote"] for index in range(low, high + 1))
 
 
-def owner_prior_facts(registry: dict, owners: list[str]) -> str:
-    """Canonical prior profile and source-derived facts for each possible owner, each bounded, and the whole block bounded."""
+def owner_prior_facts(registry: dict, owners: list[str], label: str | None = None) -> str:
+    """Canonical prior profile and source-derived facts for each possible owner, each bounded, and the whole block bounded.
+    When a label is given, a short excerpt of the owner's own prior facts around that label leads the entry so it survives the per-owner bound."""
     lines: list[str] = []
     remaining = ADJUDICATION_FACTS_TOTAL_CHARS
+    per_owner = min(ADJUDICATION_OWNER_FACT_CHARS, ADJUDICATION_FACTS_TOTAL_CHARS // max(len(owners), 1))
     for owner in owners:
         entry = registry[owner]
         facts = entry.get("facts") if isinstance(entry.get("facts"), dict) else {}
         parts = [f"name={entry.get('name', owner)!r}"]
+        flat = json.dumps(entry, ensure_ascii=False)
+        hit = flat.casefold().find(label.casefold()) if label else -1
+        if hit >= 0:
+            parts.append(f"prior facts mentioning {label!r}: ...{flat[max(0, hit - ADJUDICATION_SNIPPET_CHARS) : hit + len(label) + ADJUDICATION_SNIPPET_CHARS]}...")
         for field in ("bio", "look"):
             if entry.get(field):
                 parts.append(f"{field}={str(entry[field])!r}")
@@ -632,7 +704,7 @@ def owner_prior_facts(registry: dict, owners: list[str]) -> str:
             if facts.get(field):
                 parts.append(f"prior {field} facts={' | '.join(str(item) for item in facts[field])!r}")
         text = f"{owner}: " + "; ".join(parts)
-        text = text[: min(ADJUDICATION_OWNER_FACT_CHARS, max(remaining, 0))]
+        text = text[: min(per_owner, max(remaining, 0))]
         if text:
             lines.append(text)
             remaining -= len(text)
@@ -657,7 +729,7 @@ def scoped_audit_attestation(records: list[dict]) -> dict:
     return {"version": 1, "count": len(ordered), "sha256": json_digest(ordered)}
 
 
-def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[dict], registry: dict, ask) -> None:
+def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[dict], registry: dict, ask, aliases: dict | None = None) -> None:
     references = immutable_name_references(units)
     units_by_id = {unit["id"]: unit for unit in units}
     order = [unit["id"] for unit in units]
@@ -669,30 +741,29 @@ def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[
         if candidate["id"] in seen_candidates:
             continue
         seen_candidates.add(candidate["id"])
-        label_id = normalized_id(candidate["label"])
-        if entry["proposed"]:
-            owners = [entry["proposed"]]
-        else:
-            owners = [actor_id for actor_id, info in registry.items() if label_id in {normalized_id(word) for word in str(info.get("name", actor_id)).split()}]
+        owners = adjudication_owners(candidate["label"], registry, aliases, entry["proposed"])
         mentions: dict[tuple[str, str, str, int], dict] = {}
         for ref_id in candidate["ref_ids"]:
             unit = units_by_id[references[ref_id]["unit_id"]]
             scope = mention_scope(unit, references[ref_id], candidate["label"])
-            if scope not in known:
+            if scope not in known or readjudication_due(known[scope], owners):
                 mentions.setdefault(scope, unit)
         scopes = list(mentions)
         for offset in range(0, len(scopes), ADJUDICATION_MENTIONS_PER_CALL):
             chunk = scopes[offset : offset + ADJUDICATION_MENTIONS_PER_CALL]
             ids = [f"m{index}" for index in range(len(chunk))]
             decisions = ["alias", "non_character", "ambiguous"] if owners else ["non_character", "ambiguous"]
-            item = {"type": "object", "properties": {"mention_id": {"type": "string", "enum": ids}, "decision": {"type": "string", "enum": decisions}, "canonical": {"type": "string", "enum": [*owners, "none"]}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "reason": {"type": "string", "minLength": 1, "maxLength": 300}}, "required": ["mention_id", "decision", "canonical", "confidence", "reason"], "additionalProperties": False}
+            item = {"type": "object", "properties": {"mention_id": {"type": "string", "enum": ids}, "refers_to_person": {"type": "string", "enum": ["yes", "no", "unclear"]}, "candidate_kind": {"type": "string", "enum": ["individual_name", "specific_role", "endearment", "prose_fragment", "nonliving", "unclear"]}, "decision": {"type": "string", "enum": decisions}, "canonical": {"type": "string", "enum": [*owners, "none"]}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "reason": {"type": "string", "minLength": 1, "maxLength": 300}}, "required": ["mention_id", "refers_to_person", "candidate_kind", "decision", "canonical", "confidence", "reason"], "additionalProperties": False}
             schema = {"type": "object", "properties": {"mentions": {"type": "array", "minItems": len(chunk), "maxItems": len(chunk), "items": item}}, "required": ["mentions"], "additionalProperties": False}
             roster = "; ".join(f"{owner}={registry[owner].get('name', owner)!r}" for owner in owners) or "(no candidate owner)"
             rows = []
             for mention_id, scope in zip(ids, chunk, strict=True):
                 position = order.index(mentions[scope]["id"])
                 rows.append(f"{mention_id} [{mentions[scope]['chapter']}] mention: {mentions[scope]['quote']}\n   bounded scene: {bounded_scene(units_by_id, order, position)}")
-            prompt = f"Decide separately, for each exact mention of the label {candidate['label']!r}, whether THIS mention refers to an existing character. Never decide by spelling or sound similarity, and never generalise from one mention to another. alias requires the mention or its bounded scene to prove identity with the named owner, consistent with that owner's canonical prior facts; canonical must be that owner. non_character: not a person/creature. ambiguous: the source cannot decide. Give honest confidence and a short source-based reason.\nPossible owners: {roster}\nCanonical prior facts for the possible owners:\n{owner_prior_facts(registry, owners)}\nMENTIONS:\n" + "\n".join(rows)
+                if scope in known:
+                    prior = known[scope]
+                    rows.append(f"   previous decision (made when only {prior.get('owners', 'unrecorded owners')} were offered): {prior['decision']} confidence={prior['confidence']} because: {prior['reason']}")
+            prompt = f"Decide separately, for each exact mention of the label {candidate['label']!r}, whether THIS mention refers to an existing character. Never decide by spelling or sound similarity, and never generalise from one mention to another. alias requires the mention or its bounded scene to prove identity with the named owner, consistent with that owner's canonical prior facts; canonical must be that owner. The possible owners are only candidates (a shared name component, or a bounded roster of the whole cast when the label matches no name): a kinship or role label such as Mom or Dad may be a vocative or reference for a cast member whose prior facts say they are that person's parent, and a full name may extend a shorter canonical name; accept such a link only when the scene and prior facts support it. A previous decision is shown only where one exists; reconsider it with the fuller owner information. First answer refers_to_person for this mention: yes when it names or addresses a person/creature in the story (a vocative such as Mom, or a full name, counts), no only when it is a place, object, group, title word or other non-living thing, unclear when you cannot tell. Also classify candidate_kind: individual_name is a stable actor identity; specific_role can map only when the scene identifies its owner; endearment and prose_fragment address/describes a person but are not actor names; nonliving is not a person. Then decide: alias only for individual_name or source-owned specific_role with a supported owner. non_character is correct for nonliving, endearment, or prose_fragment even when refers_to_person=yes. ambiguous only when a potential individual_name/specific_role owner cannot be decided. Give honest confidence and a short source-based reason.\nPossible owners: {roster}\nCanonical prior facts for the possible owners:\n{owner_prior_facts(registry, owners, candidate['label'])}\nMENTIONS:\n" + "\n".join(rows)
             if len(prompt) > PREPARATION_PROMPT_MAX_CHARS:
                 raise RuntimeError(f"scoped adjudication prompt exceeds native context budget for {candidate['label']!r}")
             value = json.loads(ask(prompt, max_tokens=1500, max_attempts=1, response_schema=schema))
@@ -702,11 +773,22 @@ def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[
             for result in returned:
                 scope = chunk[ids.index(result["mention_id"])]
                 decision, canonical = result["decision"], result["canonical"]
-                if decision == "alias" and (canonical not in owners or result["confidence"] < ADJUDICATION_MIN_CONFIDENCE):
+                person = result["refers_to_person"]
+                reason = str(result["reason"])
+                kind = result["candidate_kind"]
+                if decision == "alias" and (canonical not in owners or result["confidence"] < ADJUDICATION_MIN_CONFIDENCE or person != "yes" or kind not in {"individual_name", "specific_role"}):
                     decision, canonical = "ambiguous", "none"
+                elif decision == "non_character" and person != "no" and kind not in {"endearment", "prose_fragment"}:
+                    # a verdict that contradicts the model's own person answer is not evidence the label is a non-person; fail closed as ambiguous
+                    decision, reason = "ambiguous", f"[inconsistent non_character with refers_to_person={person}] {reason}"[:300]
                 if decision != "alias":
                     canonical = "none"
-                record = {"chapter_sha256": scope[0], "quote_sha256": scope[1], "label": candidate["label"], "span_start": scope[3], "canonical": canonical, "decision": decision, "confidence": float(result["confidence"]), "reason": str(result["reason"])}
+                record = {"chapter_sha256": scope[0], "quote_sha256": scope[1], "label": candidate["label"], "span_start": scope[3], "canonical": canonical, "decision": decision, "confidence": float(result["confidence"]), "reason": reason, "owners": list(owners), "raw_adjudication": {"decision": result["decision"], "canonical": result["canonical"], "refers_to_person": person, "candidate_kind": kind, "confidence": result["confidence"], "reason": result["reason"]}}
+                prior = known.get(scope)
+                if prior:
+                    # keep every superseded decision and its reason; the audit is append-only history, not an overwrite
+                    record["history"] = [*prior.get("history", []), {key: prior[key] for key in ("decision", "canonical", "confidence", "reason", "owners") if key in prior}]
+                    records[:] = [item for item in records if item is not prior]
                 records.append(record)
                 known[scope] = record
             mention_scoped_audit_index(records)
@@ -747,7 +829,7 @@ def discover_batch(project: Path, start: int, batch: list[Path], batch_units: li
                     response = ask(f"Your chunk classification was rejected: {error}. Return the complete schema object for this chunk only.\n\n{chunk_prompt}", max_tokens=1800, max_attempts=1, response_schema=schema)
         if not pending:
             break
-        adjudicate_pending_mentions(project, pending, batch_units, progress["registry"], ask)
+        adjudicate_pending_mentions(project, pending, batch_units, progress["registry"], ask, progress["aliases"])
     discoveries, classifications = materialize_classifications({"classifications": records}, batch_units, candidates, progress["registry"], progress["aliases"])
     approved = verify_proposed_living_entities(batch_units, discoveries, ask)
     rejected = {item["id"] for item in discoveries} - approved

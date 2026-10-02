@@ -611,7 +611,7 @@ def test_discover_batch_adjudicates_each_mention_and_persists_before_mapping(tmp
                 if line.startswith("m") and "mention:" in line:
                     mention_id = line.split()[0]
                     bows = "bowed" in line
-                    rows.append({"mention_id": mention_id, "decision": "alias" if bows else "non_character", "canonical": "young_ren" if bows else "none", "confidence": 0.9, "reason": "context"})
+                    rows.append({"mention_id": mention_id, "refers_to_person": "yes" if bows else "no", "candidate_kind": "individual_name" if bows else "nonliving", "decision": "alias" if bows else "non_character", "canonical": "young_ren" if bows else "none", "confidence": 0.9, "reason": "context"})
             return json.dumps({"mentions": rows})
         out = []
         for option in schema["properties"]["classifications"]["items"]["oneOf"]:
@@ -666,7 +666,11 @@ def test_freeze_attests_scoped_audit_and_exports_exact_references() -> None:
 
 
 def run_scoped_freeze_checks(source: Path, project: Path) -> None:
-    from src.cast_freeze import SCOPED_AUDIT_NAME, scoped_audit_attestation, validated_scoped_references
+    from src.cast_freeze import (
+        SCOPED_AUDIT_NAME,
+        scoped_audit_attestation,
+        validated_scoped_references,
+    )
     chapters = sorted((project / "chapters").glob("*.txt"))
     units = immutable_evidence_units(chapters)
     unit = next(u for u in units if "Ron Blackfire" in u["quote"])
@@ -719,7 +723,11 @@ def run_scoped_freeze_checks(source: Path, project: Path) -> None:
 # adjudication prompt carries canonical prior facts and the full bounded scene
 # the owner's profile and source-derived facts plus a same-chapter scene beyond one neighbouring sentence reach every generic adjudication call.
 def test_adjudication_prompt_includes_prior_facts_and_bounded_scene(tmp_path: Path) -> None:
-    from src.cast_freeze import ADJUDICATION_SCENE_CHARS, adjudicate_pending_mentions, immutable_name_references
+    from src.cast_freeze import (
+        ADJUDICATION_SCENE_CHARS,
+        adjudicate_pending_mentions,
+        immutable_name_references,
+    )
 
     chapter = tmp_path / "ch1.txt"
     filler = " ".join(f"Filler sentence number {i} about nothing." for i in range(200))
@@ -731,7 +739,7 @@ def test_adjudication_prompt_includes_prior_facts_and_bounded_scene(tmp_path: Pa
 
     def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
         prompts.append(prompt)
-        return json.dumps({"mentions": [{"mention_id": "m0", "decision": "ambiguous", "canonical": "none", "confidence": 0.5, "reason": "x"}]})
+        return json.dumps({"mentions": [{"mention_id": "m0", "refers_to_person": "unclear", "candidate_kind": "unclear", "decision": "ambiguous", "canonical": "none", "confidence": 0.5, "reason": "x"}]})
 
     adjudicate_pending_mentions(tmp_path, [{"candidate": candidate, "proposed": "young_ren"}], units, registry, ask)
     prompt = prompts[0]
@@ -740,3 +748,135 @@ def test_adjudication_prompt_includes_prior_facts_and_bounded_scene(tmp_path: Pa
     assert "Opening remark about the harbour." in scene and "Marta wept." in scene and "Later Marta said farewell." in scene
     assert len(scene) <= ADJUDICATION_SCENE_CHARS + len(units[3]["quote"])
     assert "Filler sentence number 199" not in scene
+
+
+# ##################################################################
+# start-6 regression: component-overlap and bounded-roster owners, history-preserving re-adjudication
+# replays the production start-6 shape: cached ambiguous Ren Dove and Mom records (decided before any owner was offered) are re-judged per mention with Ren / the bounded cast, keep their prior reason as history, and never leak to other mentions or other source bytes.
+def test_start6_ren_dove_mom_and_third_context_readjudicate_with_history(tmp_path: Path) -> None:
+    from src.cast_freeze import (
+        SCOPED_AUDIT_NAME,
+        adjudicate_pending_mentions,
+        adjudication_owners,
+        discover_batch,
+    )
+
+    registry = {
+        "ren": {"name": "Ren", "bio": "a ten year old boy"},
+        "mother": {"name": "Mother", "bio": "Ren's parent, referred to as 'Mom' by her son"},
+        "narrator": {"name": "Narrator"},
+    }
+    assert adjudication_owners("Ren Dove", registry) == ["ren"]  # component overlap, not the whole cast
+    assert adjudication_owners("Mom", registry) == ["mother", "ren"]  # no lexical match: bounded roster, label-mentioning owner first, never the narrator
+    assert adjudication_owners("Mom", registry, proposed="ren")[0] == "ren"
+    chapter_one, chapter_two = tmp_path / "ch1.txt", tmp_path / "ch2.txt"
+    chapter_one.write_text("Ren Dove hid under the covers. Ren whispered, I love you, Mom.", encoding="utf-8")
+    chapter_two.write_text("Someone shouted at Mom about the broken cart.", encoding="utf-8")
+    units = immutable_evidence_units([chapter_one, chapter_two])
+    stale_reason = "only the full name is shown; no owner was offered"
+
+    def cached(label: str, quote: str) -> dict:
+        unit = next(u for u in units if u["quote"] == quote)
+        return {"chapter_sha256": unit["chapter_sha256"], "quote_sha256": hashlib.sha256(quote.encode()).hexdigest(), "label": label, "span_start": quote.index(label), "canonical": "none", "decision": "ambiguous", "confidence": 0.5, "reason": stale_reason}
+
+    legacy = [cached("Ren Dove", units[0]["quote"]), cached("Mom", units[1]["quote"]), cached("Mom", units[2]["quote"])]
+    (tmp_path / SCOPED_AUDIT_NAME).write_text(json.dumps({"records": legacy}))
+    ledger = candidate_coverage_ledger(units, registry, {}, legacy)
+    assert {c["label"] for c in ledger if c.get("scoped_stale")} == {"Ren Dove", "Mom"}  # cached ambiguity is stale, not final
+    # a record bound to other bytes or another offset is not applied at all: the source guards still decide scope
+    moved = [{**legacy[1], "span_start": legacy[1]["span_start"] + 1}, {**legacy[2], "chapter_sha256": "0" * 64}]
+    assert not any(c.get("scoped_audit") for c in candidate_coverage_ledger(units, registry, {}, moved) if c["label"] == "Mom")
+
+    adjudications: list[str] = []
+
+    def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
+        schema = response_schema or {}
+        if "mentions" in schema["properties"]:
+            adjudications.append(prompt)
+            assert "previous decision" in prompt and stale_reason in prompt
+            rows = []
+            for line in prompt.splitlines():
+                if line.startswith("m") and "mention:" in line:
+                    allowed = schema["properties"]["mentions"]["items"]["properties"]["canonical"]["enum"]
+                    if "shouted" in line:
+                        rows.append({"mention_id": line.split()[0], "refers_to_person": "no", "candidate_kind": "nonliving", "decision": "non_character", "canonical": "none", "confidence": 0.9, "reason": "a stranger's mom, not the cast"})
+                    else:
+                        target = "ren" if "Dove" in line else "mother"
+                        assert target in allowed
+                        rows.append({"mention_id": line.split()[0], "refers_to_person": "yes", "candidate_kind": "individual_name", "decision": "alias", "canonical": target, "confidence": 0.9, "reason": "scene and prior facts support it"})
+            return json.dumps({"mentions": rows})
+        out = []
+        for option in schema["properties"]["classifications"]["items"]["oneOf"]:
+            branches = option.get("oneOf", [option])
+            cid = branches[0]["properties"]["candidate_id"]["enum"][0]
+            row = next(line for line in prompt.splitlines() if line.startswith(cid + " label="))
+            label = row.split("label='")[1].split("'")[0]
+            witness = row.split("witnesses: [")[1].split("]")[0]
+            statuses = {b["properties"]["status"]["enum"][0]: b["properties"] for b in branches}
+            if len(branches) == 1:
+                status = next(iter(statuses))
+            elif label in {"Ren Dove", "Mom"}:
+                status = "known" if "known" in statuses else "ambiguous"
+            else:
+                status = "non_character"
+            identity = statuses[status]["identity"]["enum"]
+            if label == "Ren Dove" and status == "known":
+                identity = ["ren"]
+            elif label == "Mom" and status == "known":
+                identity = ["mother"]
+            out.append({"candidate_id": cid, "status": status, "identity": identity[0], "evidence_unit_ids": [witness]})
+        return json.dumps({"classifications": out})
+
+    progress = {"registry": registry, "aliases": {}}
+    discoveries, classifications = discover_batch(tmp_path, 0, [chapter_one, chapter_two], units, "", progress, set(), ask=ask)
+    assert discoveries == [] and adjudications
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert len(records) == 3  # replaced in place of the cached records, never duplicated
+    by_quote = {(r["label"], r["quote_sha256"]): r for r in records}
+    dove = by_quote[("Ren Dove", hashlib.sha256(units[0]["quote"].encode()).hexdigest())]
+    mom_vocative = by_quote[("Mom", hashlib.sha256(units[1]["quote"].encode()).hexdigest())]
+    mom_third = by_quote[("Mom", hashlib.sha256(units[2]["quote"].encode()).hexdigest())]
+    assert (dove["decision"], dove["canonical"], dove["owners"]) == ("alias", "ren", ["ren"])
+    assert (mom_vocative["decision"], mom_vocative["canonical"]) == ("alias", "mother") and set(mom_vocative["owners"]) == {"mother", "ren"}
+    assert (mom_third["decision"], mom_third["canonical"]) == ("non_character", "none")  # the same label elsewhere is decided on its own scene
+    for record in (dove, mom_vocative, mom_third):
+        assert record["history"] == [{"decision": "ambiguous", "canonical": "none", "confidence": 0.5, "reason": stale_reason}]
+    assert any(c["status"] == "known" and c["identity"] == "ren" for c in classifications) and any(c["identity"] == "mother" for c in classifications)
+    # idempotent: decisions that already saw every plausible owner are never re-asked
+    calls = len(adjudications)
+    candidates = candidate_coverage_ledger(units, registry, {}, records)
+    assert not any(c.get("scoped_stale") for c in candidates)
+    adjudicate_pending_mentions(tmp_path, [{"candidate": next(c for c in candidates if c["label"] == "Mom" and c["scoped_audit"]["decision"] == "alias"), "proposed": "mother"}], units, registry, ask)
+    assert len(adjudications) == calls
+    # an ambiguous answer that already saw every owner stays final with its reason; it is not re-asked
+    stuck = {**records[0], "decision": "ambiguous", "canonical": "none", "owners": ["ren", "mother"]}
+    assert not any(c.get("scoped_stale") for c in candidate_coverage_ledger(units, registry, {}, [stuck]))
+
+
+# ##################################################################
+# adjudication verdicts must agree with the model's own person answer
+# A capitalized continuation may be malformed prose, but component overlap alone is not identity proof; preserve raw output and leave it scoped-ambiguous for an independently evidenced decision.
+def test_adjudication_rejects_verdict_contradicting_person_answer(tmp_path: Path) -> None:
+    from src.cast_freeze import adjudicate_pending_mentions
+
+    chapter = tmp_path / "ch1.txt"
+    chapter.write_text("Ren Dove hid under the covers. Mom wept softly. Mom left.", encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    registry = {"ren": {"name": "Ren"}, "mother": {"name": "Mother", "bio": "called Mom by her son"}}
+    answers = iter([("yes", "non_character", "none"), ("no", "alias", "mother")])
+    ledger = candidate_coverage_ledger(units, registry, {})
+    prompts: list[str] = []
+
+    def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
+        prompts.append(prompt)
+        person, decision, canonical = next(answers)
+        return json.dumps({"mentions": [{"mention_id": "m0", "refers_to_person": person, "candidate_kind": "individual_name", "decision": decision, "canonical": canonical, "confidence": 0.95, "reason": "he is Ren's parent"}]})
+
+    for label in ("Ren Dove", "Mom"):
+        candidate = next(c for c in ledger if c["label"] == label)
+        candidate = {**candidate, "ref_ids": candidate["ref_ids"][:1]}
+        adjudicate_pending_mentions(tmp_path, [{"candidate": candidate, "proposed": None}], units, registry, ask)
+    records = json.loads((tmp_path / "mention-scoped-audit.json").read_text())["records"]
+    assert [(r["label"], r["decision"], r["canonical"]) for r in records] == [("Ren Dove", "ambiguous", "none"), ("Mom", "ambiguous", "none")]
+    assert records[0]["raw_adjudication"]["decision"] == "non_character" and records[0]["raw_adjudication"]["refers_to_person"] == "yes"
+    assert all("refers_to_person" in prompt and "candidate_kind" in prompt and "endearment" in prompt for prompt in prompts)

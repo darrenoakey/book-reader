@@ -16,15 +16,14 @@ from src.cast_freeze import (
     REJECTIONS_NAME,
     apply_alias_audit,
     asset_hashes,
+    candidate_coverage_ledger,
     context_safe_batch,
     discovery_schema,
     immutable_evidence_units,
-    immutable_name_references,
-    materialize_evidence_discovery,
+    materialize_classifications,
     record_rejected_discovery,
     refresh_alias_audit,
     source_label_present,
-    validate_discovery,
     validate_preparation_coverage,
     verify_frozen_cast,
 )
@@ -100,56 +99,40 @@ def write_frozen_project(root: Path) -> tuple[Path, Path]:
 
 
 # ##################################################################
-# test source reference schemas
-# existing actors select only canonical IDs plus nonempty source references; new actors select one local name reference and optional aliases.
-def test_discovery_schema_has_mode_specific_name_references() -> None:
-    ref_ids = ["c00s00000n000", "c00s00000n001"]
-    existing = discovery_schema(["ren", "ron_blackfire"], ref_ids, "existing")["properties"]["characters"]["items"]
-    assert existing["required"] == ["canonical_id", "alias_refs", "voice_facts", "look_facts"]
-    assert "name_ref" not in existing["properties"]
-    assert existing["properties"]["alias_refs"]["minItems"] == 1
-    new = discovery_schema(["ren"], ref_ids, "new")["properties"]["characters"]["items"]
-    assert new["properties"]["name_ref"]["enum"] == ref_ids
+# test exhaustive candidate schema
+# constrains native output to one classification for every locally-derived lexical candidate.
+def test_discovery_schema_requires_exact_complete_candidate_classification() -> None:
+    candidates = [{"id": "p0000", "label": "Han", "ref_ids": ["c00s00000n000"]}, {"id": "p0001", "label": "The", "ref_ids": ["c00s00001n000"]}]
+    schema = discovery_schema(["ren"], candidates)["properties"]["classifications"]
+    assert schema["minItems"] == schema["maxItems"] == 2
+    branches = schema["items"]["oneOf"]
+    assert len(branches) == 2
+    assert {branch["oneOf"][0]["properties"]["candidate_id"]["enum"][0] for branch in branches} == {"p0000", "p0001"}
+    assert branches[0]["oneOf"][0]["properties"]["status"]["enum"] == ["new"]
+    assert branches[0]["oneOf"][2]["properties"]["identity"]["enum"] == ["none"]
 
 
 # ##################################################################
-# test source references materialize exact labels
-# local reference lookup prevents Kloene invention and bare Xiao selection without offset arithmetic or copied strings.
-def test_source_references_materialize_exact_labels_and_reject_bare_xiao() -> None:
+# test classifications preserve exact labels
+# materializes participants locally, while omissions cannot pass an exhaustive candidate ledger.
+def test_classifications_materialize_exact_labels_and_reject_omissions() -> None:
     with tempfile.TemporaryDirectory() as directory:
         chapter = Path(directory) / "01-part.txt"
-        chapter.write_text("Klene Goldest arrived. Foam Xiao waved. Xiao left.", encoding="utf-8")
+        chapter.write_text("Foam Xiao waved. Aster Blackwood spoke. The beasts ran.", encoding="utf-8")
         units = immutable_evidence_units([chapter])
-        refs = immutable_name_references(units)
-        assert all(" and " not in ref["label"].casefold() for ref in refs.values())
-        find = lambda label: next(ref_id for ref_id, ref in refs.items() if ref["label"] == label)
-        raw = {"characters": [{"canonical_id": "k_goldest", "alias_refs": [find("Klene Goldest")], "voice_facts": "", "look_facts": ""}]}
-        materialized, citations = materialize_evidence_discovery(raw, units, {"klene_goldest": "k_goldest"}, {"k_goldest": {"name": "K Goldest"}})
-        assert materialized["characters"][0]["name"] == "K Goldest"
-        assert materialized["characters"][0]["aliases"] == ["Klene Goldest"]
-        assert "Kloene" not in json.dumps(materialized)
-        raw["characters"][0]["alias_refs"] = [find("Xiao")]
-        with pytest.raises(ValueError, match="bare Xiao"):
-            materialize_evidence_discovery(raw, units, {}, {"k_goldest": {"name": "K Goldest"}})
-        assert citations[0][0] in refs
-
-
-# ##################################################################
-# test new identity full source references
-# derives full canonical IDs locally from exact enumerated source spans.
-def test_new_identity_uses_full_exact_source_name_reference() -> None:
-    with tempfile.TemporaryDirectory() as directory:
-        chapter = Path(directory) / "01-part.txt"
-        chapter.write_text("Foam Xiao arrived. Aster Blackwood spoke.", encoding="utf-8")
-        units = immutable_evidence_units([chapter])
-        refs = immutable_name_references(units)
-        find = lambda label: next(ref_id for ref_id, ref in refs.items() if ref["label"] == label)
-        raw = {"characters": [
-            {"canonical_id": "new", "name_ref": find("Foam Xiao"), "alias_refs": [], "voice_facts": "", "look_facts": ""},
-            {"canonical_id": "new", "name_ref": find("Aster Blackwood"), "alias_refs": [], "voice_facts": "", "look_facts": ""},
+        candidates = candidate_coverage_ledger(units, {}, {})
+        response = {"classifications": [
+            {"candidate_id": candidate["id"], "status": "new", "identity": candidate["id"], "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]}
+            if candidate["label"] in {"Foam Xiao", "Aster Blackwood"}
+            else {"candidate_id": candidate["id"], "status": "non_character", "identity": "none", "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]}
+            for candidate in candidates
         ]}
-        materialized, _ = materialize_evidence_discovery(raw, units)
-        assert [entry["id"] for entry in materialized["characters"]] == ["foam_xiao", "aster_blackwood"]
+        discoveries, classifications = materialize_classifications(response, units, candidates, {}, {})
+        assert {entry["id"] for entry in discoveries} == {"foam_xiao", "aster_blackwood"}
+        assert len(classifications) == len(candidates)
+        response["classifications"].pop()
+        with pytest.raises(ValueError, match="omitted or duplicated"):
+            materialize_classifications(response, units, candidates, {}, {})
 
 
 # ##################################################################
@@ -198,39 +181,14 @@ def test_context_safe_batch_reduces_without_source_truncation() -> None:
         chapters = []
         for index in range(3):
             chapter = root / f"{index + 1:02d}-part.txt"
-            chapter.write_text("x" * 24_000, encoding="utf-8")
+            chapter.write_text("X. " * 1_000, encoding="utf-8")
             chapters.append(chapter)
         batch, prompt = context_safe_batch(chapters, 0, {"narrator": {"name": "Narrator"}}, {})
         assert [path.name for path in batch] == ["01-part.txt", "02-part.txt"]
         assert len(prompt) <= 53_536
-        chapters[0].write_text("x" * 60_000, encoding="utf-8")
+        chapters[0].write_text("X " * 30_000, encoding="utf-8")
         with pytest.raises(RuntimeError, match="refusing to truncate or skip"):
             context_safe_batch(chapters, 0, {"narrator": {"name": "Narrator"}}, {})
-
-
-# ##################################################################
-# test source evidence rejection
-# rejects a locally plausible but non-verbatim character claim before preparation can create an identity.
-def test_discovery_requires_verbatim_source_evidence() -> None:
-    good = {
-        "characters": [
-            {
-                "canonical_id": "new",
-                "id": "ren",
-                "name": "Ren",
-                "aliases": [],
-                "voice_facts": "",
-                "look_facts": "",
-                "evidence": ["Ren said"],
-            }
-        ]
-    }
-    assert validate_discovery(good, "Ren said hello.", set()) == good["characters"]
-    with pytest.raises(ValueError, match="source-ambiguous"):
-        validate_discovery(good, "Ren said hello.", set(), {"ren"})
-    bad = {"characters": [{**good["characters"][0], "evidence": ["Ren has blue eyes"]}]}
-    with pytest.raises(ValueError, match="non-source evidence"):
-        validate_discovery(bad, "Ren said hello.", set())
 
 
 # ##################################################################
@@ -331,3 +289,365 @@ def test_audit_refresh_is_additive_idempotent_and_preserves_cursor(tmp_path: Pat
     before = json.loads(json.dumps(progress, sort_keys=True))
     refresh_alias_audit(tmp_path, source_text, progress)
     assert progress == before
+
+# ##################################################################
+# test semantic prefix migration
+# installs a separate semantic ledger at zero while retaining an existing structural cursor until each historical chapter is reclassified.
+def test_semantic_coverage_migration_requires_prefix_revalidation() -> None:
+    from src.cast_freeze import semantic_coverage, validate_semantic_coverage
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        chapters = []
+        for index in range(2):
+            chapter = root / f"{index + 1:02d}.txt"
+            chapter.write_text(f"Han {index}.", encoding="utf-8")
+            chapters.append(chapter)
+        progress = {"next_chapter": 2, "completed_batches": [{"start": 0, "end": 2, "chapter_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in chapters}}]}
+        coverage = semantic_coverage(progress)
+        assert coverage["next_chapter"] == 0
+        validate_semantic_coverage(progress, chapters)
+        coverage["next_chapter"] = 1
+        with pytest.raises(RuntimeError, match="cursor does not match"):
+            validate_semantic_coverage(progress, chapters)
+
+# ##################################################################
+# test bounded candidate chunks
+# retains every candidate exactly once while limiting a native schema response to a bounded cardinality.
+def test_classification_chunks_cover_ledger_without_overlap() -> None:
+    from src.cast_freeze import CLASSIFICATION_CHUNK_SIZE, classification_chunks
+
+    candidates = [{"id": f"p{index:04d}", "label": f"Name{index}", "ref_ids": [f"c00s{index:05d}n000"]} for index in range(CLASSIFICATION_CHUNK_SIZE * 2 + 1)]
+    chunks = classification_chunks(candidates)
+    assert [len(chunk) for chunk in chunks] == [CLASSIFICATION_CHUNK_SIZE, CLASSIFICATION_CHUNK_SIZE, 1]
+    assert [candidate["id"] for chunk in chunks for candidate in chunk] == [candidate["id"] for candidate in candidates]
+
+# ##################################################################
+# test unresolved and alias evidence fail closed
+# prevents ambiguous people from checkpointing and requires a new spelling link to carry distinct witnesses for both source labels.
+def test_classification_blocks_ambiguity_and_requires_distinct_alias_witnesses() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        chapter = Path(directory) / "01-part.txt"
+        chapter.write_text("June approached. Jun appeared with a monkey.", encoding="utf-8")
+        units = immutable_evidence_units([chapter])
+        candidates = candidate_coverage_ledger(units, {}, {})
+        by_label = {candidate["label"]: candidate for candidate in candidates}
+        june, jun = by_label["June"], by_label["Jun"]
+        records = []
+        for candidate in candidates:
+            status, identity = ("new", june["id"]) if candidate == june else (("known", june["id"]) if candidate == jun else ("non_character", "none"))
+            evidence = [candidate["ref_ids"][0].rsplit("n", 1)[0]]
+            if candidate == jun:
+                evidence.append(june["ref_ids"][0].rsplit("n", 1)[0])
+            records.append({"candidate_id": candidate["id"], "status": status, "identity": identity, "evidence_unit_ids": evidence})
+        discoveries, _ = materialize_classifications({"classifications": records}, units, candidates, {}, {})
+        june_discovery = next(item for item in discoveries if item["id"] == "june")
+        assert "Jun" in june_discovery["aliases"]
+        assert "June approached." in june_discovery["look_facts"]
+        records[0]["status"], records[0]["identity"] = "ambiguous", "none"
+        with pytest.raises(RuntimeError, match="remains unresolved"):
+            materialize_classifications({"classifications": records}, units, candidates, {}, {})
+
+# ##################################################################
+# test discourse prefixes never form aliases
+# removes only grammar-led compounds such as As Ren while retaining the legitimate lexical Ren witness.
+def test_discourse_prefix_does_not_form_prose_name_compound() -> None:
+    from src.cast_freeze import immutable_name_references
+
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "As Ren watched, Aster Blackwood arrived."}]
+    labels = {reference["label"] for reference in immutable_name_references(units).values()}
+    assert "As Ren" not in labels
+    assert {"Ren", "Aster Blackwood"} <= labels
+
+# ##################################################################
+# test grammar labels excluded before semantic ledger
+# treats capitalized pronouns and indefinite grammar words as non-entity lexical material while retaining real names for explicit classification.
+def test_pronoun_only_words_are_not_name_candidates() -> None:
+    from src.cast_freeze import immutable_name_references
+
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Someone warned Ren. He followed Sora."}]
+    labels = {reference["label"] for reference in immutable_name_references(units).values()}
+    assert not labels.intersection({"Someone", "He"})
+    assert {"Ren", "Sora"} <= labels
+
+# ##################################################################
+# test suffix-only fragments excluded
+# removes a surname/title fragment occurring only inside a longer capitalized label, while preserving a first-name candidate with source evidence.
+def test_suffix_only_capitalized_fragment_is_not_a_candidate() -> None:
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Ron Blackfire met the Gold Crest airship."}]
+    labels = {candidate["label"] for candidate in candidate_coverage_ledger(units, {}, {})}
+    assert "Crest" not in labels
+    assert "Ron" in labels
+
+# ##################################################################
+# test house labels cannot take actor identity
+# rejects a clan or house phrase mapped to a person even when the actor's name shares one lexical component.
+def test_house_label_cannot_be_known_actor_alias() -> None:
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "The Gold Crest airship carried Klein Goldest."}]
+    candidates = candidate_coverage_ledger(units, {"k_goldest": {"name": "Klein Goldest"}}, {})
+    gold_crest = next(candidate for candidate in candidates if candidate["label"] == "Gold Crest")
+    response = {"classifications": [{"candidate_id": candidate["id"], "status": "known", "identity": "k_goldest", "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]} if candidate == gold_crest else {"candidate_id": candidate["id"], "status": "non_character", "identity": "none", "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]} for candidate in candidates]}
+    with pytest.raises(ValueError, match="unapproved alias"):
+        materialize_classifications(response, units, candidates, {"k_goldest": {"name": "Klein Goldest"}}, {})
+
+# ##################################################################
+# test full names lead candidate ownership
+# orders source-qualified full names before their components so new actor IDs remain Foam Xiao and Aster Blackwood rather than shortened fragments.
+def test_full_name_candidates_precede_short_components() -> None:
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Foam Xiao and Aster Blackwood arrived. Foam and Aster followed."}]
+    labels = [candidate["label"] for candidate in candidate_coverage_ledger(units, {}, {})]
+    assert labels.index("Foam Xiao") < labels.index("Foam")
+    assert labels.index("Aster Blackwood") < labels.index("Aster")
+
+# ##################################################################
+# test approved full names carry fixed owner
+# labels already audited to an established actor are visibly fixed in the native ledger rather than left eligible for a spurious new identity.
+def test_candidate_ledger_marks_approved_full_name_owner() -> None:
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Klein Goldest confronted Ren."}]
+    candidates = candidate_coverage_ledger(units, {"k_goldest": {"name": "Klein Goldest"}}, {"klein_goldest": "k_goldest"})
+    assert next(candidate for candidate in candidates if candidate["label"] == "Klein Goldest")["known_owner"] == "k_goldest"
+
+# ##################################################################
+# test conjunction never forms a person compound
+# excludes grammar-plus-name spans such as But Cass while retaining the real Cass label for source-grounded classification.
+def test_conjunction_does_not_form_person_compound() -> None:
+    from src.cast_freeze import immutable_name_references
+
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "But Cass answered Ren."}]
+    labels = {reference["label"] for reference in immutable_name_references(units).values()}
+    assert "But Cass" not in labels
+    assert {"Cass", "Ren"} <= labels
+
+# ##################################################################
+# test function-word compound eligibility
+# prevents every grammatical determiner, conjunction, or preposition from becoming a multiword person label while retaining its following role or name token.
+def test_function_word_prefixes_never_form_multiword_candidates() -> None:
+    from src.cast_freeze import immutable_name_references
+
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "The Ceremony Master greeted Ren. In Luna Starwaver's hall, Cass waited."}]
+    labels = {reference["label"] for reference in immutable_name_references(units).values()}
+    assert not {"The Ceremony Master", "In Luna", "In Luna Starwaver"}.intersection(labels)
+    assert {"Ceremony Master", "Luna Starwaver", "Cass"} <= labels
+
+# ##################################################################
+# test lowercase lexical usage is not a standalone name
+# excludes a sentence-initial ordinary word when the exact lower-case lexical form appears in source, while preserving a name component of a full label.
+def test_lowercase_lexical_usage_excludes_single_word_candidate() -> None:
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Keep walking. Please keep walking. Foam Xiao arrived. Foam stayed."}]
+    labels = {candidate["label"] for candidate in candidate_coverage_ledger(units, {}, {})}
+    assert "Keep" not in labels
+    assert {"Foam Xiao", "Foam"} <= labels
+
+# ##################################################################
+# test historical prefix semantic migration accepts chapter sixty introductions
+# reads the real frozen source and durable cursor to prove source-backed Han, Sora, and Jun remain eligible for new identities while replaying a pre-cursor prefix.
+def test_historical_semantic_migration_keeps_chapter_sixty_new_candidates_eligible() -> None:
+    source = Path("/Users/darrenoakey/src/book-reader/incoming/weakest_beast_tamer.txt")
+    project = Path("/Users/darrenoakey/src/book-reader/output/weakest_beast_tamer")
+    assert source.is_file(), "mandatory real weakest-beast-tamer source fixture is unavailable"
+    assert project.is_dir(), "mandatory real weakest-beast-tamer project fixture is unavailable"
+    from src.hour_runner import source_chapters
+
+    progress = json.loads((project / "cast_preparation_progress.json").read_text(encoding="utf-8"))
+    _, _, chapters = source_chapters(source, project)
+    batch, _ = context_safe_batch(chapters, 59, progress["registry"], progress["aliases"])
+    candidates = candidate_coverage_ledger(immutable_evidence_units(batch), progress["registry"], progress["aliases"])
+    labels = {candidate["label"] for candidate in candidates}
+    assert {"Han", "Sora", "Jun", "June"} <= labels
+    assert not {"han", "sora", "june"}.intersection(progress["registry"])
+    schema = discovery_schema(list(progress["registry"]), candidates, allow_new=True)
+    han_id = next(candidate["id"] for candidate in candidates if candidate["label"] == "Han")
+    han = next(branch for branch in schema["properties"]["classifications"]["items"]["oneOf"] if "oneOf" in branch and branch["oneOf"][0]["properties"]["candidate_id"]["enum"] == [han_id])
+    assert han["oneOf"][0]["properties"]["status"]["enum"] == ["new"]
+
+# ##################################################################
+# test full-name component link is local source proof
+# permits Aster to target the source-qualified Aster Blackwood candidate without requiring the model to duplicate a second witness already encoded by the full lexical span.
+def test_full_name_component_alias_uses_local_full_span_proof() -> None:
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Aster Blackwood arrived. Aster charged."}]
+    candidates = candidate_coverage_ledger(units, {}, {})
+    full = next(candidate for candidate in candidates if candidate["label"] == "Aster Blackwood")
+    short = next(candidate for candidate in candidates if candidate["label"] == "Aster")
+    response = {"classifications": [{"candidate_id": candidate["id"], "status": "new", "identity": candidate["id"], "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]} if candidate == full else ({"candidate_id": candidate["id"], "status": "known", "identity": full["id"], "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]} if candidate == short else {"candidate_id": candidate["id"], "status": "non_character", "identity": "none", "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]}) for candidate in candidates]}
+    discoveries, _ = materialize_classifications(response, units, candidates, {}, {})
+    assert next(item for item in discoveries if item["id"] == "aster_blackwood")["aliases"] == ["Aster"]
+
+# ##################################################################
+# test bounded prompt includes complete source narrative
+# gives every chunk the complete context-safe batch narrative so name variants can be linked from source facts rather than isolated mention snippets.
+def test_discovery_prompt_carries_full_bounded_source_narrative() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        chapter = Path(directory) / "01.txt"
+        chapter.write_text("Foam Xiao led the cobra team. Fong carried cobra daggers.", encoding="utf-8")
+        from src.cast_freeze import discovery_prompt
+
+        prompt = discovery_prompt([chapter], {}, {})
+        assert "FULL BOUNDED SOURCE NARRATIVE" in prompt
+        assert "Fong carried cobra daggers." in prompt
+
+# ##################################################################
+# test source-audited variant context is advisory and full-name preserving
+# derives group guidance from the read-only audit file without writing it or turning its short aliases into canonical IDs.
+def test_source_audited_variant_context_prefers_full_candidate_owner(tmp_path: Path) -> None:
+    from src.cast_freeze import source_audited_variant_context
+
+    (tmp_path / "qa-klein-team-alias-proposal.json").write_text(json.dumps({"decisions": [{"alias": ["Foam", "Fong", "Fo", "Fang", "Foam Xiao"], "note": "red cobra"}]}), encoding="utf-8")
+    candidates = [{"id": "p0000", "label": label, "ref_ids": ["c00s00000n000"]} for label in ["Foam", "Fong", "Fo", "Fang", "Foam Xiao"]]
+    context = source_audited_variant_context(tmp_path, candidates)
+    assert "Foam Xiao" in context and "one new owner" in context
+
+# ##################################################################
+# test grammatical predecessor cannot suppress a real name
+# preserves Han and a role token when their preceding capital word is a grammar prefix, while true proper-name suffix filtering remains available.
+def test_grammar_prefix_does_not_mark_following_name_as_suffix_only() -> None:
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Only Han maintained composure. The Director spoke."}]
+    labels = {candidate["label"] for candidate in candidate_coverage_ledger(units, {}, {})}
+    assert {"Han", "Director"} <= labels
+
+# ##################################################################
+# test alias witnesses enrich only new owner preparation facts
+# carries exact source quotes from an approved new-owner alias into the prepared actor facts without touching established profiles.
+def test_new_owner_alias_witnesses_enrich_source_facts() -> None:
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Foam Xiao arrived."}, {"id": "c00s00001", "chapter": "01.txt", "quote": "Foam's scarlet cobra marked his neck."}]
+    candidates = [{"id": "p0000", "label": "Foam Xiao", "ref_ids": ["c00s00000n000"]}, {"id": "p0001", "label": "Foam", "ref_ids": ["c00s00001n000"], "audited_target": "p0000"}]
+    response = {"classifications": [{"candidate_id": "p0000", "status": "new", "identity": "p0000", "evidence_unit_ids": ["c00s00000"]}, {"candidate_id": "p0001", "status": "known", "identity": "p0000", "evidence_unit_ids": ["c00s00001"]}]}
+    discoveries, _ = materialize_classifications(response, units, candidates, {}, {})
+    foam = discoveries[0]
+    assert foam["aliases"] == ["Foam"]
+    assert "scarlet cobra" in foam["look_facts"]
+
+# ##################################################################
+# test action and group clues do not force nonentity
+# a living actor may be named in an impact or team phrase, so those source clues remain native eligibility questions rather than a blanket negative schema force.
+def test_action_and_group_clues_do_not_force_nonentity() -> None:
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "The impact of Han and Hammer stopped the beast. Mira team advanced."}]
+    candidates = candidate_coverage_ledger(units, {}, {})
+    schema = discovery_schema([], candidates)
+    branches = schema["properties"]["classifications"]["items"]["oneOf"]
+    for label in ("Han", "Mira"):
+        candidate = next(item for item in candidates if item["label"] == label)
+        branch = next(item for item in branches if "oneOf" in item and item["oneOf"][0]["properties"]["candidate_id"]["enum"] == [candidate["id"]])
+        assert branch["oneOf"][0]["properties"]["status"]["enum"] == ["new"]
+
+# ##################################################################
+# test historical chapter sixty carries casting facts
+# proves the real migration boundary includes the animal and physical context needed for source-grounded new voice and portrait preparation.
+def test_historical_chapter_sixty_preserves_casting_context() -> None:
+    source = Path("/Users/darrenoakey/src/book-reader/incoming/weakest_beast_tamer.txt")
+    project = Path("/Users/darrenoakey/src/book-reader/output/weakest_beast_tamer")
+    assert source.is_file(), "mandatory real weakest-beast-tamer source fixture is unavailable"
+    assert project.is_dir(), "mandatory real weakest-beast-tamer project fixture is unavailable"
+    from src.hour_runner import source_chapters
+
+    _, _, chapters = source_chapters(source, project)
+    text = "\n".join(chapters[index].read_text(encoding="utf-8") for index in (59, 60, 61))
+    assert "Han" in text and "spider" in text.casefold()
+    assert "Sora" in text and "deer" in text.casefold()
+    assert "Jun" in text and "monkey" in text.casefold()
+    assert "Aster" in text and "rhinoceros" in text.casefold()
+
+
+# ##################################################################
+# scoped mention audit splits candidates
+# one audited Young occurrence links to its owner while unscoped Young stays separate and never inherits the alias.
+def test_scoped_audit_splits_young_without_global_alias() -> None:
+    CH1 = hashlib.sha256(b"chapter one body").hexdigest()
+    units = [
+        {"id": "c00s00000", "chapter": "ch1.txt", "chapter_sha256": CH1, "quote": "Young Ren smiled."},
+        {"id": "c00s00001", "chapter": "ch1.txt", "chapter_sha256": CH1, "quote": "Young stood up. Young left."},
+        {"id": "c00s00002", "chapter": "ch2.txt", "chapter_sha256": hashlib.sha256(b"chapter two body").hexdigest(), "quote": "Young stood up. Young left."},
+    ]
+    record = {
+        "chapter_sha256": CH1,
+        "quote_sha256": hashlib.sha256(units[1]["quote"].encode()).hexdigest(),
+        "label": "Young",
+        "span_start": 0,
+        "canonical": "young_ren",
+        "decision": "alias",
+        "confidence": 0.9,
+        "reason": "context names Ren",
+    }
+    plain = candidate_coverage_ledger(units, {}, {})
+    assert next(c for c in plain if c["label"] == "Young").get("scoped_audit") is None
+    ledger = candidate_coverage_ledger(units, {}, {}, [record])
+    young = [c for c in ledger if c["label"] == "Young"]
+    scoped = [c for c in young if c.get("scoped_audit")]
+    other = [c for c in young if not c.get("scoped_audit")]
+    assert len(scoped) == 1 and len(other) == 1
+    assert scoped[0]["known_owner"] == "young_ren" and other[0]["known_owner"] is None
+    assert all(ref.startswith("c00s00001") for ref in scoped[0]["ref_ids"])
+    assert len(scoped[0]["ref_ids"]) == 1  # only the offset-0 Young in the quote, not the second Young
+    assert next(c for c in ledger if c["label"] == "Young" and not c.get("scoped_audit"))["known_owner"] is None
+    with pytest.raises(ValueError):
+        candidate_coverage_ledger(units, {}, {}, [{k: v for k, v in record.items() if k != "span_start"}])
+    renamed = [{**u, "chapter": "other.txt"} for u in units]
+    assert any(c.get("scoped_audit") for c in candidate_coverage_ledger(renamed, {}, {}, [record]))
+    changed = [{**u, "chapter_sha256": "0" * 64} if u["id"] == "c00s00001" else u for u in units]
+    assert not any(c.get("scoped_audit") for c in candidate_coverage_ledger(changed, {}, {}, [record]))
+    assert not set(scoped[0]["ref_ids"]) & set(other[0]["ref_ids"])
+    assert any(c["label"] == "Young Ren" and c["known_owner"] is None for c in ledger)
+    with pytest.raises(ValueError):
+        candidate_coverage_ledger(units, {}, {}, [{**record, "reason": ""}])
+
+
+# ##################################################################
+# scoped adjudication end to end
+# an unapproved existing-owner link is decided per mention, persisted with hashes first, and never becomes a global Young alias.
+def test_discover_batch_adjudicates_each_mention_and_persists_before_mapping(tmp_path: Path) -> None:
+    from src.cast_freeze import SCOPED_AUDIT_NAME, discover_batch
+
+    chapter = tmp_path / "ch1.txt"
+    chapter.write_text("Young Ren smiled. Young bowed to the king. The young fox ran. Young sold the fruit.", encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    progress = {"registry": {"young_ren": {"name": "Young Ren"}}, "aliases": {}}
+    calls: list[str] = []
+
+    def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
+        calls.append(prompt)
+        schema = response_schema or {}
+        if "mentions" in schema["properties"]:
+            rows = []
+            for line in prompt.splitlines():
+                if line.startswith("m") and "mention:" in line:
+                    mention_id = line.split()[0]
+                    bows = "bowed" in line
+                    rows.append({"mention_id": mention_id, "decision": "alias" if bows else "non_character", "canonical": "young_ren" if bows else "none", "confidence": 0.9, "reason": "context"})
+            return json.dumps({"mentions": rows})
+        out = []
+        for option in schema["properties"]["classifications"]["items"]["oneOf"]:
+            branches = option.get("oneOf", [option])
+            cid = branches[0]["properties"]["candidate_id"]["enum"][0]
+            row = next(line for line in prompt.splitlines() if line.startswith(cid + " label="))
+            witness = row.split("witnesses: [")[1].split("]")[0]
+            label = row.split("label='")[1].split("'")[0]
+            statuses = {b["properties"]["status"]["enum"][0]: b["properties"] for b in branches}
+            if len(branches) == 1:
+                status = next(iter(statuses))
+            elif label == "Young":
+                status = "known" if "known" in statuses else "non_character"
+            else:
+                status = "new"
+            identity = statuses[status]["identity"]["enum"]
+            out.append({"candidate_id": cid, "status": status, "identity": "young_ren" if "young_ren" in identity else identity[0], "evidence_unit_ids": ["c00s00001" if label == "Young" and len(branches) > 1 else witness]})
+        return json.dumps({"classifications": out})
+
+    def cid_label(prompt: str, cid: str) -> str:
+        for line in prompt.splitlines():
+            if line.startswith(cid + " label="):
+                return line.split("label=")[1].split()[0].strip("'")
+        return ""
+
+    discoveries, classifications = discover_batch(tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=ask)
+    assert discoveries == []
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert {r["label"] for r in records} == {"Young"}
+    assert {r["decision"] for r in records} == {"alias", "non_character"}
+    for r in records:
+        assert len(r["chapter_sha256"]) == 64 and len(r["quote_sha256"]) == 64 and r["reason"] and r["confidence"] == 0.9
+    aliased = [r for r in records if r["decision"] == "alias"]
+    assert len(aliased) == 1 and aliased[0]["canonical"] == "young_ren"
+    assert aliased[0]["quote_sha256"] == hashlib.sha256(units[1]["quote"].encode()).hexdigest()
+    assert aliased[0]["chapter_sha256"] == hashlib.sha256(chapter.read_bytes()).hexdigest()
+    assert aliased[0]["span_start"] == units[1]["quote"].index("Young") and isinstance(aliased[0]["span_start"], int)
+    assert any(c["status"] == "known" and c["identity"] == "young_ren" for c in classifications)
+    assert any(c["status"] == "non_character" for c in classifications)

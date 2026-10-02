@@ -7,6 +7,7 @@ import tempfile
 import unicodedata
 from pathlib import Path
 
+from src.hourly_spans import classify_spans
 from src.llm import ask
 
 
@@ -72,7 +73,7 @@ def chunk_text(text: str, chunk_size: int = 4000, overlap: int = 0) -> list[str]
 CHUNK_SIZE = 4000
 MAX_ATTEMPTS = 6
 RETRY_DELAY_SECONDS = 5
-SCRIPT_VERSION = 3
+SCRIPT_VERSION = 4
 MIN_COVERAGE = 0.7
 MAX_COVERAGE = 1.4
 META_SUFFIX = ".meta.json"
@@ -334,19 +335,12 @@ async def _process_chunk(chunk: str, speaker_ids: list[str], label: str) -> list
 async def generate_chapter_script(
     chapter_text: str, chapter_title: str, speaker_ids: list[str]
 ) -> list[dict]:
-    chunks = [c for c in chunk_text(chapter_text, chunk_size=CHUNK_SIZE) if c.strip()]
-    chunk_results = await asyncio.gather(
-        *(
-            _process_chunk(
-                c, speaker_ids, f"{chapter_title} chunk {i + 1}/{len(chunks)}"
-            )
-            for i, c in enumerate(chunks)
-        )
-    )
-    all_lines: list[dict] = [{"narrator": chapter_title}]
-    for parsed in chunk_results:
-        all_lines.extend(parsed)
-    return all_lines
+    # The model chooses only a speaker ID. immutable_spans retains each source
+    # sentence byte-for-byte, so a smaller backup model cannot omit or rewrite
+    # narration while the existing canonical JSONL/cache contract is unchanged.
+    lines = [{"narrator": chapter_title}, *await classify_spans(chapter_text, speaker_ids)]
+    validate_script_lines(lines, chapter_text, speaker_ids)
+    return lines
 
 
 # ##################################################################

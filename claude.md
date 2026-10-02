@@ -35,12 +35,19 @@ assets, Range-aware /media for AV seeking (src/server.py + static/).
 
 ## LLM backend (all LLM work)
 
-All LLM calls go through `src/llm.py` → **qwen3.6:35b-a3b on the boringstack
-machine** (Ollama HTTP at `http://10.0.0.42:11434` — DHCP-assigned, was .237; check asus dnsmasq leases if unreachable, `think=false`, stdlib
-urllib only — no local model process, no per-call subprocess). Configurable via
-`BOOK_LLM_HOST`, `BOOK_LLM_MODEL`, `BOOK_LLM_CONCURRENCY`. The old
-daz-agent-sdk/Claude path (which spawned a ~400 MB Node CLI per call and
-exhausted local memory) is gone.
+All narration classification, character/cast preparation, voice descriptions,
+script generation, validation, and title prompts go through `src/llm.py`.
+Each request attempt sends a bounded ICMP probe to Boringstack
+(`10.0.0.42`) and uses its native Ollama `qwen3.6:35b-a3b` only when it is
+pingable. If—and only if—that ICMP probe fails, it uses the verified local
+loopback Ollama backup (`127.0.0.1:11434`, `qwen3:8b`). A reachable primary
+that returns slowly, times out over HTTP, returns 404, or returns 5xx is never
+replaced by backup. The next retry selects afresh, so primary resumes
+immediately on ping recovery. Configuration is non-secret and machine-local in
+`local/config.toml` under `[llm]`: `primary_url`, `primary_ping_host`,
+`primary_model`, `primary_style`, `primary_num_ctx`, `primary_think`, plus matching `backup_*`
+keys (and optional `backup_identity` for a loopback hostname assertion).
+No environment configuration or arbiter routing is used.
 
 `src/llm.py` semaphore is keyed **per running event loop** — the pipeline runs
 each step under its own `asyncio.run()`, and an asyncio.Semaphore is bound to
@@ -188,13 +195,10 @@ M4B assembly auto-numbers duplicate titles: "Interlude" → "Interlude 1", "Inte
   disown`) — the agentd3 daemon restarts kill foreground tool calls, and a
   killed run leaves partial artifacts (which are resumable, but scripts with
   LLM-fallback chunks must be deleted and regenerated).
-- **LLM backends**: default arbiter `local-coder` (OpenAI-compat). If the
-  arbiter chat fleet is congested (persistent EMPTY completions — the server
-  answers 200 with no content under queue timeouts), fall back to direct
-  Ollama: `BOOK_LLM_STYLE=ollama BOOK_LLM_HOST=http://10.0.0.42:11434
-  BOOK_LLM_MODEL=qwen3.6:35b-a3b`. The OpenAI-compat shim on Ollama IGNORES
-  `think:false` and burns max_tokens on a separate reasoning field — always
-  use the native `/api/chat` style for thinking models.
+- **LLM routing**: native Ollama `/api/chat` is always used through
+  `src/llm.py`; do not bypass it with arbiter, environment settings, or a
+  direct client. Its ICMP-only policy deliberately does not interpret HTTP
+  errors as a host failure.
 - **To stop a pipeline run, kill by the LOCK pid** (`kill $(cat output/<proj>/.pipeline.lock)`), never `pkill -f wrapper.sh` — the wrapper's `exec` chain leaves the venv python as an orphaned grandchild that keeps generating into the same project (happened twice; caused duplicate runners racing scene files).
 
 ## Long runs: ALWAYS detached + sleep (agent rule 2026-09-27)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -73,20 +74,47 @@ def parse_speakers(response: str, count: int, speakers: set[str]) -> list[str]:
     return values
 
 
-async def classify_spans(text: str, speaker_ids: list[str], approved_aliases: dict[str, str] | None = None) -> list[dict]:
+# ##################################################################
+# scoped reference notes
+# turns exact validated mention references into per-span prompt notes keyed by this chapter's content hash and each span's hash and offset; a reference never applies to any other mention of the same name.
+def scoped_reference_notes(text: str, spans: list[str], speakers: set[str], references: list[dict] | None) -> dict[int, list[str]]:
+    chapter_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    by_span: dict[str, list[dict]] = {}
+    for reference in references or []:
+        if reference["chapter_sha256"] == chapter_hash:
+            by_span.setdefault(reference["quote_sha256"], []).append(reference)
+    notes: dict[int, list[str]] = {}
+    for index, span in enumerate(spans):
+        for reference in sorted(by_span.get(hashlib.sha256(span.encode("utf-8")).hexdigest(), []), key=lambda r: r["span_start"]):
+            label, start = reference["label"], reference["span_start"]
+            if span[start : start + len(label)] != label:
+                raise ValueError("scoped reference does not match its source span")
+            if reference["canonical"] not in speakers:
+                raise ValueError(f"scoped reference targets a speaker outside the valid speakers: {reference['canonical']}")
+            notes.setdefault(index, []).append(f"span {index}: the mention {label!r} at character offset {start} is the character {reference['canonical']}")
+    return notes
+
+
+def classification_prompt(speaker_ids: list[str], alias_notes: str, scoped_notes: list[str], indexed: str) -> str:
+    return f"""Classify each immutable source span to exactly one audiobook speaker.
+Valid speakers: {', '.join(speaker_ids)}. Approved aliases that must use their canonical speaker ID: {alias_notes or '(none)'}. Mention-scoped identity references (each applies ONLY to that exact mention in that exact span, never to the same name anywhere else): {'; '.join(scoped_notes) or '(none)'}. Return only the JSON array specified by the response schema: one speaker ID per listed span, in exactly the listed order. narrator for narration and third-person prose. Direct speech may be quoted OR clearly attributed without quotes (for example, 'Klein said Look at it'); assign that speech to its named speaker when unambiguous. Never rewrite, copy, omit, or add text: the program constructs text locally from the immutable spans.
+
+SPANS:\n{indexed}"""
+
+
+async def classify_spans(text: str, speaker_ids: list[str], approved_aliases: dict[str, str] | None = None, scoped_references: list[dict] | None = None) -> list[dict]:
     spans = immutable_spans(text)
     speakers = set(speaker_ids)
     if "narrator" not in speakers:
         raise ValueError("speaker list needs narrator")
+    scoped_notes = scoped_reference_notes(text, spans, speakers, scoped_references)
     assigned: dict[int, str] = {}
     for start in range(0, len(spans), BATCH_SIZE):
         batch = spans[start : start + BATCH_SIZE]
         indexed = "\n".join(f"{start+i}: {span}" for i, span in enumerate(batch))
         alias_notes = ", ".join(f"{alias}->{canonical}" for alias, canonical in sorted((approved_aliases or {}).items()) if alias != canonical)
-        prompt = f"""Classify each immutable source span to exactly one audiobook speaker.
-Valid speakers: {', '.join(speaker_ids)}. Approved aliases that must use their canonical speaker ID: {alias_notes or '(none)'}. Return only the JSON array specified by the response schema: one speaker ID per listed span, in exactly the listed order. narrator for narration and third-person prose. Direct speech may be quoted OR clearly attributed without quotes (for example, 'Klein said Look at it'); assign that speech to its named speaker when unambiguous. Never rewrite, copy, omit, or add text: the program constructs text locally from the immutable spans.
-
-SPANS:\n{indexed}"""
+        batch_notes = [note for index in range(start, start + len(batch)) for note in scoped_notes.get(index, [])]
+        prompt = classification_prompt(speaker_ids, alias_notes, batch_notes, indexed)
         response = await ask(prompt, response_schema=speaker_array_schema(speaker_ids, len(batch)))
         try:
             assigned.update({start + index: speaker for index, speaker in enumerate(parse_speakers(response, len(batch), speakers))})
@@ -96,10 +124,14 @@ SPANS:\n{indexed}"""
 
 
 def generate_hourly_script_sync(
-    chapter_path: Path, script_path: Path, speaker_ids: list[str], approved_aliases: dict[str, str] | None = None
+    chapter_path: Path,
+    script_path: Path,
+    speaker_ids: list[str],
+    approved_aliases: dict[str, str] | None = None,
+    scoped_references: list[dict] | None = None,
 ) -> Path:
     text = chapter_path.read_text(encoding="utf-8")
-    lines = asyncio.run(classify_spans(text, speaker_ids, approved_aliases))
+    lines = asyncio.run(classify_spans(text, speaker_ids, approved_aliases, scoped_references))
     payload = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines)
     temporary = script_path.with_suffix(".partial")
     temporary.write_text(payload, encoding="utf-8")

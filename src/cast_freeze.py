@@ -593,6 +593,50 @@ def verify_proposed_living_entities(batch_units: list[dict], discoveries: list[d
 SCOPED_AUDIT_NAME = "mention-scoped-audit.json"
 ADJUDICATION_MENTIONS_PER_CALL = 12
 ADJUDICATION_MIN_CONFIDENCE = 0.7
+ADJUDICATION_SCENE_CHARS = 2400
+ADJUDICATION_OWNER_FACT_CHARS = 700
+ADJUDICATION_FACTS_TOTAL_CHARS = 6000
+
+
+def bounded_scene(units_by_id: dict, order: list[str], position: int) -> str:
+    """Contiguous same-chapter source around one mention, grown alternately both ways within a fixed character budget; the mention's own unit is always whole."""
+    chapter = units_by_id[order[position]]["chapter_sha256"]
+    low = high = position
+    used = len(units_by_id[order[position]]["quote"])
+    grew = True
+    while grew:
+        grew = False
+        for step in (-1, 1):
+            edge = (low if step < 0 else high) + step
+            if 0 <= edge < len(order) and units_by_id[order[edge]]["chapter_sha256"] == chapter:
+                size = len(units_by_id[order[edge]]["quote"]) + 1
+                if used + size <= ADJUDICATION_SCENE_CHARS:
+                    used += size
+                    low, high = (edge, high) if step < 0 else (low, edge)
+                    grew = True
+    return " ".join(units_by_id[order[index]]["quote"] for index in range(low, high + 1))
+
+
+def owner_prior_facts(registry: dict, owners: list[str]) -> str:
+    """Canonical prior profile and source-derived facts for each possible owner, each bounded, and the whole block bounded."""
+    lines: list[str] = []
+    remaining = ADJUDICATION_FACTS_TOTAL_CHARS
+    for owner in owners:
+        entry = registry[owner]
+        facts = entry.get("facts") if isinstance(entry.get("facts"), dict) else {}
+        parts = [f"name={entry.get('name', owner)!r}"]
+        for field in ("bio", "look"):
+            if entry.get(field):
+                parts.append(f"{field}={str(entry[field])!r}")
+        for field in ("voice", "look"):
+            if facts.get(field):
+                parts.append(f"prior {field} facts={' | '.join(str(item) for item in facts[field])!r}")
+        text = f"{owner}: " + "; ".join(parts)
+        text = text[: min(ADJUDICATION_OWNER_FACT_CHARS, max(remaining, 0))]
+        if text:
+            lines.append(text)
+            remaining -= len(text)
+    return "\n".join(lines) or "(none)"
 
 
 def load_scoped_audit(project: Path) -> list[dict]:
@@ -602,6 +646,15 @@ def load_scoped_audit(project: Path) -> list[dict]:
     records = load_object(path, "mention-scoped audit").get("records")
     mention_scoped_audit_index(records)
     return records
+
+
+SCOPED_REFERENCE_FIELDS = ("chapter_sha256", "quote_sha256", "label", "span_start", "canonical")
+
+
+def scoped_audit_attestation(records: list[dict]) -> dict:
+    """Order-independent digest binding the exact validated set of mention-scoped audit records to the freeze."""
+    ordered = sorted(mention_scoped_audit_index(records).values(), key=lambda r: (r["chapter_sha256"], r["quote_sha256"], r["span_start"], r["label"]))
+    return {"version": 1, "count": len(ordered), "sha256": json_digest(ordered)}
 
 
 def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[dict], registry: dict, ask) -> None:
@@ -638,9 +691,10 @@ def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[
             rows = []
             for mention_id, scope in zip(ids, chunk, strict=True):
                 position = order.index(mentions[scope]["id"])
-                context = " ".join(units_by_id[order[index]]["quote"] for index in range(max(0, position - 1), min(len(order), position + 2)))
-                rows.append(f"{mention_id} [{mentions[scope]['chapter']}] mention: {mentions[scope]['quote']}\n   neighbouring context: {context}")
-            prompt = f"Decide separately, for each exact mention of the label {candidate['label']!r}, whether THIS mention refers to an existing character. Never decide by spelling or sound similarity, and never generalise from one mention to another. alias requires the mention or its neighbouring context to prove identity with the named owner; canonical must be that owner. non_character: not a person/creature. ambiguous: the source cannot decide. Give honest confidence and a short source-based reason.\nPossible owners: {roster}\nMENTIONS:\n" + "\n".join(rows)
+                rows.append(f"{mention_id} [{mentions[scope]['chapter']}] mention: {mentions[scope]['quote']}\n   bounded scene: {bounded_scene(units_by_id, order, position)}")
+            prompt = f"Decide separately, for each exact mention of the label {candidate['label']!r}, whether THIS mention refers to an existing character. Never decide by spelling or sound similarity, and never generalise from one mention to another. alias requires the mention or its bounded scene to prove identity with the named owner, consistent with that owner's canonical prior facts; canonical must be that owner. non_character: not a person/creature. ambiguous: the source cannot decide. Give honest confidence and a short source-based reason.\nPossible owners: {roster}\nCanonical prior facts for the possible owners:\n{owner_prior_facts(registry, owners)}\nMENTIONS:\n" + "\n".join(rows)
+            if len(prompt) > PREPARATION_PROMPT_MAX_CHARS:
+                raise RuntimeError(f"scoped adjudication prompt exceeds native context budget for {candidate['label']!r}")
             value = json.loads(ask(prompt, max_tokens=1500, max_attempts=1, response_schema=schema))
             returned = value.get("mentions") if isinstance(value, dict) else None
             if not isinstance(returned, list) or {r.get("mention_id") for r in returned if isinstance(r, dict)} != set(ids) or len(returned) != len(ids):
@@ -1020,7 +1074,37 @@ def verify_frozen_cast(source: Path, project: Path | None = None) -> dict:
     actual = asset_hashes(project, set(actors))
     if actual != manifest.get("asset_hashes"):
         raise RuntimeError("frozen cast profile, voice, WAV, appearance, or portrait bytes changed")
+    # A manifest frozen before scoped audit existed attests an empty record set; any record appearing later is unattested.
+    attested = manifest.get("scoped_audit", scoped_audit_attestation([]))
+    if attested != scoped_audit_attestation(load_scoped_audit(project)):
+        raise RuntimeError("frozen cast manifest does not attest the current mention-scoped audit records")
     return manifest
+
+
+# ##################################################################
+# scoped references
+# yields each attested alias record as one exact mention reference, proven against the actual source spans and approved actors; never a global alias.
+def validated_scoped_references(source: Path, project: Path | None = None, manifest: dict | None = None) -> list[dict]:
+    source = source.resolve()
+    project = project or get_output_dir(source)
+    manifest = manifest or verify_frozen_cast(source, project)
+    _, _, chapters = source_chapters(source, project)
+    units = {(unit["chapter_sha256"], text_digest(unit["quote"])): unit for unit in immutable_evidence_units(chapters)}
+    references: list[dict] = []
+    for record in sorted(load_scoped_audit(project), key=lambda r: (r["chapter_sha256"], r["quote_sha256"], r["span_start"], r["label"])):
+        if record["decision"] != "alias":
+            continue
+        unit = units.get((record["chapter_sha256"], record["quote_sha256"]))
+        if unit is None:
+            raise RuntimeError("mention-scoped alias is bound to source text that does not exist")
+        if not any(ref["label"] == record["label"] and ref["start"] == record["span_start"] for ref in immutable_name_references([unit]).values()):
+            raise RuntimeError("mention-scoped alias does not name an exact source mention at its offset")
+        if record["canonical"] not in manifest["actors"]:
+            raise RuntimeError("mention-scoped alias targets an actor outside the frozen cast")
+        if record["confidence"] < ADJUDICATION_MIN_CONFIDENCE:
+            raise RuntimeError("mention-scoped alias is below the adjudication confidence floor")
+        references.append({field: record[field] for field in SCOPED_REFERENCE_FIELDS})
+    return references
 
 
 # ##################################################################
@@ -1242,6 +1326,7 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
         "approved_aliases": aliases,
         "inactive_legacy_ids": sorted(inactive),
         "asset_hashes": asset_hashes(project, set(actors)),
+        "scoped_audit": scoped_audit_attestation(load_scoped_audit(project)),
     }
     atomic_json(project / MANIFEST_NAME, manifest)
     verify_frozen_cast(source, project)

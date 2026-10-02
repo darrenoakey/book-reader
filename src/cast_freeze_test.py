@@ -651,3 +651,92 @@ def test_discover_batch_adjudicates_each_mention_and_persists_before_mapping(tmp
     assert aliased[0]["span_start"] == units[1]["quote"].index("Young") and isinstance(aliased[0]["span_start"], int)
     assert any(c["status"] == "known" and c["identity"] == "young_ren" for c in classifications)
     assert any(c["status"] == "non_character" for c in classifications)
+
+
+# ##################################################################
+# scoped audit freeze attestation
+# the freeze manifest attests the exact scoped record set: appended, altered, or removed records fail closed, and only validated alias records become exact references.
+def test_freeze_attests_scoped_audit_and_exports_exact_references() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        source, project = write_frozen_project(Path(directory))
+        try:
+            run_scoped_freeze_checks(source, project)
+        finally:
+            shutil.rmtree(project, ignore_errors=True)
+
+
+def run_scoped_freeze_checks(source: Path, project: Path) -> None:
+    from src.cast_freeze import SCOPED_AUDIT_NAME, scoped_audit_attestation, validated_scoped_references
+    chapters = sorted((project / "chapters").glob("*.txt"))
+    units = immutable_evidence_units(chapters)
+    unit = next(u for u in units if "Ron Blackfire" in u["quote"])
+    start = unit["quote"].index("Ron")
+
+    def record(**changes: object) -> dict:
+        return {
+            "chapter_sha256": unit["chapter_sha256"],
+            "quote_sha256": hashlib.sha256(unit["quote"].encode()).hexdigest(),
+            "label": "Ron",
+            "span_start": start,
+            "canonical": "ron_blackfire",
+            "decision": "alias",
+            "confidence": 0.9,
+            "reason": "context names Ron Blackfire",
+            **changes,
+        }
+
+    manifest_path = project / MANIFEST_NAME
+    legacy = json.loads(manifest_path.read_text())
+    assert "scoped_audit" not in legacy and verify_frozen_cast(source, project)  # legacy manifest attests no records
+    assert validated_scoped_references(source, project) == []
+    records = [record(), record(label="Ren", span_start=0, decision="non_character", canonical="none", reason="x")]
+    (project / SCOPED_AUDIT_NAME).write_text(json.dumps({"records": records}))
+    with pytest.raises(RuntimeError, match="attest"):
+        verify_frozen_cast(source, project)  # records appeared after an empty attestation
+    manifest_path.write_text(json.dumps({**legacy, "scoped_audit": scoped_audit_attestation(records)}))
+    assert verify_frozen_cast(source, project)
+    references = validated_scoped_references(source, project)
+    assert references == [{k: records[0][k] for k in ("chapter_sha256", "quote_sha256", "label", "span_start", "canonical")}]
+    assert json.loads(manifest_path.read_text())["approved_aliases"] == legacy["approved_aliases"] and "ron" not in legacy["approved_aliases"]
+    reordered = list(reversed(records))
+    assert scoped_audit_attestation(reordered) == scoped_audit_attestation(records)
+    (project / SCOPED_AUDIT_NAME).write_text(json.dumps({"records": [records[0]]}))
+    with pytest.raises(RuntimeError, match="attest"):
+        verify_frozen_cast(source, project)
+    for bad, message in (
+        (record(span_start=start + 1), "exact source mention"),
+        (record(canonical="not_frozen"), "outside the frozen cast"),
+        (record(quote_sha256="0" * 64), "does not exist"),
+        (record(confidence=0.5), "confidence"),
+    ):
+        (project / SCOPED_AUDIT_NAME).write_text(json.dumps({"records": [bad]}))
+        manifest_path.write_text(json.dumps({**legacy, "scoped_audit": scoped_audit_attestation([bad])}))
+        with pytest.raises(RuntimeError, match=message):
+            validated_scoped_references(source, project)
+
+
+# ##################################################################
+# adjudication prompt carries canonical prior facts and the full bounded scene
+# the owner's profile and source-derived facts plus a same-chapter scene beyond one neighbouring sentence reach every generic adjudication call.
+def test_adjudication_prompt_includes_prior_facts_and_bounded_scene(tmp_path: Path) -> None:
+    from src.cast_freeze import ADJUDICATION_SCENE_CHARS, adjudicate_pending_mentions, immutable_name_references
+
+    chapter = tmp_path / "ch1.txt"
+    filler = " ".join(f"Filler sentence number {i} about nothing." for i in range(200))
+    chapter.write_text(f"Opening remark about the harbour. Elena of the north was proud. Marta wept. Young bowed low. Later Marta said farewell. {filler}", encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    registry = {"young_ren": {"name": "Young Ren", "bio": "a boy raised by Elena of the north", "look": "freckled", "facts": {"voice": ["soft tenor"], "look": ["scar on chin"]}}}
+    candidate = {"id": "p0000", "label": "Young", "ref_ids": [r for r, ref in immutable_name_references(units).items() if ref["label"] == "Young"]}
+    prompts: list[str] = []
+
+    def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
+        prompts.append(prompt)
+        return json.dumps({"mentions": [{"mention_id": "m0", "decision": "ambiguous", "canonical": "none", "confidence": 0.5, "reason": "x"}]})
+
+    adjudicate_pending_mentions(tmp_path, [{"candidate": candidate, "proposed": "young_ren"}], units, registry, ask)
+    prompt = prompts[0]
+    assert "a boy raised by Elena of the north" in prompt and "soft tenor" in prompt and "scar on chin" in prompt and "freckled" in prompt
+    scene = prompt.split("bounded scene: ")[1].splitlines()[0]
+    assert "Opening remark about the harbour." in scene and "Marta wept." in scene and "Later Marta said farewell." in scene
+    assert len(scene) <= ADJUDICATION_SCENE_CHARS + len(units[3]["quote"])
+    assert "Filler sentence number 199" not in scene

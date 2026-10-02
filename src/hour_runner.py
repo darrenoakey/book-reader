@@ -306,7 +306,12 @@ def prepare_hour_directory(project: Path, hour_dir: Path, approved_cast: dict | 
 # script for chapter
 # create one chapter script against the current shared cast, avoiding any full-book script pass.
 def script_for_chapter(
-    project: Path, hour_dir: Path, chapter: Path, cast: dict, aliases: dict[str, str] | None = None
+    project: Path,
+    hour_dir: Path,
+    chapter: Path,
+    cast: dict,
+    aliases: dict[str, str] | None = None,
+    scoped_references: list[dict] | None = None,
 ) -> Path:
     shared_dir = project / "script_cache"
     shared_dir.mkdir(exist_ok=True)
@@ -373,7 +378,7 @@ def script_for_chapter(
             ) from error
     from src.hourly_spans import generate_hourly_script_sync
 
-    generate_hourly_script_sync(chapter, canonical, sorted(cast), aliases)
+    generate_hourly_script_sync(chapter, canonical, sorted(cast), aliases, scoped_references)
     payload = canonical.read_bytes()
     atomic_json(
         metadata,
@@ -381,6 +386,11 @@ def script_for_chapter(
             "mode": "immutable-spans",
             "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
             "sha256": hashlib.sha256(payload).hexdigest(),
+            **(
+                {"scoped_references_sha256": hashlib.sha256(json.dumps(scoped_references, sort_keys=True).encode()).hexdigest()}
+                if scoped_references
+                else {}
+            ),
         },
     )
     script_dir = hour_dir / "script"
@@ -508,14 +518,16 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
     # touching a registry. Every new production hour starts only after the whole-source
     # frozen manifest verifies the source and every voice/portrait anchor byte.
     if hour_index >= 3:
-        from src.cast_freeze import load_approved_cast, verify_frozen_cast
+        from src.cast_freeze import load_approved_cast, validated_scoped_references, verify_frozen_cast
 
         frozen = verify_frozen_cast(source, project)
         cast = load_approved_cast(source, project)
         aliases = frozen["approved_aliases"]
+        scoped_references = validated_scoped_references(source, project, frozen)
     else:
         cast = {}
         aliases = None
+        scoped_references = None
     if tts_engine.engine_name() != "breeze":
         raise RuntimeError("hour production requires Breeze shared voice references")
     hour_dir = project / "hours" / f"hour-{hour_index:03d}"
@@ -530,7 +542,7 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
         # New hours never extend cast, voice, appearance, or portrait state.
         prepare_hour_directory(project, hour_dir, cast if hour_index >= 3 else None)
         copy_chapter_context(hour_dir, chapters[chapter_index])
-        script = script_for_chapter(project, hour_dir, chapters[chapter_index], cast, aliases)
+        script = script_for_chapter(project, hour_dir, chapters[chapter_index], cast, aliases, scoped_references)
         start_piece = piece_cursor if chapter_index == chapter_cursor else 0
         candidates, _ = synthesize_window(project, script, remaining, start_piece)
         if not candidates:

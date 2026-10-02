@@ -17,12 +17,12 @@ from src.cast_freeze import (
     apply_alias_audit,
     asset_hashes,
     context_safe_batch,
-    discovery_prompt,
     discovery_schema,
     immutable_evidence_units,
+    immutable_name_references,
     materialize_evidence_discovery,
     record_rejected_discovery,
-    repair_prompt,
+    refresh_alias_audit,
     source_label_present,
     validate_discovery,
     validate_preparation_coverage,
@@ -100,162 +100,56 @@ def write_frozen_project(root: Path) -> tuple[Path, Path]:
 
 
 # ##################################################################
-# test schema is closed
-# proves native Ollama receives a bounded response schema and cannot add arbitrary top-level response fields.
-def test_discovery_schema_is_closed_and_known_canonical_only() -> None:
-    schema = discovery_schema(["ren", "ron_blackfire"])
-    assert schema["additionalProperties"] is False
-    item = schema["properties"]["characters"]["items"]
-    assert item["additionalProperties"] is False
-    assert item["properties"]["canonical_id"]["enum"] == ["new", "ren", "ron_blackfire"]
-    source_schema = discovery_schema(["ren"], ["c00s00000", "c00s00001"])
-    source_item = source_schema["properties"]["characters"]["items"]
-    assert source_item["required"][-1] == "evidence_unit_ids"
-    assert source_item["properties"]["evidence_unit_ids"]["items"]["enum"] == ["c00s00000", "c00s00001"]
+# test source reference schemas
+# existing actors select only canonical IDs plus nonempty source references; new actors select one local name reference and optional aliases.
+def test_discovery_schema_has_mode_specific_name_references() -> None:
+    ref_ids = ["c00s00000n000", "c00s00000n001"]
+    existing = discovery_schema(["ren", "ron_blackfire"], ref_ids, "existing")["properties"]["characters"]["items"]
+    assert existing["required"] == ["canonical_id", "alias_refs", "voice_facts", "look_facts"]
+    assert "name_ref" not in existing["properties"]
+    assert existing["properties"]["alias_refs"]["minItems"] == 1
+    new = discovery_schema(["ren"], ref_ids, "new")["properties"]["characters"]["items"]
+    assert new["properties"]["name_ref"]["enum"] == ref_ids
 
 
 # ##################################################################
-# test discovery reduction and repair
-# keeps normal batch output focused on additions and makes a repair carry a concrete validation failure plus the same numbered source units.
-def test_discovery_prompt_requests_only_additions_and_repair_has_error() -> None:
+# test source references materialize exact labels
+# local reference lookup prevents Kloene invention and bare Xiao selection without offset arithmetic or copied strings.
+def test_source_references_materialize_exact_labels_and_reject_bare_xiao() -> None:
     with tempfile.TemporaryDirectory() as directory:
         chapter = Path(directory) / "01-part.txt"
-        chapter.write_text("Ren spoke.", encoding="utf-8")
-        prompt = discovery_prompt([chapter], {"ren": {"name": "Ren"}}, {"ren": "ren"})
-        repair = repair_prompt(ValueError("missing c00s00000"), [chapter], {"ren": {"name": "Ren"}}, {"ren": "ren"})
-        assert "Do not repeat an unchanged known actor" in prompt
-        assert "Scan every numbered source unit" in prompt
-        assert "one record per actor" in prompt
-        assert 'canonical_id MUST be exactly "new"' in prompt
-        assert 'id="professor_xiao"' in prompt
-        assert "missing c00s00000" in repair
-        assert "structural identity mismatch" in repair
-        assert "[c00s00000] Ren spoke." in repair
-
-
-# ##################################################################
-# test immutable evidence materialization
-# proves the native schema can only select source IDs and local code writes the byte-exact source sentence rather than LLM-provided prose.
-def test_evidence_ids_materialize_exact_source_and_ground_names() -> None:
-    with tempfile.TemporaryDirectory() as directory:
-        chapter = Path(directory) / "01-part.txt"
-        chapter.write_text("Ren said, Hello. Ron watched Ren.", encoding="utf-8")
+        chapter.write_text("Klene Goldest arrived. Foam Xiao waved. Xiao left.", encoding="utf-8")
         units = immutable_evidence_units([chapter])
-        raw = {
-            "characters": [
-                {
-                    "canonical_id": "new",
-                    "id": "ren",
-                    "name": "Ren",
-                    "aliases": [],
-                    "voice_facts": "speaks",
-                    "look_facts": "",
-                    "evidence_unit_ids": [units[0]["id"]],
-                }
-            ]
-        }
-        materialized, citations = materialize_evidence_discovery(raw, units)
-        assert citations == [[units[0]["id"]]]
-        assert materialized["characters"][0]["evidence"] == ["Ren said, Hello."]
-        assert (
-            validate_discovery(materialized, chapter.read_text(encoding="utf-8"), set()) == materialized["characters"]
-        )
-        raw["characters"][0]["aliases"] = ["Rin"]
-        with pytest.raises(ValueError, match="lacks selected source evidence"):
-            materialize_evidence_discovery(raw, units)
-        raw["characters"][0]["aliases"] = []
-        raw["characters"][0]["evidence_unit_ids"] = ["made_up"]
-        with pytest.raises(ValueError, match="invalid immutable evidence ID"):
-            materialize_evidence_discovery(raw, units)
-        raw["characters"][0].update({"canonical_id": "ron", "id": "foam_xiao", "name": "Foam Xiao"})
-        raw["characters"][0]["evidence_unit_ids"] = [units[0]["id"]]
-        with pytest.raises(ValueError, match="structural identity mismatch.*canonical_id='new'"):
-            materialize_evidence_discovery(raw, units)
-        raw["characters"] = [
-            {"canonical_id": "new", "id": "ren", "name": "Ren", "aliases": ["Ron"], "voice_facts": "", "look_facts": "", "evidence_unit_ids": [unit["id"] for unit in units]},
-            {"canonical_id": "new", "id": "ron", "name": "Ron", "aliases": [], "voice_facts": "", "look_facts": "", "evidence_unit_ids": [unit["id"] for unit in units]},
-        ]
-        with pytest.raises(ValueError, match="duplicate new identity label"):
-            materialize_evidence_discovery(raw, units)
-        raw["characters"] = [{"canonical_id": "new", "id": "ren", "name": "Ren", "aliases": ["Ron"], "voice_facts": "", "look_facts": "", "evidence_unit_ids": [unit["id"] for unit in units]}]
-        with pytest.raises(ValueError, match="conflicts with approved source alias"):
-            materialize_evidence_discovery(raw, units, {"ron": "ron"})
+        refs = immutable_name_references(units)
+        assert all(" and " not in ref["label"].casefold() for ref in refs.values())
+        find = lambda label: next(ref_id for ref_id, ref in refs.items() if ref["label"] == label)
+        raw = {"characters": [{"canonical_id": "k_goldest", "alias_refs": [find("Klene Goldest")], "voice_facts": "", "look_facts": ""}]}
+        materialized, citations = materialize_evidence_discovery(raw, units, {"klene_goldest": "k_goldest"}, {"k_goldest": {"name": "K Goldest"}})
+        assert materialized["characters"][0]["name"] == "K Goldest"
+        assert materialized["characters"][0]["aliases"] == ["Klene Goldest"]
+        assert "Kloene" not in json.dumps(materialized)
+        raw["characters"][0]["alias_refs"] = [find("Xiao")]
+        with pytest.raises(ValueError, match="bare Xiao"):
+            materialize_evidence_discovery(raw, units, {}, {"k_goldest": {"name": "K Goldest"}})
+        assert citations[0][0] in refs
 
 
 # ##################################################################
-# test audited global alias
-# permits an already source-audited alias for an existing canonical actor without letting the same absent label invent a new actor.
-def test_existing_canonical_can_use_only_approved_global_alias() -> None:
+# test new identity full source references
+# derives full canonical IDs locally from exact enumerated source spans.
+def test_new_identity_uses_full_exact_source_name_reference() -> None:
     with tempfile.TemporaryDirectory() as directory:
         chapter = Path(directory) / "01-part.txt"
-        chapter.write_text("The tiger boy watched the road.", encoding="utf-8")
+        chapter.write_text("Foam Xiao arrived. Aster Blackwood spoke.", encoding="utf-8")
         units = immutable_evidence_units([chapter])
-        raw = {
-            "characters": [
-                {
-                    "canonical_id": "tiger_boy",
-                    "id": "tiger_boy",
-                    "name": "Jean",
-                    "aliases": ["Jean"],
-                    "voice_facts": "",
-                    "look_facts": "",
-                    "evidence_unit_ids": [units[0]["id"]],
-                }
-            ]
-        }
-        materialized, _ = materialize_evidence_discovery(raw, units, {"jean": "tiger_boy"})
-        assert materialized["characters"][0]["evidence"] == ["The tiger boy watched the road."]
-        raw["characters"][0]["canonical_id"] = "new"
-        raw["characters"][0]["id"] = "jean"
-        with pytest.raises(ValueError, match="lacks selected source evidence"):
-            materialize_evidence_discovery(raw, units, {"jean": "tiger_boy"})
-
-
-# ##################################################################
-# test selected alias actor link
-# accepts a new existing-actor spelling only when its own source unit and a canonical or approved spelling are both selected.
-def test_existing_alias_requires_selected_exact_witness_and_actor_link() -> None:
-    with tempfile.TemporaryDirectory() as directory:
-        chapter = Path(directory) / "01-part.txt"
-        chapter.write_text("Weey began drawing. Professor Weii taught the class. We sat quietly.", encoding="utf-8")
-        units = immutable_evidence_units([chapter])
-        raw = {
-            "characters": [
-                {
-                    "canonical_id": "professor_wei",
-                    "id": "professor_wei",
-                    "name": "Professor Wei",
-                    "aliases": ["Weey"],
-                    "voice_facts": "",
-                    "look_facts": "",
-                    "evidence_unit_ids": [unit["id"] for unit in units],
-                }
-            ]
-        }
-        materialized, _ = materialize_evidence_discovery(
-            raw,
-            units,
-            {"weii": "professor_wei", "professor_wei": "professor_wei"},
-            {"professor_wei": {"name": "Professor Wei"}},
-        )
-        assert materialized["characters"][0]["aliases"] == ["Weey"]
-        raw["characters"][0]["evidence_unit_ids"] = [units[0]["id"]]
-        with pytest.raises(ValueError, match="lacks selected actor link"):
-            materialize_evidence_discovery(
-                raw,
-                units,
-                {"weii": "professor_wei", "professor_wei": "professor_wei"},
-                {"professor_wei": {"name": "Professor Wei"}},
-            )
-        raw["characters"][0]["aliases"] = ["We"]
-        raw["characters"][0]["evidence_unit_ids"] = [unit["id"] for unit in units]
-        with pytest.raises(ValueError, match="generic pronoun"):
-            materialize_evidence_discovery(
-                raw,
-                units,
-                {"weii": "professor_wei", "professor_wei": "professor_wei"},
-                {"professor_wei": {"name": "Professor Wei"}},
-            )
+        refs = immutable_name_references(units)
+        find = lambda label: next(ref_id for ref_id, ref in refs.items() if ref["label"] == label)
+        raw = {"characters": [
+            {"canonical_id": "new", "name_ref": find("Foam Xiao"), "alias_refs": [], "voice_facts": "", "look_facts": ""},
+            {"canonical_id": "new", "name_ref": find("Aster Blackwood"), "alias_refs": [], "voice_facts": "", "look_facts": ""},
+        ]}
+        materialized, _ = materialize_evidence_discovery(raw, units)
+        assert [entry["id"] for entry in materialized["characters"]] == ["foam_xiao", "aster_blackwood"]
 
 
 # ##################################################################
@@ -398,3 +292,42 @@ def test_source_label_requires_whole_word_boundary() -> None:
     assert not source_label_present("Foa", units)
     assert not source_label_present("Xia", units)
     assert source_label_present("Xiao", [{"id": "x", "chapter": "a", "quote": "Hi, Xiao."}])
+
+# ##################################################################
+# test additive audit refresh
+# applies newly appended verified aliases at cursor 60 without moving progress or rewriting media, and remains identical on a second refresh.
+def test_audit_refresh_is_additive_idempotent_and_preserves_cursor(tmp_path: Path) -> None:
+    source_text = "Klein Goldrest greeted Klene Goldest. Kai is the lizard boy."
+    (tmp_path / "cast_alias_audit.json").write_text(
+        json.dumps(
+            [
+                {"alias": "Klein", "canonical": "k_goldest", "evidence": ["Klein Goldrest"], "decision": "merge"},
+                {"alias": "Klene", "canonical": "k_goldest", "evidence": ["Klene Goldest"], "decision": "merge"},
+                {"alias": "kai", "canonical": "lizard_boy", "evidence": ["Kai is the lizard boy"], "decision": "merge"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "characters.json").write_text(
+        json.dumps({"k_goldest": {"name": "K Goldest"}, "kai": {"name": "Kai"}, "lizard_boy": {"name": "Lizard Boy"}}), encoding="utf-8"
+    )
+    progress = {
+        "next_chapter": 60,
+        "completed_batches": [{"start": 0, "end": 60, "chapter_sha256": {"01.txt": "unchanged"}}],
+        "registry": {"k_goldest": {"name": "K Goldest"}},
+        "aliases": {"k_goldest": "k_goldest", "kai": "kai", "lizard_boy": "lizard_boy"},
+        "inactive_legacy_ids": ["old_legacy"],
+        "ambiguous_new_ids": [],
+        "audit_applied": True,
+    }
+    inactive, _ = refresh_alias_audit(tmp_path, source_text, progress)
+    assert progress["next_chapter"] == 60
+    assert progress["completed_batches"] == [{"start": 0, "end": 60, "chapter_sha256": {"01.txt": "unchanged"}}]
+    assert progress["aliases"]["klein"] == "k_goldest"
+    assert progress["aliases"]["klene"] == "k_goldest"
+    assert progress["aliases"]["kai"] == "lizard_boy"
+    assert "kloene" not in progress["aliases"]
+    assert {"old_legacy", "klein", "klene", "kai"} <= inactive
+    before = json.loads(json.dumps(progress, sort_keys=True))
+    refresh_alias_audit(tmp_path, source_text, progress)
+    assert progress == before

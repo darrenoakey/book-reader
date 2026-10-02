@@ -113,46 +113,44 @@ def immutable_evidence_units(chapters: list[Path]) -> list[dict[str, str]]:
 
 
 # ##################################################################
+# immutable name references
+# enumerates bounded whole-token source spans with stable IDs so a model selects exact names without calculating offsets or copying text.
+def immutable_name_references(units: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    references: dict[str, dict[str, str]] = {}
+    for unit in units:
+        tokens = list(re.finditer(r"\b[\w'-]+\b", unit["quote"]))
+        index = 0
+        for start, token in enumerate(tokens):
+            if not token.group()[0].isupper():
+                continue
+            for end in range(start + 1, min(start + 5, len(tokens)) + 1):
+                label = unit["quote"][token.start() : tokens[end - 1].end()]
+                if " and " in label.casefold() or " or " in label.casefold():
+                    continue
+                if source_label_present(label, [unit]):
+                    references[f"{unit['id']}n{index:03d}"] = {"unit_id": unit["id"], "label": label}
+                    index += 1
+    return references
+
+
+# ##################################################################
 # source batch schema
 # asks native Ollama to select only enumerated immutable source IDs; the program, never the model, materializes quotations.
-def discovery_schema(known_ids: list[str], evidence_unit_ids: list[str] | None = None, mode: str = "all") -> dict:
+def discovery_schema(known_ids: list[str], name_ref_ids: list[str] | None = None, mode: str = "all") -> dict:
     known = sorted(set(known_ids))
-    if mode not in {"all", "new", "existing"}:
+    if mode not in {"new", "existing"}:
         raise ValueError(f"unknown discovery mode: {mode}")
     if mode == "existing" and not known:
         raise ValueError("existing-alias discovery requires known canonical IDs")
-    canonical_enum = ["new"] if mode == "new" else known if mode == "existing" else ["new", *known]
-    evidence_property = (
-        {"type": "array", "items": {"type": "string", "enum": evidence_unit_ids}, "minItems": 1, "maxItems": 8}
-        if evidence_unit_ids is not None
-        else {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 8}
-    )
-    evidence_key = "evidence_unit_ids" if evidence_unit_ids is not None else "evidence"
-    return {
-        "type": "object",
-        "properties": {
-            "characters": {
-                "type": "array",
-                "maxItems": MAX_BATCH_CHARACTERS,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "canonical_id": {"type": "string", "enum": canonical_enum},
-                        "id": {"type": "string", "minLength": 1, "maxLength": 80},
-                        "name": {"type": "string", "minLength": 1, "maxLength": 120},
-                        "aliases": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 12},
-                        "voice_facts": {"type": "string", "maxLength": 1000},
-                        "look_facts": {"type": "string", "maxLength": 1000},
-                        evidence_key: evidence_property,
-                    },
-                    "required": ["canonical_id", "id", "name", "aliases", "voice_facts", "look_facts", evidence_key],
-                    "additionalProperties": False,
-                },
-            }
-        },
-        "required": ["characters"],
-        "additionalProperties": False,
-    }
+    if not name_ref_ids:
+        raise ValueError("discovery schema requires immutable name references")
+    refs = {"type": "array", "items": {"type": "string", "enum": name_ref_ids}, "minItems": 0 if mode == "new" else 1, "maxItems": 12, "uniqueItems": True}
+    properties = {"canonical_id": {"type": "string", "enum": ["new"] if mode == "new" else known}, "alias_refs": refs, "voice_facts": {"type": "string", "maxLength": 1000}, "look_facts": {"type": "string", "maxLength": 1000}}
+    required = ["canonical_id", "alias_refs", "voice_facts", "look_facts"]
+    if mode == "new":
+        properties["name_ref"] = {"type": "string", "enum": name_ref_ids}
+        required.insert(1, "name_ref")
+    return {"type": "object", "properties": {"characters": {"type": "array", "maxItems": MAX_BATCH_CHARACTERS, "items": {"type": "object", "properties": properties, "required": required, "additionalProperties": False}}}, "required": ["characters"], "additionalProperties": False}
 
 
 def exclusion_text(exclude: list[str] | None) -> str:
@@ -167,7 +165,7 @@ def exclusion_text(exclude: list[str] | None) -> str:
 MODE_INSTRUCTIONS = {
     "all": "",
     "new": 'THIS CALL: report ONLY brand-new actors absent from Known canonical IDs. Every record MUST have canonical_id="new"; the schema permits nothing else. Do not report aliases of known actors.',
-    "existing": "THIS CALL: report ONLY new source-backed aliases of actors already in Known canonical IDs. canonical_id and id MUST both be that known ID; never report a brand-new actor.",
+    "existing": "THIS CALL: report ONLY source-selected labels of actors already in Known canonical IDs. canonical_id MUST be that known ID; never report a brand-new actor.",
 }
 
 
@@ -182,17 +180,28 @@ def discovery_prompt(
         f"{alias}->{canonical}" for alias, canonical in sorted(aliases.items()) if alias != canonical
     )
     units = immutable_evidence_units(chapters)
+    references = immutable_name_references(units)
     excerpts = "\n".join(f"[{unit['id']}] {unit['quote']}" for unit in units)
-    return f"""Return ALL legitimate named or consistently role-named people/creatures who are unknown to the registry, plus new source-backed aliases for existing actors. Scan every numbered source unit; do not stop after the first discoveries. Do not repeat an unchanged known actor. Emit one record per actor: put spellings such as Foam/Fong/Fo in that actor's aliases, never as duplicate new actors. Do not invent a character for an unnamed crowd, pronoun, title, or a mere mention. Use the response schema only.
+    reference_text = "; ".join(f"{ref_id}={ref['label']}" for ref_id, ref in references.items())
+    objective = {
+        "all": "Return all legitimate named people/creatures unknown to the registry plus source-backed aliases for existing actors.",
+        "new": "Return only legitimate named people/creatures unknown to the registry; do not return existing actors.",
+        "existing": "Return only source-backed aliases for known existing actors; do not return any new actor.",
+    }[mode]
+
+    return f"""{objective} Scan every numbered source unit; do not stop after the first discoveries. Do not repeat an unchanged known actor. Emit one record per actor: put spellings such as Foam/Fong/Fo in that actor's aliases, never as duplicate new actors. Do not invent a character for an unnamed crowd, pronoun, title, or a mere mention. Use the response schema only.
 
 Known canonical IDs (reuse a listed ID only when source evidence establishes it is the same identity): {roster or "(none)"}
 Approved source-audited aliases (always use their canonical target, never create the alias as a new identity): {approved_aliases or "(none)"}
 
-IDENTITY SENTINEL: For EVERY new actor absent from Known canonical IDs, canonical_id MUST be exactly "new" and id MUST be lowercase underscore normalization of name. When selected units contain a full multiword personal name and shorter spellings for that actor, name MUST be the full exact source name and shorter spellings belong only in aliases. Examples: source "Foam Xiao" -> canonical_id="new", id="foam_xiao", name="Foam Xiao"; source "Professor Xiao" -> canonical_id="new", id="professor_xiao", name="Professor Xiao". Never select an existing canonical_id for a different name or id. For an existing actor, canonical_id must be that exact known ID and id must repeat it. You may add a previously unknown alias only when selected units prove both the exact alias spelling and that it is the existing actor (a selected unit must name the canonical name or a pre-approved alias). Never use generic pronouns (including We) as aliases. A pre-approved source-audited alias may establish the identity globally even when absent from this batch. Select evidence_unit_ids only from the numbered source units. Do not copy, paraphrase, or quote source text: local code creates the exact citations from your selected IDs. voice_facts and look_facts may contain only facts supported by selected units; use an empty string when unstated. Never infer a merge from similarity alone.
+IDENTITY SENTINEL: Select only immutable NAME REFERENCES below: never return name, alias, id, quotation, paraphrase, or spelling text. For new actors use canonical_id="new" with one name_ref; local code derives its full normalized ID. For existing actors use canonical_id and alias_refs only: local code derives their unchanged name/id from the registry. alias_refs must be nonempty. Never infer a merge from similarity. Bare Xiao and generic pronouns are invalid aliases. A pre-approved source-audited alias may establish identity globally even when absent from this batch. voice_facts and look_facts may contain only facts supported by the selected source units; use an empty string when unstated.
 
 {MODE_INSTRUCTIONS[mode]}{exclusion_text(exclude)}
 
-SOURCE EVIDENCE UNITS:\n{excerpts}"""
+SOURCE EVIDENCE UNITS:\n{excerpts}
+
+IMMUTABLE NAME REFERENCES:
+{reference_text}"""
 
 
 # ##################################################################
@@ -233,91 +242,46 @@ def existing_actor_linked(
 ) -> bool:
     entry = (registry or {}).get(canonical, {})
     labels = [canonical.replace("_", " "), str(entry.get("name", ""))]
-    labels.extend(alias for alias, target in approved_aliases.items() if target == canonical)
+    labels.extend(alias.replace("_", " ") for alias, target in approved_aliases.items() if target == canonical)
     return any(label.strip() and normalized_id(label) not in GENERIC_PRONOUN_ALIASES and source_label_present(label, units) for label in labels)
 
 
 # ##################################################################
 # materialize evidence discovery
 # turns schema-enumerated IDs into exact original citations before compatibility validation, allowing audited aliases and source-linked new variants for existing actors.
-def materialize_evidence_discovery(
-    value: object,
-    units: list[dict[str, str]],
-    approved_aliases: dict[str, str] | None = None,
-    registry: dict[str, dict] | None = None,
-) -> tuple[dict, list[list[str]]]:
+def materialize_evidence_discovery(value: object, units: list[dict[str, str]], approved_aliases: dict[str, str] | None = None, registry: dict[str, dict] | None = None) -> tuple[dict, list[list[str]]]:
     if not isinstance(value, dict) or set(value) != {"characters"} or not isinstance(value["characters"], list):
         raise ValueError("evidence discovery response is not the exact object schema")
-    by_id = {unit["id"]: unit for unit in units}
-    if len(by_id) != len(units):
-        raise RuntimeError("immutable evidence unit IDs are not unique")
-    materialized: list[dict] = []
-    citations: list[list[str]] = []
-    new_labels: dict[str, str] = {}
-    expected = {"canonical_id", "id", "name", "aliases", "voice_facts", "look_facts", "evidence_unit_ids"}
+    refs = immutable_name_references(units)
+    alias_map = approved_aliases or {}
+    materialized, citations, new_labels = [], [], {}
     for item in value["characters"]:
-        if not isinstance(item, dict) or set(item) != expected:
+        if not isinstance(item, dict) or not isinstance(item.get("canonical_id"), str):
+            raise TypeError("evidence discovery contains an invalid character record")
+        canonical = item["canonical_id"]
+        expected = {"canonical_id", "alias_refs", "voice_facts", "look_facts"} | ({"name_ref"} if canonical == "new" else set())
+        if set(item) != expected or not isinstance(item.get("alias_refs"), list):
             raise ValueError("evidence discovery contains an invalid character record")
-        canonical = item.get("canonical_id")
-        actor_id = item.get("id")
-        name = item.get("name")
-        if not all(isinstance(value, str) for value in (canonical, actor_id, name)):
-            raise ValueError("evidence discovery identity fields must be strings")
-        if canonical == "new" and actor_id != normalized_id(name):
-            raise ValueError(f"discovery structural new identity requires canonical_id='new' with normalized id for {name!r}")
-        if canonical != "new" and actor_id != canonical:
-            raise ValueError(
-                f"discovery structural identity mismatch: {name!r}/{actor_id!r} must use canonical_id='new', not {canonical!r}"
-            )
-        selected = item["evidence_unit_ids"]
-        if (
-            not isinstance(selected, list)
-            or not selected
-            or len(selected) > 8
-            or any(not isinstance(unit_id, str) or unit_id not in by_id for unit_id in selected)
-        ):
-            raise ValueError("evidence discovery selected an invalid immutable evidence ID")
-        selected_units = [by_id[unit_id] for unit_id in selected]
-        aliases = item.get("aliases")
-        labels = [item.get("name"), *(aliases if isinstance(aliases, list) else [])]
-        alias_map = approved_aliases or {}
-        for label in labels:
-            appears_in_selected_source = isinstance(label, str) and label.strip() and source_label_present(label, selected_units)
-            globally_approved_existing_alias = (
-                canonical != "new"
-                and isinstance(canonical, str)
-                and isinstance(label, str)
-                and alias_map.get(normalized_id(label)) == canonical
-            )
-            if not appears_in_selected_source and not globally_approved_existing_alias:
-                raise ValueError(f"discovery name or alias lacks selected source evidence: {label!r}")
-        if canonical != "new" and isinstance(canonical, str) and isinstance(aliases, list):
-            for alias in aliases:
-                alias_id = normalized_id(alias) if isinstance(alias, str) else ""
-                if alias_id in GENERIC_PRONOUN_ALIASES and alias_map.get(alias_id) != canonical:
-                    raise ValueError(f"discovery has unapproved generic pronoun alias: {alias!r}")
-                if alias_map.get(alias_id) != canonical and not existing_actor_linked(
-                    canonical, selected_units, registry, alias_map
-                ):
-                    raise ValueError(f"discovery alias lacks selected actor link for {canonical}: {alias!r}")
+        ref_ids = ([item["name_ref"]] if canonical == "new" else []) + item["alias_refs"]
+        if not ref_ids or len(ref_ids) > 13 or any(not isinstance(ref_id, str) or ref_id not in refs for ref_id in ref_ids):
+            raise ValueError("discovery selected invalid immutable name references")
+        labels = [refs[ref_id]["label"] for ref_id in ref_ids]
+        name = labels[0] if canonical == "new" else str((registry or {}).get(canonical, {}).get("name", canonical))
+        aliases = labels[1:] if canonical == "new" else labels
+        actor_id = normalized_id(name) if canonical == "new" else canonical
+        selected_units = [{"id": refs[ref_id]["unit_id"], "quote": next(unit["quote"] for unit in units if unit["id"] == refs[ref_id]["unit_id"])} for ref_id in ref_ids]
+        for label in [name, *aliases]:
+            if normalized_id(label) == "xiao": raise ValueError("discovery bare Xiao alias is ambiguous")
+        if canonical != "new" and not existing_actor_linked(canonical, selected_units, registry, alias_map):
+            raise ValueError(f"discovery alias lacks selected actor link for {canonical}")
         if canonical == "new":
-            for label in [name, *(aliases if isinstance(aliases, list) else [])]:
-                label_id = normalized_id(label) if isinstance(label, str) else ""
-                approved_owner = alias_map.get(label_id)
-                if label_id and approved_owner is not None and approved_owner != actor_id:
-                    raise ValueError(
-                        f"new discovery conflicts with approved source alias {label!r}: {approved_owner!r} versus {actor_id!r}"
-                    )
-                prior = new_labels.get(label_id)
-                if label_id and prior is not None and prior != actor_id:
-                    raise ValueError(f"discovery structural duplicate new identity label {label!r}: {prior!r} versus {actor_id!r}")
-                if label_id:
-                    new_labels[label_id] = actor_id
-        materialized.append(
-            {key: item[key] for key in expected - {"evidence_unit_ids"}}
-            | {"evidence": [unit["quote"] for unit in selected_units]}
-        )
-        citations.append(selected)
+            for label in [name, *aliases]:
+                label_id=normalized_id(label); prior=new_labels.get(label_id); owner=alias_map.get(label_id)
+                if owner is not None and owner != actor_id: raise ValueError(f"new discovery conflicts with approved source alias {label!r}")
+                if prior is not None and prior != actor_id: raise ValueError(f"discovery structural duplicate new identity label {label!r}")
+                new_labels[label_id]=actor_id
+        materialized.append({"canonical_id": canonical,"id":actor_id,"name":name,"aliases":aliases,"voice_facts":item["voice_facts"],"look_facts":item["look_facts"],"evidence":[unit["quote"] for unit in selected_units]})
+        citations.append(list(dict.fromkeys(ref_ids)))
     return {"characters": materialized}, citations
 
 
@@ -339,7 +303,7 @@ def discover_mode(
 ) -> tuple[list[dict], list[list[str]]]:
     ask = ask or ask_sync
     blocked = {normalized_id(label) for label in exclude or []}
-    schema = discovery_schema(list(progress["registry"]), [unit["id"] for unit in batch_units], mode)
+    schema = discovery_schema(list(progress["registry"]), list(immutable_name_references(batch_units)), mode)
     response = ask(prompt, max_tokens=3500, max_attempts=1, response_schema=schema)
     for attempt in range(EVIDENCE_REPAIR_ATTEMPTS + 1):
         try:
@@ -385,6 +349,8 @@ def discover_batch(
     prompt: str | None = None,
     ask=None,
 ) -> tuple[list[dict], list[list[str]]]:
+    if not immutable_name_references(batch_units):
+        return [], []
     modes = ["new", *(["existing"] if progress["registry"] else [])]
     results = []
     for mode in modes:
@@ -421,7 +387,7 @@ def repair_prompt(
     mode: str = "all",
     exclude: list[str] | None = None,
 ) -> str:
-    return f"""Your immediately prior discovery JSON was rejected by local validation: {error}. Return a replacement JSON object containing ONLY the unknown actors or new source-backed aliases that remain valid. A structural identity mismatch means a genuinely new named actor MUST set canonical_id exactly to "new" and id to normalized(name); do not attach it to a known canonical ID. Correct every unsupported label: include its exact witness evidence_unit_id and, for a new alias of an existing actor, an additional selected unit proving the actor link; otherwise omit that label. Generic pronouns are never aliases.\n\n{discovery_prompt(chapters, registry, aliases, mode, exclude)}"""
+    return f"""Your immediately prior discovery JSON was rejected by local validation: {error}. Return a replacement JSON object containing ONLY the unknown actors or new source-backed aliases that remain valid. A structural identity mismatch means a genuinely new named actor MUST set canonical_id exactly to "new" and id to normalized(name); do not attach it to a known canonical ID. Correct every unsupported label: use a name_selector or alias_selector whose unit_id and offsets extract its exact witness bytes and, for an existing actor alias, select an additional source label proving the actor link; otherwise omit that label. Generic pronouns are never aliases.\n\n{discovery_prompt(chapters, registry, aliases, mode, exclude)}"""
 
 
 # ##################################################################
@@ -624,6 +590,22 @@ def apply_alias_audit(project: Path, source_text: str, registry: dict, aliases: 
         aliases[alias_id] = final
         if alias_id in registry and alias_id != final:
             inactive.add(alias_id)
+    return inactive, ambiguous
+
+
+# ##################################################################
+# refresh audited aliases
+# reapplies verified audit records before each discovery without moving the cursor or generating media, retaining every earlier inactive identity and ambiguity.
+def refresh_alias_audit(project: Path, source_text: str, progress: dict) -> tuple[set[str], set[str]]:
+    legacy_registry = {**load_object(project / "characters.json", "characters profile"), **progress["registry"]}
+    inactive, ambiguous = apply_alias_audit(project, source_text, legacy_registry, progress["aliases"])
+    inactive.update(progress.get("inactive_legacy_ids", []))
+    ambiguous.update(progress.get("ambiguous_new_ids", []))
+    if inactive:
+        progress["registry"] = {actor_id: entry for actor_id, entry in progress["registry"].items() if actor_id not in inactive}
+    progress["inactive_legacy_ids"] = sorted(inactive)
+    progress["ambiguous_new_ids"] = sorted(ambiguous)
+    progress["audit_applied"] = True
     return inactive, ambiguous
 
 
@@ -840,19 +822,14 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
         }
         atomic_json(progress_path, progress)
     validate_preparation_coverage(progress, chapters)
-    if not progress.get("audit_applied"):
-        inactive, ambiguous = apply_alias_audit(project, source_text, progress["registry"], progress["aliases"])
-        progress["registry"] = {
-            actor_id: entry for actor_id, entry in progress["registry"].items() if actor_id not in inactive
-        }
-        progress["inactive_legacy_ids"] = sorted(inactive)
-        progress["ambiguous_new_ids"] = sorted(ambiguous)
-        progress["audit_applied"] = True
-        atomic_json(progress_path, progress)
-    inactive = set(progress.get("inactive_legacy_ids", []))
-    ambiguous = set(progress.get("ambiguous_new_ids", []))
+    # Always refresh: an audit can be safely appended after an interrupted batch and must apply before its next discovery even when old progress says audit_applied.
+    inactive, ambiguous = refresh_alias_audit(project, source_text, progress)
+    atomic_json(progress_path, progress)
     batches = 0
     while int(progress["next_chapter"]) < len(chapters):
+        # Audit records may be appended while this resumable preparation is paused; refresh is idempotent and leaves cursor and media untouched.
+        inactive, ambiguous = refresh_alias_audit(project, source_text, progress)
+        atomic_json(progress_path, progress)
         start = int(progress["next_chapter"])
         batch, prompt = context_safe_batch(chapters, start, progress["registry"], progress["aliases"])
         batch_units = immutable_evidence_units(batch)

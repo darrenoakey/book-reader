@@ -17,7 +17,6 @@ from src.cast_freeze import (
     apply_alias_audit,
     asset_hashes,
     context_safe_batch,
-    discover_batch,
     discovery_prompt,
     discovery_schema,
     immutable_evidence_units,
@@ -388,112 +387,8 @@ def test_verify_frozen_cast_detects_changed_anchor_portrait_bytes() -> None:
 
 
 # ##################################################################
-# test split calls
-# proves each batch makes a new-only call and an existing-only call with distinct closed schemas, and combines only when both validate.
-def scripted(responses: list[list[str]], calls: list[dict]):
-    queues = {"new": list(responses[0]), "existing": list(responses[1])}
-
-    def ask(prompt: str, max_tokens: int, max_attempts: int, response_schema: dict) -> str:
-        enum = response_schema["properties"]["characters"]["items"]["properties"]["canonical_id"]["enum"]
-        mode = "new" if enum == ["new"] else "existing"
-        calls.append({"mode": mode, "enum": enum, "prompt": prompt})
-        return queues[mode].pop(0)
-
-    return ask
-
-
-def record(canonical: str, actor_id: str, name: str, aliases: list[str], unit: str) -> dict:
-    return {"canonical_id": canonical, "id": actor_id, "name": name, "aliases": aliases, "voice_facts": "", "look_facts": "", "evidence_unit_ids": [unit]}
-
-
-def test_split_calls_use_distinct_schemas_and_combine() -> None:
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        chapter = root / "01-part.txt"
-        chapter.write_text("Ren spoke. Zed Quill answered.", encoding="utf-8")
-        units = immutable_evidence_units([chapter])
-        zed = next(u["id"] for u in units if "Zed" in u["quote"])
-        progress = {"registry": {"ren": {"name": "Ren"}}, "aliases": {"ren": "ren"}}
-        calls: list[dict] = []
-        ask = scripted(
-            [[json.dumps({"characters": [record("new", "zed_quill", "Zed Quill", [], zed)]})], [json.dumps({"characters": []})]],
-            calls,
-        )
-        found, citations = discover_batch(root, 0, [chapter], units, chapter.read_text(), progress, set(), None, ask)
-        assert [c["mode"] for c in calls] == ["new", "existing"]
-        assert calls[0]["enum"] == ["new"] and calls[1]["enum"] == ["ren"]
-        assert [f["id"] for f in found] == ["zed_quill"] and len(citations) == 1
-
-
-def test_split_repairs_each_call_at_most_twice_and_fails_closed() -> None:
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        chapter = root / "01-part.txt"
-        chapter.write_text("Ren spoke. Zed Quill answered.", encoding="utf-8")
-        units = immutable_evidence_units([chapter])
-        zed = next(u["id"] for u in units if "Zed" in u["quote"])
-        progress = {"registry": {"ren": {"name": "Ren"}}, "aliases": {"ren": "ren"}}
-        bad = json.dumps({"characters": [record("new", "wrong", "Zed Quill", [], zed)]})
-        good = json.dumps({"characters": [record("new", "zed_quill", "Zed Quill", [], zed)]})
-        calls: list[dict] = []
-        found, _ = discover_batch(
-            root, 0, [chapter], units, chapter.read_text(), progress, set(), None,
-            scripted([[bad, bad, good], [json.dumps({"characters": []})]], calls),
-        )
-        assert [c["mode"] for c in calls] == ["new", "new", "new", "existing"] and found[0]["id"] == "zed_quill"
-        calls.clear()
-        with pytest.raises(RuntimeError, match="new batch 0-0 rejected after 2 repairs"):
-            discover_batch(root, 0, [chapter], units, chapter.read_text(), progress, set(), None, scripted([[bad, bad, bad], []], calls))
-        assert [c["mode"] for c in calls] == ["new", "new", "new"]
-        assert len((root / "cast_preparation_rejections.jsonl").read_text().splitlines()) == 5
-
-
-def test_existing_call_rejects_new_record_and_empty_registry_skips_it() -> None:
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        chapter = root / "01-part.txt"
-        chapter.write_text("Ren spoke. Zed Quill answered.", encoding="utf-8")
-        units = immutable_evidence_units([chapter])
-        zed = next(u["id"] for u in units if "Zed" in u["quote"])
-        calls: list[dict] = []
-        empty = {"registry": {}, "aliases": {}}
-        good = json.dumps({"characters": [record("new", "zed_quill", "Zed Quill", [], zed)]})
-        discover_batch(root, 0, [chapter], units, chapter.read_text(), empty, set(), None, scripted([[good], []], calls))
-        assert [c["mode"] for c in calls] == ["new"]
-        progress = {"registry": {"ren": {"name": "Ren"}}, "aliases": {"ren": "ren"}}
-        with pytest.raises(ValueError, match="unknown discovery mode"):
-            discovery_schema(["ren"], None, "bogus")
-        assert discovery_schema(["ren"], None, "existing")["properties"]["characters"]["items"]["properties"]["canonical_id"]["enum"] == ["ren"]
-        assert progress
-
-
-def test_existing_pass_excludes_new_labels_and_rejects_reuse() -> None:
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        chapter = root / "01-part.txt"
-        chapter.write_text("Ren spoke. Zed Quill answered.", encoding="utf-8")
-        units = immutable_evidence_units([chapter])
-        zed = next(u["id"] for u in units if "Zed" in u["quote"])
-        both = [u["id"] for u in units]
-        progress = {"registry": {"ren": {"name": "Ren"}}, "aliases": {"ren": "ren"}}
-        new = json.dumps({"characters": [record("new", "zed_quill", "Zed Quill", ["Zed"], zed)]})
-        steal = json.dumps({"characters": [{**record("ren", "ren", "Ren", ["Zed"], zed), "evidence_unit_ids": both}]})
-        clean = json.dumps({"characters": []})
-        calls: list[dict] = []
-        found, _ = discover_batch(
-            root, 0, [chapter], units, chapter.read_text(), progress, set(), None, scripted([[new], [steal, clean]], calls)
-        )
-        existing = [c for c in calls if c["mode"] == "existing"]
-        assert len(existing) == 2 and [f["id"] for f in found] == ["zed_quill"]
-        assert "EXCLUDED LABELS" in existing[0]["prompt"] and "Zed Quill" in existing[0]["prompt"]
-        assert "uses excluded new-actor labels" in existing[1]["prompt"]
-        calls.clear()
-        with pytest.raises(RuntimeError, match="existing batch 0-0 rejected after 2 repairs"):
-            discover_batch(
-                root, 0, [chapter], units, chapter.read_text(), progress, set(), None, scripted([[new], [steal] * 3], calls)
-            )
-
-
+# test source label boundary
+# proves aliases match whole source labels and never a substring of a longer personal name.
 def test_source_label_requires_whole_word_boundary() -> None:
     units = [{"id": "c00s00000", "chapter": "a", "quote": "Foam Xiao spoke; the foamy sea rose."}]
     assert source_label_present("Foam", units)

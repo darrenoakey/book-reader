@@ -6966,6 +6966,7 @@ def prepare_cast(
     max_batches: int | None = None,
     ask=None,
     max_revalidations: int | None = QUARANTINE_REVALIDATION_LIMIT,
+    wide_bio=None,
 ) -> dict:
     source = source.resolve()
     if not source.is_file():
@@ -7067,6 +7068,19 @@ def prepare_cast(
                 "chapters": len(chapters),
                 "next_chapter": progress["next_chapter"],
                 "actors": len(progress["registry"]),
+                "warnings": len(recovery.entries()),
+            }
+    if wide_bio is not None:
+        # Optional whole-source wide-context fact pass (src.wide_bio_delta.WideBioHook). It sees the finished structural registry, only appends `facts` / source-bridged aliases / typed pending rows, and a result that is not fully applied (offline, deadline, error, partial coverage) is never approval: nothing is frozen.
+        outcome = wide_bio(project, chapters, progress, source_text, recovery)
+        atomic_json(progress_path, progress)
+        if outcome.get("state") != "applied":
+            return {
+                "status": "preparing",
+                "chapters": len(chapters),
+                "next_chapter": progress["next_chapter"],
+                "actors": len(progress["registry"]),
+                "wide_bio": outcome,
                 "warnings": len(recovery.entries()),
             }
     replay_pending(project, chapters, progress, ambiguous, source_text, recovery, ask)

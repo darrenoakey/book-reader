@@ -3,7 +3,13 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from src.m4b_assemble import assemble_m4b, generate_chime, generate_silence, get_audio_duration, number_duplicate_titles
+from src.m4b_assemble import (
+    assemble_m4b,
+    generate_chime,
+    generate_silence,
+    get_audio_duration,
+    number_duplicate_titles,
+)
 
 
 # ##################################################################

@@ -1,0 +1,1861 @@
+"""Resumable delta runner for wide-context biography extraction, built on src.wide_bio and src.cast_index.
+
+The authoritative original source is cut at paragraph boundaries into tokenizer-budget chunks (exact local token counts,
+configurable target) and each chunk is sent exactly once per attempt with a compact DELTA prompt: traits that are
+already cited by a locally accepted claim are listed once (so they are not repeated), but every source paragraph of the
+chunk is always shown, a character that is not established is always expressible (`subject_ref` = `novel`), and an
+unclear subject is always expressible (`subject_ref` = `ambiguous`). Nothing is dropped from the source to save tokens.
+
+Every response is saved verbatim with its hashes before it is judged, and every fact is judged locally: exact literal
+quote inside the cited paragraph, chapter witness, and subject/candidate reconciliation against the exact-label cast
+index. Anything unsupported, ambiguous or incomplete becomes a typed `pending` item; nothing is merged into any registry
+or cast. Progress lives in an append-only, hash-chained journal, so an interrupted run resumes without re-asking a saved
+chunk, and a bounded deadline always leaves a durable `not_ready` summary (it never claims readiness it does not have).
+
+`plan` and `validate` are offline. Only `run --execute` can reach a model, through the explicit proof config's single
+primary route. This module reports exact token and call counts; it makes no throughput or completion-time claim.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import threading
+import time
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+from src.cast_freeze import (
+    TITLE_ROLE_TOKENS,
+    CastDataIssue,
+    label_components,
+    normalized_id,
+    owner_name_forms,
+    source_bridge_predicate,
+)
+from src.cast_index import (
+    PARAGRAPH,
+    CastIndex,
+    Claim,
+    build_cast_index,
+    component_names,
+    project_inputs,
+    reconcile,
+)
+from src.llm import request_for
+from src.wide_bio import (
+    HARD_DEADLINE_S,
+    MAX_FIXED_OVERHEAD_TOKENS,
+    SOFT_DEADLINE_S,
+    ContractError,
+    Counter,
+    Paragraph,
+    ProofConfig,
+    Transport,
+    build_counter,
+    canonical_json,
+    check_output_dir,
+    load_proof_config,
+    ollama_transport,
+    pack_source,
+    padded,
+    project_chapters,
+    read_source,
+    sha256_text,
+    validate_calibration,
+    write_atomic,
+)
+from src.wide_bio_tokenizer import TokenizerRefusal
+
+DELTA_VERSION = 1
+QUOTE_MAX = 240
+VALUE_MAX = 160
+REF_NOVEL = "novel"
+REF_AMBIGUOUS = "ambiguous"
+# short category enum: appearance, role, gender, kinship, gene/beast, age (changes included), source alias
+CATEGORIES = ("look", "role", "gender", "kin", "beast", "age", "alias")
+FACT_FIELDS = ("subject", "category", "value", "paragraph_id")
+SUBJECT_FIELDS = ("name", "ref")
+PENDING_REASONS = (
+    "incomplete_fields",
+    "unsupported_category",
+    "unknown_paragraph",
+    "unsupported_value",
+    "value_too_long",
+    "no_chapter_witness",
+    "unknown_subject_ref",
+    "subject_ref_mismatch",
+    "subject_not_in_paragraph",
+    "ambiguous_subject",
+    "novel_collides_established",
+    "component_of_other_subject",
+    "subject_not_candidate",
+    "subject_nonentity",
+    "alias_collision",
+    "role_scope_uncertain",
+    "alias_unbridged",
+    "actor_id_collision",
+)
+NO_RESPONSE = frozenset({"transport_error", "over_budget", "token_count_refused"})
+SYSTEM_PROMPT = (
+    "You extract NEW character biography facts from a book excerpt. Return only JSON matching the schema. "
+    "Each fact has `subject` (who: `name` as written in the paragraph, and `ref`), `category`, `value` and `paragraph_id`. "
+    "`value` is a short snippet copied exactly, unmodified and contiguous, from the paragraph named by `paragraph_id` "
+    "(one of the [[P id]] markers); it is the evidence itself, so do not paraphrase it. "
+    f"Categories: {', '.join(CATEGORIES)} (look=appearance, kin=kinship, beast=gene/beast nature, age includes age changes, "
+    "alias=another name the source gives the same character). "
+    "An 'Already established' section may list characters and traits already cited: do not repeat those traits, and use the "
+    "listed [id] as `subject.ref` for those characters. It is only a de-duplication aid. Read every paragraph: still report "
+    "every new trait of a known character, every character that is not listed (`ref` = novel), and any fact whose subject is "
+    "unclear (`ref` = ambiguous). Do not infer, merge identities, or invent; if nothing new qualifies return an empty facts list."
+)
+
+
+# ##################################################################
+# text helpers
+# exact, deterministic normalisation shared by validation and replay.
+def norm_space(text: str) -> str:
+    return " ".join(text.split())
+
+
+def norm_value(text: str) -> str:
+    return norm_space(text).casefold().strip(" .,;:!")
+
+
+def subject_id(name: str) -> str:
+    return "S" + sha256_text(norm_space(name))[:8]
+
+
+def whole_word(needle: str, text: str) -> bool:
+    return re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", text) is not None
+
+
+# ##################################################################
+# per-chunk schema
+# every request constrains `paragraph_id` to that chunk's exact paragraph ids and `subject_ref` to novel, ambiguous and the established ids actually shown in that prompt; short quote/value lengths are part of the schema.
+def delta_schema(paragraph_ids: Sequence[str], shown_ids: Sequence[str]) -> dict:
+    item = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": list(FACT_FIELDS),
+        "properties": {
+            "subject": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": list(SUBJECT_FIELDS),
+                "properties": {
+                    "name": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "ref": {
+                        "type": "string",
+                        "enum": [REF_NOVEL, REF_AMBIGUOUS, *shown_ids],
+                    },
+                },
+            },
+            "category": {"type": "string", "enum": list(CATEGORIES)},
+            "value": {"type": "string", "minLength": 1, "maxLength": VALUE_MAX},
+            "paragraph_id": {"type": "string", "enum": list(paragraph_ids)},
+        },
+    }
+    facts: dict = {"type": "array", "items": item}
+    if not paragraph_ids:
+        facts = {"type": "array", "maxItems": 0}
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["facts"],
+        "properties": {"facts": facts},
+    }
+
+
+# ##################################################################
+# settings
+# the only knobs of the runner: the source-token target per chunk, the cap on the delta section, and the per-chunk attempt bound (which bounds the model calls).
+@dataclass(frozen=True, slots=True)
+class DeltaSettings:
+    target_tokens: int
+    delta_tokens: int = 1024
+    max_attempts: int = 1
+
+    def __post_init__(self) -> None:
+        for name in ("target_tokens", "delta_tokens", "max_attempts"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ContractError(
+                    f"{name} must be a positive integer", "settings_invalid"
+                )
+
+
+# ##################################################################
+# token-budget chunks
+# the whole original text, paragraph boundaries only. `source_tokens` is the sum of exact counts of the rendered paragraphs; a lone paragraph above the target becomes its own `oversize` chunk (never split, never truncated) and is still bound by the input budget.
+@dataclass(frozen=True, slots=True)
+class DeltaChunk:
+    id: str
+    start: int
+    end: int
+    paragraphs: tuple[Paragraph, ...]
+    source_tokens: int
+    oversize: bool
+
+
+def render_paragraph(paragraph: Paragraph) -> str:
+    return f"[[P {paragraph.id}]]\n{paragraph.text}"
+
+
+def render_user(chunk: DeltaChunk, delta_text: str) -> str:
+    body = "\n\n".join(render_paragraph(paragraph) for paragraph in chunk.paragraphs)
+    return f"Excerpt {chunk.id}. Extract NEW biography facts.\n\n{delta_text}Source paragraphs:\n\n{body}\n"
+
+
+def pack_by_tokens(
+    source: str, chapters: Sequence[Path], count: Counter, target_tokens: int
+) -> tuple[list[DeltaChunk], dict]:
+    whole, coverage = pack_source(source, len(source) + 1, chapters)
+    paragraphs = [paragraph for chunk in whole for paragraph in chunk.paragraphs]
+    if not paragraphs:
+        raise ContractError("source has no paragraph text", "source_empty")
+    spans = [
+        (m.start(), m.end()) for m in PARAGRAPH.finditer(source) if m.end() > m.start()
+    ]
+    groups: list[tuple[list[Paragraph], int]] = []
+    current: list[Paragraph] = []
+    size = 0
+    for paragraph in paragraphs:
+        cost = count(render_paragraph(paragraph))
+        if current and size + cost > target_tokens:
+            groups.append((current, size))
+            current, size = [], 0
+        current.append(paragraph)
+        size += cost
+    groups.append((current, size))
+    starts = [0] + [spans[int(group[0].id)][0] for group, _ in groups[1:]]
+    ends = starts[1:] + [len(source)]
+    chunks = [
+        DeltaChunk(
+            f"k{number:04d}", start, end, tuple(group), size, size > target_tokens
+        )
+        for number, ((group, size), start, end) in enumerate(zip(groups, starts, ends))
+    ]
+    ids = [paragraph.id for chunk in chunks for paragraph in chunk.paragraphs]
+    exact = (
+        "".join(source[chunk.start : chunk.end] for chunk in chunks) == source
+        and ids == [paragraph.id for paragraph in paragraphs]
+        and len(set(ids)) == len(ids) == coverage["shown_paragraphs"]
+    )
+    if not exact:
+        raise ContractError(
+            "chunks do not cover every source paragraph exactly once", "source_coverage"
+        )
+    return chunks, coverage
+
+
+# ##################################################################
+# established state
+# what is already cited, by subject: the registry actors of the cast being prepared (seeded by direct literal name or audited alias only, their original profiles are never read for anything but de-duplication) plus every locally accepted claim. The claim part is rebuilt by replaying the journal, so it is never trusted from disk.
+class Established:
+    def __init__(self) -> None:
+        self.subjects: dict[str, dict] = {}
+
+    def seed(self, registry: dict, aliases: dict) -> None:
+        for actor_id, entry in registry.items():
+            if actor_id == "narrator" or not str(entry.get("name", actor_id)).strip():
+                continue
+            forms = [
+                norm_space(form)
+                for form in owner_name_forms(actor_id, registry, aliases)
+            ]
+            traits: dict[str, dict] = {}
+            facts = entry.get("facts") if isinstance(entry.get("facts"), dict) else {}
+            for category, values in facts.items():
+                if category in CATEGORIES and isinstance(values, list):
+                    traits[category] = {
+                        norm_value(str(v)): str(v) for v in values if str(v).strip()
+                    }
+            self.subjects[actor_id] = {
+                "name": forms[0],
+                "aliases": [form for form in forms[1:] if form != forms[0]],
+                "traits": traits,
+                "claim_ids": [],
+                "registry": True,
+            }
+
+    def names(self, sid: str) -> list[str]:
+        subject = self.subjects[sid]
+        return [subject["name"], *subject["aliases"]]
+
+    def resolve(self, name: str) -> str | None:
+        wanted = norm_space(name)
+        for sid, subject in self.subjects.items():
+            if wanted == subject["name"] or wanted in subject["aliases"]:
+                return sid
+        return None
+
+    def all_names(self) -> list[str]:
+        return [name for sid in self.subjects for name in self.names(sid)]
+
+    def has_trait(self, sid: str, category: str, value: str) -> bool:
+        subject = self.subjects.get(sid)
+        return bool(subject) and norm_value(value) in subject["traits"].get(
+            category, {}
+        )
+
+    def apply(self, claims: Sequence[dict]) -> None:
+        for claim in claims:
+            subject = self.subjects.setdefault(
+                claim["subject_id"],
+                {
+                    "name": norm_space(claim["subject"]),
+                    "aliases": [],
+                    "traits": {},
+                    "claim_ids": [],
+                    "registry": False,
+                },
+            )
+            subject["traits"].setdefault(claim["category"], {})[
+                norm_value(claim["value"])
+            ] = claim["value"].strip()
+            subject["claim_ids"].append(claim["claim_id"])
+            if claim["category"] == "alias":
+                alias = norm_space(claim["value"])
+                if alias != subject["name"] and alias not in subject["aliases"]:
+                    subject["aliases"].append(alias)
+
+
+# ##################################################################
+# delta section
+# only established subjects whose name or alias occurs in this chunk are listed, one compact line each, bounded by the delta token cap (whole subjects are dropped from the end, never partially cut, and the number dropped is recorded). The section never touches the source paragraphs, the novel-subject option or the ambiguous option.
+@dataclass(frozen=True, slots=True)
+class Delta:
+    text: str
+    shown: tuple[str, ...]
+    truncated_subjects: int
+    tokens: int
+
+
+DELTA_HEADER = "Already established (do not repeat these traits; use the [id] as subject.ref for these characters):\n"
+
+
+def subject_line(sid: str, subject: dict) -> str:
+    parts = [f"[{sid}] {subject['name']}"]
+    if subject["aliases"]:
+        parts[0] += f" (also: {'; '.join(subject['aliases'])})"
+    parts += [
+        f"{category}: {'; '.join(values.values())}"
+        for category, values in sorted(subject["traits"].items())
+    ]
+    return " | ".join(parts)
+
+
+def build_delta(
+    state: Established, chunk: DeltaChunk, cap: int, count: Counter
+) -> Delta:
+    body = "\n".join(paragraph.text for paragraph in chunk.paragraphs)
+    relevant = sorted(
+        (
+            sid
+            for sid in state.subjects
+            if any(whole_word(name, body) for name in state.names(sid))
+        ),
+        key=lambda sid: state.subjects[sid]["name"],
+    )
+    lines = [subject_line(sid, state.subjects[sid]) for sid in relevant]
+    keep = len(lines)
+    while keep:
+        text = DELTA_HEADER + "\n".join(lines[:keep]) + "\n\n"
+        if count(text) <= cap:
+            return Delta(text, tuple(relevant[:keep]), len(lines) - keep, count(text))
+        keep -= 1
+    return Delta("", (), len(lines), 0)
+
+
+# ##################################################################
+# candidates
+# exact-label candidate groups of the chapter files from the cast index (whitespace-normalised), each with its non-entity flag; a subject that is not one of these exact labels can never be accepted as a novel character.
+def candidate_labels(cast: CastIndex) -> dict[str, bool]:
+    labels: dict[str, bool] = {}
+    for group in cast.grouping.groups:
+        key = norm_space(group.label)
+        labels[key] = labels.get(key, False) or group.nonentity
+    return labels
+
+
+def role_only(name: str) -> bool:
+    words = label_components(name)
+    return not words or words <= TITLE_ROLE_TOKENS
+
+
+# ##################################################################
+# validate response
+# strict local judgement of one raw response against the paragraphs shown and the state established BEFORE this chunk. The model supplies only a source-literal `value` snippet and a paragraph id; the exact quote (the containing sentence), its offset and the chapter witness are reconstructed here from the source, never taken from the model. Everything not provably supported becomes `pending` with a typed reason; an exact repeat of an established trait is a `duplicate` (counted, not a claim). Only a response that is not the expected JSON object is a whole-chunk failure.
+def validate_delta_response(
+    raw: str,
+    chunk: DeltaChunk,
+    state: Established,
+    shown: Sequence[str],
+    candidates: dict[str, bool],
+) -> dict:
+    result = {
+        "chunk_id": chunk.id,
+        "raw_sha256": sha256_text(raw),
+        "status": "ok",
+        "claims": [],
+        "pending": [],
+        "duplicates": [],
+    }
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {**result, "status": "invalid_json"}
+    facts = (
+        data.get("facts") if isinstance(data, dict) and set(data) == {"facts"} else None
+    )
+    if not isinstance(facts, list):
+        return {**result, "status": "invalid_shape"}
+    by_id = {paragraph.id: paragraph for paragraph in chunk.paragraphs}
+    established = state.all_names()
+    chunk_names: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
+    for position, fact in enumerate(facts):
+        outcome = judge_fact(
+            fact, by_id, state, shown, candidates, established, chunk_names
+        )
+        if outcome["kind"] == "pending":
+            result["pending"].append(
+                {
+                    "pending_id": sha256_text(
+                        canonical_json([chunk.id, position, fact])
+                    ),
+                    "chunk_id": chunk.id,
+                    "position": position,
+                    "pending_reason": outcome["reason"],
+                    "fact": fact if isinstance(fact, dict) else None,
+                }
+            )
+            continue
+        key = (outcome["subject_id"], outcome["category"], norm_value(outcome["value"]))
+        known = state.has_trait(key[0], key[1], outcome["value"])
+        if known or key in seen:
+            result["duplicates"].append(
+                {
+                    "position": position,
+                    "reason": "already_established"
+                    if known
+                    else "duplicate_in_response",
+                    "subject_id": key[0],
+                    "category": key[1],
+                    "value": outcome["value"],
+                }
+            )
+            continue
+        seen.add(key)
+        if outcome["new_subject"]:
+            chunk_names.append(outcome["subject"])
+        result["claims"].append(outcome["claim"](chunk, position))
+    if result["pending"] or result["duplicates"]:
+        result["status"] = "partial"
+    return result
+
+
+def pending(reason: str) -> dict:
+    return {"kind": "pending", "reason": reason}
+
+
+def judge_fact(
+    fact,
+    by_id: dict[str, Paragraph],
+    state: Established,
+    shown: Sequence[str],
+    candidates: dict[str, bool],
+    established: list[str],
+    chunk_names: list[str],
+) -> dict:
+    who = fact.get("subject") if isinstance(fact, dict) else None
+    if (
+        not isinstance(fact, dict)
+        or set(fact) != set(FACT_FIELDS)
+        or not isinstance(who, dict)
+        or set(who) != set(SUBJECT_FIELDS)
+        or not all(
+            isinstance(fact[field], str) and fact[field].strip()
+            for field in FACT_FIELDS
+            if field != "subject"
+        )
+        or not all(
+            isinstance(who[field], str) and who[field].strip()
+            for field in SUBJECT_FIELDS
+        )
+    ):
+        return pending("incomplete_fields")
+    if fact["category"] not in CATEGORIES:
+        return pending("unsupported_category")
+    paragraph = by_id.get(fact["paragraph_id"])
+    if paragraph is None:
+        return pending("unknown_paragraph")
+    value = fact["value"].strip()
+    if value not in paragraph.text:
+        return pending("unsupported_value")
+    if len(value) > VALUE_MAX:
+        return pending("value_too_long")
+    if paragraph.witness is None:
+        return pending("no_chapter_witness")
+    subject, ref = norm_space(who["name"]), who["ref"]
+    new_subject = False
+    if ref == REF_AMBIGUOUS:
+        return pending("ambiguous_subject")
+    if ref == REF_NOVEL:
+        problem = novel_problem(
+            subject, paragraph, state, candidates, established, chunk_names
+        )
+        if problem:
+            return pending(problem)
+        sid, new_subject = subject_id(subject), subject not in chunk_names
+    else:
+        if ref not in shown or ref not in state.subjects:
+            return pending("unknown_subject_ref")
+        # direct known literal reuse only: the written name must be the actor's exact name or audited alias
+        if subject not in state.names(ref):
+            return pending("subject_ref_mismatch")
+        if not any(whole_word(name, paragraph.text) for name in state.names(ref)):
+            return pending("subject_not_in_paragraph")
+        sid = ref
+    if fact["category"] == "alias":
+        alias = norm_space(value)
+        owner = state.resolve(alias)
+        if (
+            alias == subject
+            or (owner is not None and owner != sid)
+            or (alias in chunk_names and alias != subject)
+        ):
+            return pending("alias_collision")
+    return {
+        "kind": "claim",
+        "subject": subject,
+        "subject_id": sid,
+        "category": fact["category"],
+        "value": value,
+        "new_subject": new_subject,
+        "claim": lambda chunk, position: claim_record(
+            chunk, paragraph, value, fact["category"], subject, ref, sid, position
+        ),
+    }
+
+
+def novel_problem(
+    subject: str,
+    paragraph: Paragraph,
+    state: Established,
+    candidates: dict[str, bool],
+    established: list[str],
+    chunk_names: list[str],
+) -> str | None:
+    if not whole_word(subject, paragraph.text):
+        return "subject_not_in_paragraph"
+    if state.resolve(subject) is not None:
+        return "novel_collides_established"
+    # a role or title is never a character by itself: scope is uncertain, so it waits as pending
+    if role_only(subject):
+        return "role_scope_uncertain"
+    others = [name for name in [*established, *chunk_names] if name != subject]
+    own_parts = component_names({subject: [subject]})
+    parts = component_names({name: [name] for name in others})
+    if subject in parts or any(name in own_parts for name in others):
+        return "component_of_other_subject"
+    if subject not in candidates:
+        return "subject_not_candidate"
+    if candidates[subject]:
+        return "subject_nonentity"
+    return None
+
+
+# ##################################################################
+# reconstructed evidence
+# the exact source quote is the sentence of the paragraph that contains the model's literal snippet (or the snippet itself when that sentence is too long), with its paragraph id, absolute offset and chapter witness.
+def reconstruct_quote(text: str, value: str) -> str:
+    at = text.find(value)
+    low = max((text.rfind(mark, 0, at) for mark in ".!?\n"), default=-1) + 1
+    ends = [text.find(mark, at + len(value)) for mark in ".!?\n"]
+    high = min((end + 1 for end in ends if end >= 0), default=len(text))
+    quote = text[low:high].strip()
+    return quote if value in quote and len(quote) <= QUOTE_MAX else value
+
+
+def claim_record(
+    chunk: DeltaChunk,
+    paragraph: Paragraph,
+    value: str,
+    category: str,
+    subject: str,
+    ref: str,
+    sid: str,
+    position: int,
+) -> dict:
+    quote = reconstruct_quote(paragraph.text, value)
+    claim = {
+        "chunk_id": chunk.id,
+        "position": position,
+        "subject": subject,
+        "subject_id": sid,
+        "subject_ref": ref,
+        "category": category,
+        "value": value,
+        "quote": quote,
+        "quote_sha256": sha256_text(quote),
+        "value_offset": paragraph.start + paragraph.text.find(value),
+        "source_offset": paragraph.start + paragraph.text.find(quote),
+        "paragraph_id": paragraph.id,
+        "paragraph_sha256": paragraph.sha256,
+        "witness": paragraph.witness,
+    }
+    claim["claim_id"] = sha256_text(
+        canonical_json(
+            {
+                "subject_id": sid,
+                "category": category,
+                "value": norm_value(value),
+                "paragraph_sha256": paragraph.sha256,
+                "value_offset": claim["value_offset"],
+            }
+        )
+    )
+    return claim
+
+
+# ##################################################################
+# plan
+# the whole original text as ordered token-budget chunks. The plan fails closed if even an empty delta section plus the delta cap would overflow the input budget for any chunk (no truncation, ever). The attempt bound is not part of the plan identity, so a resume may raise it.
+@dataclass(frozen=True, slots=True)
+class DeltaPlan:
+    source: str
+    chunks: tuple[DeltaChunk, ...]
+    settings: DeltaSettings
+    fixed_overhead: int
+    artifact: dict
+
+
+def build_delta_plan(
+    source: str,
+    chapters: Sequence[Path],
+    config: ProofConfig,
+    count: Counter,
+    settings: DeltaSettings,
+    fixed_overhead: int = 0,
+    seed_sha256: str = "",
+) -> DeltaPlan:
+    if (
+        not isinstance(fixed_overhead, int)
+        or isinstance(fixed_overhead, bool)
+        or not 0 <= fixed_overhead <= MAX_FIXED_OVERHEAD_TOKENS
+    ):
+        raise ContractError(
+            f"fixed overhead must be an integer in 0..{MAX_FIXED_OVERHEAD_TOKENS}",
+            "overhead_invalid",
+        )
+    chunks, coverage = pack_by_tokens(source, chapters, count, settings.target_tokens)
+    system_tokens = count(SYSTEM_PROMPT)
+    entries, over = [], []
+    for chunk in chunks:
+        base = system_tokens + count(render_user(chunk, ""))
+        worst = padded(
+            base + settings.delta_tokens + fixed_overhead, config.tolerance_percent
+        )
+        if worst > config.input_budget:
+            over.append(chunk.id)
+        entries.append(
+            {
+                "id": chunk.id,
+                "start": chunk.start,
+                "end": chunk.end,
+                "paragraphs": len(chunk.paragraphs),
+                "first_paragraph_id": chunk.paragraphs[0].id,
+                "last_paragraph_id": chunk.paragraphs[-1].id,
+                "source_tokens": chunk.source_tokens,
+                "oversize": chunk.oversize,
+                "base_prompt_tokens": base,
+                "max_padded_prompt_tokens": worst,
+                "base_user_sha256": sha256_text(render_user(chunk, "")),
+            }
+        )
+    if over:
+        raise ContractError(
+            f"chunks {over} cannot fit the input budget of {config.input_budget} tokens with a {settings.delta_tokens}-token delta",
+            "input_budget_exceeded",
+        )
+    artifact = {
+        "delta_version": DELTA_VERSION,
+        "model": config.backend.model,
+        "num_ctx": config.backend.num_ctx,
+        "output_tokens": config.output_tokens,
+        "reserve_tokens": config.reserve_tokens,
+        "tolerance_percent": config.tolerance_percent,
+        "fixed_overhead_tokens": fixed_overhead,
+        "input_budget": config.input_budget,
+        "tokenizer_capture_sha256": config.tokenizer_sha256,
+        "system_prompt_sha256": sha256_text(SYSTEM_PROMPT),
+        "schema_template_sha256": sha256_text(
+            canonical_json(delta_schema(["p"], ["s"]))
+        ),
+        "target_tokens": settings.target_tokens,
+        "delta_tokens": settings.delta_tokens,
+        "seed_sha256": seed_sha256,
+        "coverage": coverage,
+        "chunks": entries,
+    }
+    artifact["plan_sha256"] = sha256_text(canonical_json(artifact))
+    return DeltaPlan(source, tuple(chunks), settings, fixed_overhead, artifact)
+
+
+# ##################################################################
+# journal
+# append-only, hash-chained, fsynced JSONL. A torn final line (a crash mid-append, never a committed record) is quarantined beside the journal and cut off; any other inconsistency refuses the run.
+class Journal:
+    def __init__(self, out_dir: Path) -> None:
+        self.path = out_dir / "journal.jsonl"
+        self.records: list[dict] = []
+
+    def load(self) -> list[dict]:
+        data = self.path.read_bytes() if self.path.is_file() else b""
+        if data and not data.endswith(b"\n"):
+            cut = data.rfind(b"\n") + 1
+            torn = data[cut:]
+            self.path.with_name(
+                f"journal.torn-{hashlib.sha256(torn).hexdigest()[:12]}"
+            ).write_bytes(torn)
+            self.path.write_bytes(data[:cut])
+            data = data[:cut]
+        previous = "0" * 64
+        self.records = []
+        for number, line in enumerate(data.decode("utf-8").splitlines()):
+            try:
+                record = json.loads(line)
+            except ValueError as error:
+                raise ContractError(
+                    f"journal line {number} is not JSON", "journal_corrupt"
+                ) from error
+            body = {
+                key: value for key, value in record.items() if key != "record_sha256"
+            }
+            if (
+                record.get("seq") != number
+                or record.get("prev") != previous
+                or record.get("record_sha256") != sha256_text(canonical_json(body))
+            ):
+                raise ContractError(
+                    f"journal record {number} breaks the hash chain", "journal_corrupt"
+                )
+            previous = record["record_sha256"]
+            self.records.append(record)
+        return self.records
+
+    def append(self, core: dict, elapsed_s: float) -> dict:
+        body = {
+            **core,
+            "elapsed_s": round(elapsed_s, 3),
+            "seq": len(self.records),
+            "prev": self.records[-1]["record_sha256"] if self.records else "0" * 64,
+        }
+        record = {**body, "record_sha256": sha256_text(canonical_json(body))}
+        with self.path.open("ab") as stream:
+            stream.write((canonical_json(record) + "\n").encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        self.records.append(record)
+        return record
+
+
+# ##################################################################
+# prepared request
+# one chunk's exact request given the current established state: delta section, user prompt, per-chunk schema, payload and exact local token counts.
+@dataclass(frozen=True, slots=True)
+class Prepared:
+    url: str
+    payload: bytes
+    user: str
+    delta: Delta
+    schema_sha256: str
+    tokens: int
+    padded_tokens: int
+
+    @property
+    def request_sha256(self) -> str:
+        return hashlib.sha256(self.payload).hexdigest()
+
+
+def prepare(
+    config: ProofConfig,
+    plan: DeltaPlan,
+    chunk: DeltaChunk,
+    state: Established,
+    count: Counter,
+) -> Prepared:
+    delta = build_delta(state, chunk, plan.settings.delta_tokens, count)
+    user = render_user(chunk, delta.text)
+    tokens = count(SYSTEM_PROMPT) + count(user)
+    schema = delta_schema([paragraph.id for paragraph in chunk.paragraphs], delta.shown)
+    url, payload = request_for(
+        config.backend,
+        [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ],
+        0.0,
+        config.output_tokens,
+        schema,
+    )
+    return Prepared(
+        url,
+        payload,
+        user,
+        delta,
+        sha256_text(canonical_json(schema)),
+        tokens,
+        padded(tokens + plan.fixed_overhead, config.tolerance_percent),
+    )
+
+
+def classify(
+    config: ProofConfig, meta: dict, validation: dict, padded_tokens: int
+) -> str:
+    if meta.get("model") != config.backend.model:
+        return "fallback_route"
+    if meta.get("done_reason") == "length":
+        return "truncated"
+    reported = meta.get("prompt_eval_count")
+    if isinstance(reported, int) and reported > padded_tokens:
+        return "token_drift"
+    if validation["status"] in {"invalid_json", "invalid_shape"}:
+        return validation["status"]
+    return "ready"
+
+
+META_KEYS = ("model", "done_reason", "prompt_eval_count", "eval_count")
+
+
+def bounded_call(
+    transport: Transport, url: str, payload: bytes, timeout: float
+) -> dict:
+    """One call with a true wall-clock bound: a response that has not arrived by `timeout` is abandoned (daemon thread)."""
+    box: dict = {}
+
+    def target() -> None:
+        try:
+            box["reply"] = transport(url, payload, timeout)
+        except BaseException as error:  # noqa: BLE001 - relayed to the caller below
+            box["error"] = error
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(max(timeout, 0.0))
+    if thread.is_alive():
+        raise TimeoutError(
+            f"no response within the {timeout:.1f}s remaining before the hard deadline"
+        )
+    if "error" in box:
+        raise box["error"]
+    return box["reply"]
+
+
+# ##################################################################
+# run
+# one object owns a run directory: it replays the journal (re-judging every saved raw response against rebuilt state, so nothing on disk is trusted beyond its hash), sends only what is missing, and always finishes by writing durable artifacts.
+class DeltaRun:
+    def __init__(
+        self,
+        chapters: Sequence[Path],
+        config: ProofConfig,
+        plan: DeltaPlan,
+        out_dir: Path,
+        count: Counter,
+        cast: CastIndex,
+        registry: dict | None = None,
+        aliases: dict | None = None,
+    ) -> None:
+        self.chapters, self.config, self.plan, self.out_dir, self.count = (
+            chapters,
+            config,
+            plan,
+            out_dir,
+            count,
+        )
+        self.candidates = candidate_labels(cast)
+        self.cast = cast
+        self.by_id = {chunk.id: chunk for chunk in plan.chunks}
+        self.state = Established()
+        self.state.seed(registry or {}, aliases or {})
+        self.journal = Journal(out_dir)
+        self.attempts: dict[str, list[dict]] = {chunk.id: [] for chunk in plan.chunks}
+        self.ready: dict[str, dict] = {}
+        self.calls_this_invocation = 0
+
+    # replay ---------------------------------------------------------
+    def replay(self) -> None:
+        for record in self.journal.load():
+            chunk = self.by_id.get(record["chunk_id"])
+            if chunk is None or record["attempt"] != len(self.attempts[chunk.id]) + 1:
+                raise ContractError(
+                    "journal does not belong to this plan", "journal_inconsistent"
+                )
+            if record["status"] in NO_RESPONSE:
+                self.verify_without_response(chunk, record)
+                self.attempts[chunk.id].append(record)
+                continue
+            prepared = self.prepare_or_refuse(chunk)
+            raw_path, meta_path = self.raw_paths(chunk.id, record["attempt"])
+            try:
+                raw, meta_text = (
+                    raw_path.read_text(encoding="utf-8"),
+                    meta_path.read_text(encoding="utf-8"),
+                )
+            except OSError as error:
+                raise ContractError(
+                    f"saved response of {chunk.id} is unreadable",
+                    "journal_inconsistent",
+                ) from error
+            core, validation = self.conclude(
+                chunk,
+                record["attempt"],
+                prepared,
+                raw,
+                meta_text,
+                record["called"],
+                record["salvaged"],
+            )
+            if {key: record.get(key) for key in core} != core:
+                raise ContractError(
+                    f"saved response of {chunk.id} attempt {record['attempt']} no longer reproduces its journal record",
+                    "journal_inconsistent",
+                )
+            self.absorb(chunk, core, validation)
+
+    def verify_without_response(self, chunk: DeltaChunk, record: dict) -> None:
+        if record["request_sha256"] is None:
+            return
+        try:
+            prepared = prepare(self.config, self.plan, chunk, self.state, self.count)
+        except TokenizerRefusal as error:
+            raise ContractError(str(error), "journal_inconsistent") from error
+        if prepared.request_sha256 != record["request_sha256"]:
+            raise ContractError(
+                f"request of {chunk.id} no longer reproduces its journal record",
+                "journal_inconsistent",
+            )
+
+    def prepare_or_refuse(self, chunk: DeltaChunk) -> Prepared:
+        try:
+            return prepare(self.config, self.plan, chunk, self.state, self.count)
+        except TokenizerRefusal as error:
+            raise ContractError(str(error), "journal_inconsistent") from error
+
+    def raw_paths(self, chunk_id: str, attempt: int) -> tuple[Path, Path]:
+        base = self.out_dir / "raw" / f"{chunk_id}.a{attempt}"
+        return base.with_name(base.name + ".response.txt"), base.with_name(
+            base.name + ".meta.json"
+        )
+
+    def absorb(self, chunk: DeltaChunk, core: dict, validation: dict) -> None:
+        self.attempts[chunk.id].append(core)
+        if core["status"] == "ready":
+            self.state.apply(validation["claims"])
+            self.ready[chunk.id] = validation
+
+    # conclude -------------------------------------------------------
+    def conclude(
+        self,
+        chunk: DeltaChunk,
+        attempt: int,
+        prepared: Prepared,
+        raw: str,
+        meta_text: str,
+        called: bool,
+        salvaged: bool,
+    ) -> tuple[dict, dict]:
+        meta = json.loads(meta_text)
+        if meta.get("request_sha256") != prepared.request_sha256 or meta.get(
+            "response_sha256"
+        ) != sha256_text(raw):
+            raise ContractError(
+                f"saved response of {chunk.id} does not match its request/hash",
+                "journal_inconsistent",
+            )
+        validation = validate_delta_response(
+            raw, chunk, self.state, prepared.delta.shown, self.candidates
+        )
+        core = self.core(
+            chunk,
+            attempt,
+            classify(self.config, meta, validation, prepared.padded_tokens),
+            prepared,
+        )
+        core.update(
+            called=called,
+            salvaged=salvaged,
+            response_sha256=sha256_text(raw),
+            meta_sha256=sha256_text(meta_text),
+            server={key: meta.get(key) for key in META_KEYS},
+            counts={
+                key: len(validation[key]) for key in ("claims", "pending", "duplicates")
+            },
+            result_sha256=sha256_text(canonical_json(validation)),
+        )
+        return core, validation
+
+    def core(
+        self,
+        chunk: DeltaChunk,
+        attempt: int,
+        status: str,
+        prepared: Prepared | None,
+        error: str | None = None,
+    ) -> dict:
+        return {
+            "chunk_id": chunk.id,
+            "attempt": attempt,
+            "status": status,
+            "called": False,
+            "salvaged": False,
+            "error": error,
+            "request_sha256": prepared.request_sha256 if prepared else None,
+            "user_sha256": sha256_text(prepared.user) if prepared else None,
+            "delta_sha256": sha256_text(prepared.delta.text) if prepared else None,
+            "schema_sha256": prepared.schema_sha256 if prepared else None,
+            "local_tokens": prepared.tokens if prepared else None,
+            "padded_tokens": prepared.padded_tokens if prepared else None,
+            "delta_shown": list(prepared.delta.shown) if prepared else [],
+            "delta_truncated_subjects": prepared.delta.truncated_subjects
+            if prepared
+            else 0,
+            "response_sha256": None,
+            "meta_sha256": None,
+            "server": {},
+            "counts": {},
+            "result_sha256": None,
+        }
+
+    # live -----------------------------------------------------------
+    def settle_without_response(
+        self,
+        chunk: DeltaChunk,
+        status: str,
+        prepared: Prepared | None,
+        error: str,
+        elapsed_s: float,
+    ) -> None:
+        core = self.core(
+            chunk, len(self.attempts[chunk.id]) + 1, status, prepared, error
+        )
+        self.journal.append(core, elapsed_s)
+        self.attempts[chunk.id].append(core)
+
+    def process(
+        self,
+        chunk: DeltaChunk,
+        transport: Transport | None,
+        clock: Callable[[], float],
+        started: float,
+        soft_s: float,
+        hard_s: float,
+    ) -> str | None:
+        """Handle one missing chunk. Returns a stop reason when the run must stop, else None."""
+        attempt = len(self.attempts[chunk.id]) + 1
+        raw_path, meta_path = self.raw_paths(chunk.id, attempt)
+        tick = clock()
+        try:
+            prepared = prepare(self.config, self.plan, chunk, self.state, self.count)
+        except TokenizerRefusal as error:
+            self.settle_without_response(
+                chunk,
+                "token_count_refused",
+                None,
+                f"{error.code}: {error}",
+                clock() - tick,
+            )
+            return None
+        if raw_path.is_file() and meta_path.is_file():
+            core, validation = self.conclude(
+                chunk,
+                attempt,
+                prepared,
+                raw_path.read_text(encoding="utf-8"),
+                meta_path.read_text(encoding="utf-8"),
+                True,
+                True,
+            )
+            self.journal.append(core, clock() - tick)
+            self.absorb(chunk, core, validation)
+            return core["status"] == "fallback_route" and "fallback_route" or None
+        if prepared.padded_tokens > self.config.input_budget:
+            self.settle_without_response(
+                chunk,
+                "over_budget",
+                prepared,
+                f"{prepared.padded_tokens} > {self.config.input_budget}",
+                clock() - tick,
+            )
+            return None
+        remaining = hard_s - (clock() - started)
+        if transport is None:
+            return "offline"
+        if clock() - started >= soft_s or remaining <= 0:
+            return "deadline"
+        self.calls_this_invocation += 1
+        try:
+            reply = bounded_call(transport, prepared.url, prepared.payload, remaining)
+        except (OSError, TimeoutError, ValueError) as error:
+            self.settle_without_response(
+                chunk,
+                "transport_error",
+                prepared,
+                f"{type(error).__name__}: {error}"[:300],
+                clock() - tick,
+            )
+            self.mark_called(chunk)
+            return "deadline" if isinstance(error, TimeoutError) else "transport_error"
+        raw = reply.get("content") or ""
+        meta = {key: reply.get(key) for key in META_KEYS} | {
+            "request_sha256": prepared.request_sha256,
+            "response_sha256": sha256_text(raw),
+        }
+        meta_text = json.dumps(meta, sort_keys=True)
+        write_atomic(raw_path, raw)
+        write_atomic(meta_path, meta_text)
+        core, validation = self.conclude(
+            chunk, attempt, prepared, raw, meta_text, True, False
+        )
+        self.journal.append(core, clock() - tick)
+        self.absorb(chunk, core, validation)
+        return "fallback_route" if core["status"] == "fallback_route" else None
+
+    def mark_called(self, chunk: DeltaChunk) -> None:
+        """A transport_error record is a call attempt even though it saved no response."""
+        record = self.attempts[chunk.id][-1]
+        record["called"] = True
+
+    # artifacts ------------------------------------------------------
+    def chunk_state(self, chunk: DeltaChunk) -> str:
+        attempts = self.attempts[chunk.id]
+        return attempts[-1]["status"] if attempts else "missing"
+
+    def calls_total(self) -> int:
+        return sum(
+            1
+            for records in self.attempts.values()
+            for record in records
+            if record["called"]
+        )
+
+    def summary(
+        self,
+        stop: str | None,
+        offline: bool,
+        elapsed_s: float,
+        error: str | None = None,
+    ) -> dict:
+        statuses = {
+            chunk.id: "ready" if chunk.id in self.ready else self.chunk_state(chunk)
+            for chunk in self.plan.chunks
+        }
+        ready_chars = sum(
+            chunk.end - chunk.start
+            for chunk in self.plan.chunks
+            if chunk.id in self.ready
+        )
+        total = self.plan.artifact["coverage"]["source_chars"]
+        validations = [
+            self.ready[chunk.id] for chunk in self.plan.chunks if chunk.id in self.ready
+        ]
+        reasons = {name: 0 for name in PENDING_REASONS}
+        for validation in validations:
+            for item in validation["pending"]:
+                reasons[item["pending_reason"]] += 1
+        complete = len(self.ready) == len(self.plan.chunks)
+        reason = None
+        if not complete:
+            reason = (
+                error
+                or stop
+                or ("offline_validation" if offline else "chunks_not_ready")
+            )
+        return {
+            "plan_sha256": self.plan.artifact["plan_sha256"],
+            "state": "ready" if complete else "not_ready",
+            "reason": reason,
+            "source_chars": total,
+            "source_chars_ready": ready_chars,
+            "source_fraction": round(ready_chars / total, 6) if total else 0.0,
+            "chunks": len(self.plan.chunks),
+            "chunk_status": {
+                status: list(statuses.values()).count(status)
+                for status in sorted(set(statuses.values()))
+            },
+            "claims": sum(len(item["claims"]) for item in validations),
+            "pending_claims": sum(len(item["pending"]) for item in validations),
+            "pending_reasons": {
+                name: number for name, number in reasons.items() if number
+            },
+            "duplicates": sum(len(item["duplicates"]) for item in validations),
+            "calls_total": self.calls_total(),
+            "calls_this_invocation": self.calls_this_invocation,
+            "elapsed_s_this_invocation": round(elapsed_s, 3),
+            "cast_status": "pending: nothing is merged into any registry or cast",
+        }
+
+    def call_budget(self, soft_s: float, hard_s: float) -> dict:
+        settings = self.plan.settings
+        per_chunk = []
+        for entry in self.plan.artifact["chunks"]:
+            records = self.attempts[entry["id"]]
+            done = entry["id"] in self.ready
+            per_chunk.append(
+                {
+                    "id": entry["id"],
+                    "paragraphs": entry["paragraphs"],
+                    "source_tokens": entry["source_tokens"],
+                    "base_prompt_tokens": entry["base_prompt_tokens"],
+                    "max_delta_tokens": settings.delta_tokens,
+                    "max_padded_prompt_tokens": entry["max_padded_prompt_tokens"],
+                    "max_output_tokens": self.config.output_tokens,
+                    "attempts_used": len(records),
+                    "calls_used": sum(1 for record in records if record["called"]),
+                    "ready": done,
+                    "max_calls_remaining": 0
+                    if done
+                    else max(0, settings.max_attempts - len(records)),
+                }
+            )
+        metas = [
+            record["server"]
+            for records in self.attempts.values()
+            for record in records
+            if record["called"]
+        ]
+        return {
+            "plan_sha256": self.plan.artifact["plan_sha256"],
+            "chunks": len(per_chunk),
+            "max_attempts_per_chunk": settings.max_attempts,
+            "max_model_calls": len(per_chunk) * settings.max_attempts,
+            "calls_used": self.calls_total(),
+            "max_calls_remaining": sum(
+                item["max_calls_remaining"] for item in per_chunk
+            ),
+            "worst_case_input_tokens_per_call": max(
+                item["max_padded_prompt_tokens"] for item in per_chunk
+            ),
+            "worst_case_output_tokens_per_call": self.config.output_tokens,
+            "input_budget_tokens": self.config.input_budget,
+            "target_tokens": settings.target_tokens,
+            "delta_tokens": settings.delta_tokens,
+            "measured": {
+                "prompt_eval_tokens": sum(
+                    meta.get("prompt_eval_count") or 0 for meta in metas
+                ),
+                "eval_tokens": sum(meta.get("eval_count") or 0 for meta in metas),
+            },
+            "deadline_per_invocation_s": {"soft": soft_s, "hard": hard_s},
+            "speed_claim": "none: no latency or throughput is estimated; elapsed_s in summary.json is the wall time of the last invocation only",
+            "per_chunk": per_chunk,
+        }
+
+    def write_artifacts(self, summary: dict, soft_s: float, hard_s: float) -> None:
+        ordered = [
+            self.ready[chunk.id] for chunk in self.plan.chunks if chunk.id in self.ready
+        ]
+        claims = [claim for item in ordered for claim in item["claims"]]
+        pending_items = [
+            item for validation in ordered for item in validation["pending"]
+        ]
+        write_atomic(
+            self.out_dir / "claims.jsonl",
+            "".join(canonical_json(claim) + "\n" for claim in claims),
+        )
+        write_atomic(
+            self.out_dir / "pending.jsonl",
+            "".join(canonical_json(item) + "\n" for item in pending_items),
+        )
+        write_atomic(
+            self.out_dir / "chunk_results.json",
+            json.dumps(
+                [
+                    {
+                        "id": chunk.id,
+                        "status": "ready"
+                        if chunk.id in self.ready
+                        else self.chunk_state(chunk),
+                        "attempts": [
+                            {
+                                key: record[key]
+                                for key in (
+                                    "attempt",
+                                    "status",
+                                    "called",
+                                    "salvaged",
+                                    "error",
+                                    "counts",
+                                    "server",
+                                )
+                            }
+                            for record in self.attempts[chunk.id]
+                        ],
+                    }
+                    for chunk in self.plan.chunks
+                ],
+                indent=2,
+                sort_keys=True,
+            ),
+        )
+        write_atomic(
+            self.out_dir / "pending_reconciliation.json",
+            json.dumps(self.reconciliation(), indent=2, sort_keys=True),
+        )
+        write_atomic(
+            self.out_dir / "call_budget.json",
+            json.dumps(self.call_budget(soft_s, hard_s), indent=2, sort_keys=True),
+        )
+        write_atomic(
+            self.out_dir / "summary.json", json.dumps(summary, indent=2, sort_keys=True)
+        )
+
+    def reconciliation(self) -> dict:
+        subjects = {
+            sid: {
+                "name": item["name"],
+                "aliases": item["aliases"],
+                "claim_ids": item["claim_ids"],
+                "status": "pending",
+            }
+            for sid, item in sorted(self.state.subjects.items())
+        }
+        report = None
+        if subjects:
+            claims = [Claim(sid, tuple(self.state.names(sid))) for sid in subjects]
+            result = reconcile(self.cast, claims)
+            report = {
+                "digest": result["digest"],
+                "groups": result["groups"],
+                "unsupported_claim_names": result["unsupported_claim_names"],
+                "omitted_candidates": [item["label"] for item in result["omitted"]],
+            }
+        return {
+            "status": "pending",
+            "plan_sha256": self.plan.artifact["plan_sha256"],
+            "subjects": subjects,
+            "cast_index": report,
+        }
+
+
+@contextlib.contextmanager
+def run_lock(out_dir: Path) -> Iterator[None]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with (out_dir / "run.lock").open("a+") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise ContractError(
+                "another run holds this run directory", "run_locked"
+            ) from error
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_plan_file(plan: DeltaPlan, out_dir: Path) -> None:
+    path = out_dir / "plan.json"
+    if path.is_file():
+        existing = json.loads(path.read_text(encoding="utf-8")).get("plan_sha256")
+        if existing != plan.artifact["plan_sha256"]:
+            raise ContractError(
+                "run directory holds a different plan; use a new --out", "plan_mismatch"
+            )
+        return
+    write_atomic(path, json.dumps(plan.artifact, indent=2, sort_keys=True))
+
+
+# ##################################################################
+# run delta
+# replays the journal, then asks for each chunk still missing, in order, never re-asking a ready or saved chunk, never more than `max_attempts` attempts per chunk, and never starting a request after the soft deadline. The hard deadline is a real wall-clock cut-off per request. Whatever happens (deadline, transport error, refusal, any exception) `summary.json` is rewritten as `not_ready` with its reason before control leaves. With transport=None nothing is sent (offline validation).
+def run_delta(
+    chapters: Sequence[Path],
+    config: ProofConfig,
+    plan: DeltaPlan,
+    out_dir: Path,
+    transport: Transport | None,
+    count: Counter,
+    calibration: dict | None = None,
+    soft_s: float = SOFT_DEADLINE_S,
+    hard_s: float = HARD_DEADLINE_S,
+    clock: Callable[[], float] = time.monotonic,
+    cast: CastIndex | None = None,
+    registry: dict | None = None,
+    aliases: dict | None = None,
+) -> dict:
+    check_output_dir(out_dir, chapters)
+    if transport is not None:
+        measured = validate_calibration(calibration or {}, config)
+        if measured["fixed_overhead_tokens"] != plan.fixed_overhead:
+            raise ContractError(
+                f"plan budgeted {plan.fixed_overhead} overhead tokens but calibration measured {measured['fixed_overhead_tokens']}",
+                "calibration_overhead_mismatch",
+            )
+    if cast is None:
+        try:
+            cast = build_cast_index(list(chapters), registry or {}, aliases or {}, None)
+        except CastDataIssue as error:
+            raise ContractError(
+                f"cast index unavailable: {error}", "cast_index_unavailable"
+            ) from error
+    with run_lock(out_dir):
+        ensure_plan_file(plan, out_dir)
+        run = DeltaRun(chapters, config, plan, out_dir, count, cast, registry, aliases)
+        started = clock()
+        run.replay()
+        stop: str | None = None
+        error: str | None = None
+        run.write_artifacts(
+            run.summary("in_progress", transport is None, 0.0), soft_s, hard_s
+        )
+        try:
+            for chunk in plan.chunks:
+                if (
+                    chunk.id in run.ready
+                    or len(run.attempts[chunk.id]) >= plan.settings.max_attempts
+                ):
+                    continue
+                stop = run.process(chunk, transport, clock, started, soft_s, hard_s)
+                write_atomic(
+                    out_dir / "summary.json",
+                    json.dumps(
+                        run.summary(
+                            "in_progress", transport is None, clock() - started
+                        ),
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                )
+                if stop:
+                    break
+        except BaseException as caught:
+            error = f"error:{type(caught).__name__}"
+            raise
+        finally:
+            summary = run.summary(stop, transport is None, clock() - started, error)
+            run.write_artifacts(summary, soft_s, hard_s)
+        if stop == "fallback_route":
+            raise ContractError(
+                "server answered with a model other than the configured primary; fallback route rejected",
+                "fallback_route",
+            )
+        return summary
+
+
+# ##################################################################
+# apply to cast
+# turns locally accepted claims into cast registry facts, nothing more. Existing actors (the original profiles, voices and anchors included) only gain appended `facts`; their name, bio and look, assets and ids are never rewritten. A novel subject becomes a prepared actor only through its exact label; an alias is recorded only when the source itself bridges it (src.cast_freeze.source_bridge_predicate on the cited sentence) and never takes a name another actor already owns. Anything else is returned as a typed pending item and the caller keeps it blocking the freeze. Idempotent: replaying the same claims changes nothing.
+def append_unique(target: list, text: str) -> None:
+    if text and text not in target:
+        target.append(text)
+
+
+def apply_to_cast(registry: dict, aliases: dict, claims: Sequence[dict]) -> dict:
+    actor_of: dict[str, str] = {}
+    applied, held = 0, []
+
+    def hold(claim: dict, reason: str) -> None:
+        held.append(
+            {
+                "claim_id": claim["claim_id"],
+                "subject": claim["subject"],
+                "category": claim["category"],
+                "value": claim["value"],
+                "pending_reason": reason,
+                "chunk_id": claim["chunk_id"],
+                "paragraph_id": claim["paragraph_id"],
+            }
+        )
+
+    for claim in claims:
+        sid = claim["subject_id"]
+        actor = sid if sid in registry else actor_of.get(sid)
+        if actor is None:
+            actor = normalized_id(claim["subject"])
+            existing = registry.get(actor)
+            if not actor or (
+                existing is not None
+                and norm_space(str(existing.get("name", actor))) != claim["subject"]
+            ):
+                hold(claim, "actor_id_collision")
+                continue
+            taken = aliases.get(actor)
+            if taken is not None and taken != actor:
+                hold(claim, "actor_id_collision")
+                continue
+            if existing is None:
+                registry[actor] = {
+                    "name": claim["subject"],
+                    "bio": "",
+                    "look": "",
+                    "origin": "prepared",
+                    "facts": {"voice": [], "look": []},
+                }
+            aliases.setdefault(actor, actor)
+            aliases.setdefault(normalized_id(claim["subject"]), actor)
+            actor_of[sid] = actor
+        facts = registry[actor].setdefault("facts", {"voice": [], "look": []})
+        if not isinstance(facts, dict):
+            hold(claim, "actor_id_collision")
+            continue
+        if claim["category"] == "alias":
+            alias_key = normalized_id(claim["value"])
+            proof = source_bridge_predicate(
+                claim["value"],
+                actor,
+                [{"id": claim["claim_id"], "quote": claim["quote"]}],
+                registry,
+                aliases,
+            )
+            if proof is None or not alias_key:
+                hold(claim, "alias_unbridged")
+                continue
+            if aliases.get(alias_key, actor) != actor:
+                hold(claim, "alias_collision")
+                continue
+            aliases[alias_key] = actor
+        append_unique(facts.setdefault(claim["category"], []), claim["value"])
+        applied += 1
+    return {"applied": applied, "pending": held}
+
+
+# ##################################################################
+# prepare-cast hook
+# the callable handed to src.cast_freeze.prepare_cast(wide_bio=...). It runs once the structural cast batches are done and before the freeze: it pins a private seed copy of the registry (so a resumed run is judged against the same state), runs or resumes the delta runner, and only when EVERY chunk is ready applies the accepted claims to the preparation registry and records each pending item as a blocking `pending` recovery row. A `not_ready` result (offline, deadline, error, partial coverage) is returned to prepare_cast, which then neither applies anything nor freezes: a bounded or interrupted run is never approval. The model route is the explicit proof config only; with live=False nothing is sent.
+def pinned_seed(out_dir: Path, registry: dict, aliases: dict) -> dict:
+    """The registry/aliases this run directory is judged against: written once, then always read back, so a resume is never judged against a registry that the run itself changed."""
+    path = out_dir / "seed.json"
+    if not path.is_file():
+        write_atomic(path, canonical_json({"registry": registry, "aliases": aliases}))
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@dataclass(frozen=True, slots=True)
+class WideBioHook:
+    config_path: Path
+    out_dir: Path
+    settings: DeltaSettings
+    calibration_path: Path | None = None
+    live: bool = False
+    transport: Transport = ollama_transport
+    soft_s: float = SOFT_DEADLINE_S
+    hard_s: float = HARD_DEADLINE_S
+
+    def __call__(
+        self,
+        project: Path,
+        chapters: Sequence[Path],
+        progress: dict,
+        source_text: str,
+        recovery,
+    ) -> dict:
+        applied = progress.get("wide_bio")
+        if isinstance(applied, dict) and applied.get("state") == "applied":
+            return applied
+        config = load_proof_config(self.config_path)
+        out = self.out_dir
+        seed = pinned_seed(out, progress["registry"], progress["aliases"])
+        calibration, overhead = None, 0
+        if self.live:
+            try:
+                calibration = json.loads(
+                    (self.calibration_path or Path("/nonexistent")).read_text(
+                        encoding="utf-8"
+                    )
+                )
+            except (OSError, ValueError) as error:
+                raise ContractError(
+                    "calibration record is not readable JSON", "calibration_invalid"
+                ) from error
+            overhead = validate_calibration(calibration, config)[
+                "fixed_overhead_tokens"
+            ]
+        count = build_counter(config)
+        plan = build_delta_plan(
+            source_text,
+            chapters,
+            config,
+            count,
+            self.settings,
+            overhead,
+            sha256_text(canonical_json(seed)),
+        )
+        summary = run_delta(
+            chapters,
+            config,
+            plan,
+            out,
+            self.transport if self.live else None,
+            count,
+            calibration,
+            self.soft_s,
+            self.hard_s,
+            registry=seed["registry"],
+            aliases=seed["aliases"],
+        )
+        if summary["state"] != "ready":
+            return {
+                "state": "not_ready",
+                "reason": summary["reason"],
+                "source_fraction": summary["source_fraction"],
+                "out_dir": str(out),
+            }
+        claims = [
+            json.loads(line)
+            for line in (out / "claims.jsonl").read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        held = [
+            json.loads(line)
+            for line in (out / "pending.jsonl").read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        outcome = apply_to_cast(progress["registry"], progress["aliases"], claims)
+        rows = [
+            {
+                "item": f"wide_bio:{item['chunk_id']}:{item['pending_id'][:16]}",
+                "reason": item["pending_reason"],
+                "detail": item,
+            }
+            for item in held
+        ] + [
+            {
+                "item": f"wide_bio:{item['chunk_id']}:{item['claim_id'][:16]}",
+                "reason": item["pending_reason"],
+                "detail": item,
+            }
+            for item in outcome["pending"]
+        ]
+        for row in rows:
+            recovery.record(
+                "cast",
+                row["item"],
+                f"wide_bio_pending_{row['reason']}",
+                f"wide-bio fact is pending: {row['reason']}",
+                severity="pending",
+                evidence={
+                    "plan_sha256": plan.artifact["plan_sha256"],
+                    "source_hash": plan.artifact["coverage"]["source_sha256"],
+                    "fact": row["detail"],
+                },
+            )
+        result = {
+            "state": "applied",
+            "plan_sha256": plan.artifact["plan_sha256"],
+            "claims_applied": outcome["applied"],
+            "pending": len(rows),
+            "calls_total": summary["calls_total"],
+        }
+        progress["wide_bio"] = result
+        return result
+
+
+# ##################################################################
+# main
+# plan/validate are offline; run needs --execute and a calibration record. Exit 0 = ready, 3 = not_ready (durable summary written), 2 = refused before any request. `transport` is injectable only for tests; the default is the single-route ollama transport.
+def main(argv: list[str] | None = None, transport: Transport = ollama_transport) -> int:
+    parser = argparse.ArgumentParser(
+        description="Resumable delta runner for wide-context biography extraction (offline unless `--execute`)"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("plan", "run", "validate", "prepare-cast"):
+        item = sub.add_parser(name)
+        item.add_argument(
+            "project" if name != "prepare-cast" else "source",
+            type=Path,
+            help="book project directory"
+            if name != "prepare-cast"
+            else "the original book source given to ./run prepare-cast",
+        )
+        if name != "prepare-cast":
+            item.add_argument(
+                "--source",
+                type=Path,
+                required=True,
+                help="authoritative original UTF-8 text",
+            )
+        item.add_argument("--config", type=Path, required=True)
+        item.add_argument("--out", type=Path, required=True)
+        item.add_argument(
+            "--target-tokens",
+            type=int,
+            required=True,
+            help="source-paragraph tokens per chunk, e.g. 8000 or 32000",
+        )
+        item.add_argument(
+            "--delta-tokens",
+            type=int,
+            default=1024,
+            help="cap on the already-established section",
+        )
+        item.add_argument(
+            "--max-attempts",
+            type=int,
+            default=1,
+            help="attempts per chunk; bounds model calls",
+        )
+        item.add_argument("--soft-deadline-s", type=float, default=SOFT_DEADLINE_S)
+        item.add_argument("--hard-deadline-s", type=float, default=HARD_DEADLINE_S)
+        item.add_argument(
+            "--calibration", type=Path, default=None, required=name == "run"
+        )
+    sub.choices["run"].add_argument(
+        "--execute", action="store_true", help="required: sends requests to the primary"
+    )
+    pc = sub.choices["prepare-cast"]
+    pc.add_argument(
+        "--execute",
+        action="store_true",
+        help="send the wide-bio requests (the structural cast batches follow their own configuration)",
+    )
+    pc.add_argument("--max-batches", type=int, default=None)
+    args = parser.parse_args(argv)
+    exit_file = None
+    try:
+        settings = DeltaSettings(
+            args.target_tokens, args.delta_tokens, args.max_attempts
+        )
+        if args.command == "prepare-cast":
+            from src.cast_freeze import prepare_cast
+
+            if args.execute and args.calibration is None:
+                raise ContractError(
+                    "--execute needs --calibration", "calibration_invalid"
+                )
+            hook = WideBioHook(
+                args.config,
+                args.out,
+                settings,
+                args.calibration,
+                args.execute,
+                transport,
+                args.soft_deadline_s,
+                args.hard_deadline_s,
+            )
+            result = prepare_cast(
+                args.source, max_batches=args.max_batches, wide_bio=hook
+            )
+            print(json.dumps(result, sort_keys=True, default=str))
+            return 0 if result.get("status") == "frozen" else 3
+        config = load_proof_config(args.config)
+        chapters = project_chapters(args.project.resolve())
+        check_output_dir(args.out, chapters)
+        if args.command == "run" and not args.execute:
+            raise ContractError("run requires --execute", "execute_required")
+        calibration, overhead = None, 0
+        if args.calibration is not None:
+            try:
+                calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise ContractError(
+                    "calibration record is not readable JSON", "calibration_invalid"
+                ) from error
+            overhead = validate_calibration(calibration, config)[
+                "fixed_overhead_tokens"
+            ]
+        _, registry, aliases, _ = project_inputs(args.project.resolve())
+        seed = pinned_seed(args.out, registry, aliases)
+        count = build_counter(config)
+        plan = build_delta_plan(
+            read_source(args.source),
+            chapters,
+            config,
+            count,
+            settings,
+            overhead,
+            sha256_text(canonical_json(seed)),
+        )
+        if args.command == "plan":
+            with run_lock(args.out):
+                ensure_plan_file(plan, args.out)
+                cast = build_cast_index(
+                    list(chapters), seed["registry"], seed["aliases"], None
+                )
+                run = DeltaRun(
+                    chapters,
+                    config,
+                    plan,
+                    args.out,
+                    count,
+                    cast,
+                    seed["registry"],
+                    seed["aliases"],
+                )
+                run.replay()
+                write_atomic(
+                    args.out / "call_budget.json",
+                    json.dumps(
+                        run.call_budget(args.soft_deadline_s, args.hard_deadline_s),
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                )
+            print(
+                json.dumps(
+                    {
+                        key: plan.artifact[key]
+                        for key in (
+                            "plan_sha256",
+                            "input_budget",
+                            "fixed_overhead_tokens",
+                            "coverage",
+                        )
+                    }
+                    | {
+                        "chunks": len(plan.chunks),
+                        "max_model_calls": len(plan.chunks) * settings.max_attempts,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        live = args.command == "run"
+        if live:
+            exit_file = args.out / "run.exit"
+            write_atomic(args.out / "run.pid", str(os.getpid()))
+        summary = run_delta(
+            chapters,
+            config,
+            plan,
+            args.out,
+            transport if live else None,
+            count,
+            calibration,
+            args.soft_deadline_s,
+            args.hard_deadline_s,
+            registry=seed["registry"],
+            aliases=seed["aliases"],
+        )
+        code = 0 if summary["state"] == "ready" else 3
+        if exit_file is not None:
+            write_atomic(exit_file, str(code))
+        print(json.dumps(summary, sort_keys=True))
+        return code
+    except (ContractError, TokenizerRefusal, CastDataIssue) as error:
+        print(
+            json.dumps(
+                {
+                    "refused": getattr(error, "code", type(error).__name__),
+                    "message": str(error),
+                }
+            ),
+            file=sys.stderr,
+        )
+        if exit_file is not None:
+            write_atomic(exit_file, "2")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -4535,13 +4535,46 @@ def active_quality_pending(recovery: RecoveryLedger, registry: dict) -> list[dic
     return [
         row
         for row in recovery.open_pending("cast_quality")
-        if row.get("code") in {f"quality_{kind}" for kind in QUALITY_KINDS}
-        and row.get("evidence", {}).get("registry_id") in registry
+        if (
+            row.get("code") in {f"quality_{kind}" for kind in QUALITY_KINDS}
+            and row.get("evidence", {}).get("registry_id") in registry
+        )
+        or row.get("code") == QUALITY_UNKNOWN_ACTOR
     ]
 
 
+QUALITY_UNKNOWN_ACTOR = "quality_unknown_actor"
+
+
+def _quality_inactive_basis(project: Path, progress: dict | None, registry: dict, registry_id: str) -> dict | None:
+    """Source-proven reason a non-registry ID is gone: a recorded retirement, or a verified alias-audit merge.
+
+    Returns None when nothing proves it, so the caller treats the ID as unknown (typed pending, never a crash).
+    """
+    if not isinstance(progress, dict):
+        return None
+    for entry in progress.get(SOURCE_RETIREMENT_HISTORY, []):
+        if isinstance(entry, dict) and entry.get("actor_id") == registry_id and entry.get("entry_sha256"):
+            return {"basis": "source_reviewed_retirement", "entry_sha256": entry["entry_sha256"]}
+    target = progress.get("aliases", {}).get(registry_id)
+    if registry_id in progress.get("inactive_legacy_ids", []) and target in registry and target != registry_id:
+        for record in _alias_audit_records(project):
+            if (
+                isinstance(record, dict)
+                and record.get("decision") == "merge"
+                and registry_id in {normalized_id(str(record.get("alias", ""))), normalized_id(str(record.get("canonical", "")))}
+            ):
+                return {"basis": "verified_alias_audit_merge", "canonical": target}
+    return None
+
+
 def ingest_context_quality_proposals(
-    project: Path, source_sha: str, chapters: list[Path], registry: dict, recovery: RecoveryLedger
+    project: Path,
+    source_sha: str,
+    chapters: list[Path],
+    registry: dict,
+    recovery: RecoveryLedger,
+    progress: dict | None = None,
 ) -> list[dict]:
     """Atomically merge caretaker quality input at a producer batch boundary.
 
@@ -4586,7 +4619,6 @@ def ingest_context_quality_proposals(
             or proposal_id in seen_ids
             or not isinstance(registry_id, str)
             or registry_id == "narrator"
-            or registry_id not in registry
             or kind not in QUALITY_KINDS
             or status not in {"pending", "resolved"}
             or not isinstance(note, str)
@@ -4620,6 +4652,24 @@ def ingest_context_quality_proposals(
             "scope": scope,
             "witnesses": witnesses,
         }
+        if registry_id not in registry:
+            basis = _quality_inactive_basis(project, progress, registry, registry_id)
+            mine = [r for r in prior_rows if r.get("evidence", {}).get("proposal_id") == proposal_id]
+            if basis is None:
+                recovery.record(
+                    "cast_quality", item, QUALITY_UNKNOWN_ACTOR,
+                    f"quality proposal names unknown registry ID {registry_id!r}", severity="pending", evidence=evidence,
+                )
+                continue
+            if not mine:
+                recovery.record("cast_quality", item, f"quality_{kind}", note, severity="pending", evidence=evidence)
+            for row in recovery.open_pending("cast_quality"):
+                if row.get("evidence", {}).get("proposal_id") == proposal_id and row["code"] != QUALITY_UNKNOWN_ACTOR:
+                    recovery.resolve(row, "actor_inactive_source_proven", {"proposal_id": proposal_id, "registry_id": registry_id, **basis})
+            continue
+        for row in recovery.open_pending("cast_quality"):
+            if row["code"] == QUALITY_UNKNOWN_ACTOR and row.get("evidence", {}).get("proposal_id") == proposal_id:
+                recovery.resolve(row, "actor_now_registered", {"proposal_id": proposal_id, "registry_id": registry_id})
         if status == "pending":
             if proposal["resolution"] is not None:
                 raise OperationalError("cast_integrity", "pending quality proposal has a resolution")
@@ -6864,7 +6914,7 @@ def prepare_cast(
     batches = 0
     coverage = semantic_coverage(progress)
     recovery = RecoveryLedger(project)
-    ingest_context_quality_proposals(project, source_sha, chapters, progress["registry"], recovery)
+    ingest_context_quality_proposals(project, source_sha, chapters, progress["registry"], recovery, progress)
     ingest_context_resolution_v2(project, source_sha, chapters, progress["registry"], progress["aliases"], recovery)
     ingest_root_approvals(project, source_sha, chapters, progress, recovery)
     ingest_source_reviewed_retirements(project, source_sha, chapters, progress, recovery)
@@ -6880,7 +6930,7 @@ def prepare_cast(
     while int(progress["next_chapter"]) < len(chapters):
         # Audit records may be appended while this resumable preparation is paused; refresh is idempotent and leaves cursor and media untouched.
         inactive, ambiguous = refresh_alias_audit(project, source_text, progress)
-        ingest_context_quality_proposals(project, source_sha, chapters, progress["registry"], recovery)
+        ingest_context_quality_proposals(project, source_sha, chapters, progress["registry"], recovery, progress)
         ingest_context_resolution_v2(project, source_sha, chapters, progress["registry"], progress["aliases"], recovery)
         ingest_root_approvals(project, source_sha, chapters, progress, recovery)
         ingest_source_reviewed_retirements(project, source_sha, chapters, progress, recovery)

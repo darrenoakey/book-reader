@@ -1375,6 +1375,93 @@ def test_context_quality_proposal_requires_exact_scope_and_preserves_resolution_
 
 
 # ##################################################################
+# quality proposals naming retired / merged / unknown IDs
+# Real temp chapter + project files; retired and alias-merged IDs resolve append-only, unknown IDs become typed pending.
+def _quality_project(tmp_path: Path, ids: list[str]) -> tuple[Path, dict]:
+    chapter = tmp_path / "01-part_01.txt"
+    chapter.write_text("Ren greeted Zed.", encoding="utf-8")
+    unit = immutable_evidence_units([chapter])[0]
+    scope = {
+        "chapter": chapter.name,
+        "chapter_sha256": unit["chapter_sha256"],
+        "unit_id": unit["id"],
+        "quote": unit["quote"],
+        "quote_sha256": hashlib.sha256(unit["quote"].encode()).hexdigest(),
+        "label": "Ren",
+        "span_start": unit["quote"].index("Ren"),
+    }
+    witness = {key: scope[key] for key in ("chapter", "chapter_sha256", "unit_id", "quote", "quote_sha256")}
+    proposals = []
+    for index, actor in enumerate(ids):
+        # distinct exact mention scope per proposal: vary the label occurrence by using the same span but a unique id
+        proposals.append(
+            {
+                "proposal_id": f"q-{actor}",
+                "registry_id": actor,
+                "kind": "garble",
+                "status": "pending",
+                "scope": {**scope, "label": "Ren", "span_start": 0} if index == 0 else {**scope, "label": "Zed", "span_start": unit["quote"].index("Zed")},
+                "witnesses": [witness],
+                "note": "review",
+                "resolution": None,
+            }
+        )
+    (tmp_path / CONTEXT_PROPOSALS_NAME).write_text(
+        json.dumps({"version": 1, "source_sha256": "source-sha", "proposals": proposals}), encoding="utf-8"
+    )
+    return chapter, scope
+
+
+def test_quality_proposal_for_retired_and_merged_ids_resolves_append_only_and_unknown_is_typed_pending(tmp_path: Path) -> None:
+    chapter, _ = _quality_project(tmp_path, ["ren", "zed"])
+    recovery = RecoveryLedger(tmp_path)
+    live = {"ren": {"name": "Ren"}, "zed": {"name": "Zed"}}
+    assert len(ingest_context_quality_proposals(tmp_path, "source-sha", [chapter], live, recovery)) == 2
+    before = recovery.entries()
+    # ren is retired through recorded history; zed was merged away through a verified alias audit
+    (tmp_path / "cast_alias_audit.json").write_text(
+        json.dumps({"records": [{"alias": "Zed", "canonical": "Ren", "evidence": ["Ren greeted Zed."], "decision": "merge"}]}),
+        encoding="utf-8",
+    )
+    progress = {
+        "source_reviewed_retirements": [{"actor_id": "ren", "entry_sha256": "e" * 64}],
+        "aliases": {"zed": "kept", "ren": "kept"},
+        "inactive_legacy_ids": ["zed"],
+    }
+    registry = {"kept": {"name": "Kept"}}
+    assert ingest_context_quality_proposals(tmp_path, "source-sha", [chapter], registry, recovery, progress) == []
+    after = recovery.entries()
+    assert after[: len(before)] == before  # original rows preserved, resolutions only appended
+    assert recovery.open_pending("cast_quality") == []
+    assert any(r["severity"] == "resolved" and r["evidence"]["outcome"] == "actor_inactive_source_proven" for r in after)
+    assert ingest_context_quality_proposals(tmp_path, "source-sha", [chapter], registry, recovery, progress) == []
+    assert recovery.entries() == after  # idempotent
+
+
+def test_quality_proposal_for_unknown_id_is_exact_typed_pending_and_live_flag_stays_open(tmp_path: Path) -> None:
+    chapter, _ = _quality_project(tmp_path, ["ren", "ghost"])
+    recovery = RecoveryLedger(tmp_path)
+    pending = ingest_context_quality_proposals(tmp_path, "source-sha", [chapter], {"ren": {"name": "Ren"}}, recovery, {"aliases": {}})
+    assert sorted(r["code"] for r in pending) == ["quality_garble", "quality_unknown_actor"]
+    again = ingest_context_quality_proposals(tmp_path, "source-sha", [chapter], {"ren": {"name": "Ren"}}, recovery, {"aliases": {}})
+    assert len(again) == 2 and len(recovery.entries()) == 2
+    # an inactive id with no audit merge proof is not retired by assertion alone
+    unproven = {"aliases": {"ghost": "ren"}, "inactive_legacy_ids": ["ghost"]}
+    ingest_context_quality_proposals(tmp_path, "source-sha", [chapter], {"ren": {"name": "Ren"}}, recovery, unproven)
+    assert any(r["code"] == "quality_unknown_actor" for r in recovery.open_pending("cast_quality"))
+
+
+def test_quality_proposal_source_mismatch_still_fails_closed_for_retired_id(tmp_path: Path) -> None:
+    chapter, _ = _quality_project(tmp_path, ["ren"])
+    progress = {"source_reviewed_retirements": [{"actor_id": "ren", "entry_sha256": "e" * 64}], "aliases": {}}
+    chapter.write_text("Ren greeted Zed!", encoding="utf-8")
+    with pytest.raises(OperationalError):
+        ingest_context_quality_proposals(tmp_path, "source-sha", [chapter], {}, RecoveryLedger(tmp_path), progress)
+    with pytest.raises(OperationalError):
+        ingest_context_quality_proposals(tmp_path, "other-sha", [chapter], {}, RecoveryLedger(tmp_path), progress)
+
+
+# ##################################################################
 # caretaker context resolution v2 adapter
 # Real temp chapters: source identity fails closed; a decision applies only when the existing guards prove it,
 # and everything else (new_actor, hold, unproven alias/non_character) is typed pending, never a whole-file failure.

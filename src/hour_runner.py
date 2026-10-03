@@ -45,6 +45,8 @@ HOUR_MAX_SECONDS = 3600.0
 # Leave one second for AAC container priming while retaining a near-full natural hour.
 AUDIO_MAX_SECONDS = 3599.0
 SCENE_SECONDS = 20.0
+# Per-hour override: Part 3 gets one generated illustration per second of runtime.
+HOUR_SCENE_SECONDS = {3: 1.0}
 FINAL_RESOLUTION = 480
 
 
@@ -85,7 +87,11 @@ def verify_hour_runtime(source: Path) -> dict[str, str]:
     source = source.resolve()
     if not source.is_file():
         raise ValueError(f"input source is not a file: {source}")
-    return {"source": str(source), "sha256": source_fingerprint(source), "output": str(get_output_dir(source))}
+    return {
+        "source": str(source),
+        "sha256": source_fingerprint(source),
+        "output": str(get_output_dir(source)),
+    }
 
 
 # ##################################################################
@@ -98,7 +104,9 @@ def load_ledger(project: Path, source: Path) -> dict:
         return {"source": str(source), "sha256": fingerprint, "hours": {}}
     ledger = load_json_store(path, "hour_ledger")
     if ledger.get("sha256") != fingerprint:
-        raise RuntimeError("hour ledger source SHA-256 does not match input; refusing to mix stories")
+        raise RuntimeError(
+            "hour ledger source SHA-256 does not match input; refusing to mix stories"
+        )
     return ledger
 
 
@@ -112,10 +120,17 @@ def source_chapters(source: Path, project: Path) -> tuple[str, str, list[Path]]:
     intro = chapters_dir / "00-intro.txt"
     parts = intro.read_text(encoding="utf-8").split(" by ", 1)
     title = parts[0].strip()
-    author = parts[1].split(", narrated by", 1)[0].strip() if len(parts) > 1 else "Unknown"
-    chapters = sorted((path for path in chapters_dir.glob("*.txt") if path != intro), key=chapter_order)
+    author = (
+        parts[1].split(", narrated by", 1)[0].strip() if len(parts) > 1 else "Unknown"
+    )
+    chapters = sorted(
+        (path for path in chapters_dir.glob("*.txt") if path != intro),
+        key=chapter_order,
+    )
     if not chapters:
-        raise OperationalError("source_no_chapters", "input extraction produced no narrative chapters")
+        raise OperationalError(
+            "source_no_chapters", "input extraction produced no narrative chapters"
+        )
     return title, author, chapters
 
 
@@ -130,14 +145,18 @@ def load_cast(project: Path) -> dict:
 # ##################################################################
 # cast aliases
 # map only exact normalized display-name matches so spelling/case aliases keep one identity without merging distinct names such as Ren and Ron.
-def canonical_character_id(project: Path, cast: dict, candidate_id: str, name: str) -> str:
+def canonical_character_id(
+    project: Path, cast: dict, candidate_id: str, name: str
+) -> str:
     aliases_path = project / "character_aliases.json"
     aliases = load_json_store(aliases_path, "character_aliases", default={})
     if candidate_id in aliases:
         return aliases[candidate_id]
     normalized = "".join(char for char in name.casefold() if char.isalnum())
     for established_id, info in cast.items():
-        established = "".join(char for char in str(info.get("name", "")).casefold() if char.isalnum())
+        established = "".join(
+            char for char in str(info.get("name", "")).casefold() if char.isalnum()
+        )
         if normalized and normalized == established:
             aliases[candidate_id] = established_id
             atomic_json(aliases_path, aliases)
@@ -148,14 +167,22 @@ def canonical_character_id(project: Path, cast: dict, candidate_id: str, name: s
 # ##################################################################
 # extend cast
 # analyze one upcoming chapter only, append its new information, and retain established identities.
-async def extend_cast(project: Path, chapter: Path, chapter_number: int, title: str, author: str) -> dict:
+async def extend_cast(
+    project: Path, chapter: Path, chapter_number: int, title: str, author: str
+) -> dict:
     cast = load_cast(project)
     known = ", ".join(f"{cid}={info.get('name', cid)}" for cid, info in cast.items())
-    found = merge_character_info([await analyze_chapter(chapter, chapter_number, known)], RecoveryLedger(project))
+    found = merge_character_info(
+        [await analyze_chapter(chapter, chapter_number, known)], RecoveryLedger(project)
+    )
     if "narrator" not in cast:
-        cast["narrator"] = await create_narrator_entry(title, author, chapter.read_text(encoding="utf-8")[:3000])
+        cast["narrator"] = await create_narrator_entry(
+            title, author, chapter.read_text(encoding="utf-8")[:3000]
+        )
     for char_id, info in found.items():
-        char_id = canonical_character_id(project, cast, char_id, str(info.get("name", char_id)))
+        char_id = canonical_character_id(
+            project, cast, char_id, str(info.get("name", char_id))
+        )
         if char_id not in cast:
             cast[char_id] = info
             continue
@@ -174,9 +201,13 @@ async def extend_cast(project: Path, chapter: Path, chapter_number: int, title: 
 async def extend_voices(project: Path, cast: dict) -> None:
     path = project / "voices.json"
     voices = load_json_store(path, "voices", default={})
-    missing = [(char_id, info) for char_id, info in cast.items() if char_id not in voices]
+    missing = [
+        (char_id, info) for char_id, info in cast.items() if char_id not in voices
+    ]
     if missing:
-        described = await asyncio.gather(*(_voice_description_for_one(char_id, info) for char_id, info in missing))
+        described = await asyncio.gather(
+            *(_voice_description_for_one(char_id, info) for char_id, info in missing)
+        )
         for char_id, info in described:
             voices[char_id] = info
         atomic_json(path, voices)
@@ -193,7 +224,10 @@ APPEARANCE_ATTEMPTS = 2
 def appearance_schema(character_ids: list[str]) -> dict:
     return {
         "type": "object",
-        "properties": {character_id: {"type": "string", "minLength": 1} for character_id in character_ids},
+        "properties": {
+            character_id: {"type": "string", "minLength": 1}
+            for character_id in character_ids
+        },
         "required": character_ids,
         "additionalProperties": False,
     }
@@ -204,12 +238,16 @@ def appearance_schema(character_ids: list[str]) -> dict:
 # reject any partial, renamed, blank, or non-string appearance response before production state can be changed.
 def validate_appearances(value: object, character_ids: list[str]) -> dict[str, str]:
     if not isinstance(value, dict) or set(value) != set(character_ids):
-        raise ValueError("appearance response keys do not exactly match requested character IDs")
+        raise ValueError(
+            "appearance response keys do not exactly match requested character IDs"
+        )
     result: dict[str, str] = {}
     for character_id in character_ids:
         description = value[character_id]
         if not isinstance(description, str) or not description.strip():
-            raise ValueError(f"appearance response for {character_id} is not a nonempty string")
+            raise ValueError(
+                f"appearance response for {character_id} is not a nonempty string"
+            )
         result[character_id] = description.strip()
     return result
 
@@ -220,16 +258,20 @@ def validate_appearances(value: object, character_ids: list[str]) -> dict[str, s
 def generate_appearance_batch(items: list[tuple[str, dict]]) -> dict[str, str]:
     character_ids = [character_id for character_id, _ in items]
     roster = "\n".join(
-        f"- {character_id}: {(info.get('look') or info.get('bio') or '')[:700]}" for character_id, info in items
+        f"- {character_id}: {(info.get('look') or info.get('bio') or '')[:700]}"
+        for character_id, info in items
     )
     prompt = (
         "For each requested character, give a 50-80 word canonical visual description for an image generator. "
         "Use source facts exactly; include age, build, hair, face, skin, clothing, and species when known. "
-        "Never describe plot or relationships. Return only the response-schema object. Characters:\n" + roster
+        "Never describe plot or relationships. Return only the response-schema object. Characters:\n"
+        + roster
     )
     last_error = "no response"
     for attempt in range(APPEARANCE_ATTEMPTS):
-        response = ask_sync(prompt, max_tokens=1200, response_schema=appearance_schema(character_ids))
+        response = ask_sync(
+            prompt, max_tokens=1200, response_schema=appearance_schema(character_ids)
+        )
         try:
             return validate_appearances(json.loads(response), character_ids)
         except (ValueError, json.JSONDecodeError) as error:
@@ -247,16 +289,26 @@ def generate_appearance_batch(items: list[tuple[str, dict]]) -> dict[str, str]:
 def extend_appearances(project: Path, cast: dict) -> None:
     path = project / "appearances.json"
     try:
-        appearances = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        appearances = (
+            json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        )
     except (OSError, ValueError) as error:
-        raise OperationalError("appearances_unreadable", f"appearances cache is unreadable: {path}") from error
+        raise OperationalError(
+            "appearances_unreadable", f"appearances cache is unreadable: {path}"
+        ) from error
     if not isinstance(appearances, dict):
-        raise OperationalError("appearances_invalid", "appearances cache is not an object")
+        raise OperationalError(
+            "appearances_invalid", "appearances cache is not an object"
+        )
     for character_id in cast:
         if character_id in appearances and (
-            not isinstance(appearances[character_id], str) or not appearances[character_id].strip()
+            not isinstance(appearances[character_id], str)
+            or not appearances[character_id].strip()
         ):
-            raise OperationalError("appearances_invalid", f"cached appearance for {character_id} is invalid")
+            raise OperationalError(
+                "appearances_invalid",
+                f"cached appearance for {character_id} is invalid",
+            )
     missing = [
         (character_id, info)
         for character_id, info in cast.items()
@@ -266,7 +318,9 @@ def extend_appearances(project: Path, cast: dict) -> None:
         return
     generated: dict[str, str] = {}
     for start in range(0, len(missing), APPEARANCE_BATCH_SIZE):
-        generated.update(generate_appearance_batch(missing[start : start + APPEARANCE_BATCH_SIZE]))
+        generated.update(
+            generate_appearance_batch(missing[start : start + APPEARANCE_BATCH_SIZE])
+        )
     appearances.update(generated)
     atomic_json(path, appearances)
 
@@ -285,7 +339,9 @@ def link_shared(hour_dir: Path, project: Path, name: str) -> None:
 # ##################################################################
 # prepare hour directory
 # make the hour see the canonical cast and Breeze reference files while retaining hour-local script/audio/movie outputs.
-def prepare_hour_directory(project: Path, hour_dir: Path, approved_cast: dict | None = None) -> None:
+def prepare_hour_directory(
+    project: Path, hour_dir: Path, approved_cast: dict | None = None
+) -> None:
     hour_dir.mkdir(parents=True, exist_ok=True)
     intro = project / "chapters" / "00-intro.txt"
     if intro.exists():
@@ -299,10 +355,20 @@ def prepare_hour_directory(project: Path, hour_dir: Path, approved_cast: dict | 
     if frozen_names:
         # Later hours consume a local active-only metadata view. Root files keep
         # historical aliases for cache preservation but must never steer scenes.
-        for name in ("characters.json", "voices.json", "breeze_voices.json", "appearances.json"):
+        for name in (
+            "characters.json",
+            "voices.json",
+            "breeze_voices.json",
+            "appearances.json",
+        ):
             source = json.loads((project / name).read_text(encoding="utf-8"))
             atomic_json(
-                hour_dir / name, {actor_id: source[actor_id] for actor_id in frozen_names if actor_id in source}
+                hour_dir / name,
+                {
+                    actor_id: source[actor_id]
+                    for actor_id in frozen_names
+                    if actor_id in source
+                },
             )
     for name in (
         "voices",
@@ -314,13 +380,25 @@ def prepare_hour_directory(project: Path, hour_dir: Path, approved_cast: dict | 
     ):
         link_shared(hour_dir, project, name)
     if frozen_names:
-        (hour_dir / "frozen_cast_active_only.txt").write_text("true\n", encoding="utf-8")
+        (hour_dir / "frozen_cast_active_only.txt").write_text(
+            "true\n", encoding="utf-8"
+        )
     for name in ("style.txt", "style-reference.png"):
         if (project / name).exists():
             link_shared(hour_dir, project, name)
-    (hour_dir / "scene_seconds.txt").write_text(f"{SCENE_SECONDS:g}\n", encoding="utf-8")
+    hour_number = (
+        int(hour_dir.name.rsplit("-", 1)[-1])
+        if hour_dir.name.startswith("hour-")
+        else 0
+    )
+    scene_seconds = HOUR_SCENE_SECONDS.get(hour_number, SCENE_SECONDS)
+    (hour_dir / "scene_seconds.txt").write_text(
+        f"{scene_seconds:g}\n", encoding="utf-8"
+    )
     # Hourly productions deliberately use only the clean style asset and canonical cast portraits.
-    (hour_dir / "image_reference_mode.txt").write_text("style-and-cast-only\n", encoding="utf-8")
+    (hour_dir / "image_reference_mode.txt").write_text(
+        "style-and-cast-only\n", encoding="utf-8"
+    )
 
 
 # ##################################################################
@@ -342,45 +420,77 @@ def script_for_chapter(
     if canonical.exists():
         payload = canonical.read_bytes()
         try:
-            lines = [json.loads(line) for line in payload.decode("utf-8").splitlines() if line.strip()]
-            meta_path = metadata if metadata.exists() else canonical.with_name(canonical.name + ".meta.json")
+            lines = [
+                json.loads(line)
+                for line in payload.decode("utf-8").splitlines()
+                if line.strip()
+            ]
+            meta_path = (
+                metadata
+                if metadata.exists()
+                else canonical.with_name(canonical.name + ".meta.json")
+            )
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             if meta.get("sha256") != hashlib.sha256(payload).hexdigest():
                 raise ValueError("payload hash mismatch")
             if metadata.exists():
                 if (
                     meta.get("mode") != "immutable-spans"
-                    or meta.get("source_sha256") != hashlib.sha256(source.encode()).hexdigest()
+                    or meta.get("source_sha256")
+                    != hashlib.sha256(source.encode()).hexdigest()
                 ):
                     raise ValueError("hourly source metadata mismatch")
                 if "".join(next(iter(line.values())) for line in lines) != source:
                     raise ValueError("hourly immutable spans do not reconstruct source")
-                unknown = [next(iter(line)) for line in lines if next(iter(line)) not in cast]
-                remapped_indices = [index for index, line in enumerate(lines) if next(iter(line)) not in cast]
+                unknown = [
+                    next(iter(line)) for line in lines if next(iter(line)) not in cast
+                ]
+                remapped_indices = [
+                    index
+                    for index, line in enumerate(lines)
+                    if next(iter(line)) not in cast
+                ]
                 if unknown:
                     if aliases is None or any(
-                        speaker not in aliases or aliases[speaker] not in cast for speaker in unknown
+                        speaker not in aliases or aliases[speaker] not in cast
+                        for speaker in unknown
                     ):
-                        raise ValueError("hourly script has an unknown speaker outside frozen aliases")
+                        raise ValueError(
+                            "hourly script has an unknown speaker outside frozen aliases"
+                        )
                     frozen_dir = project / "frozen_script_cache"
                     frozen_dir.mkdir(exist_ok=True)
                     frozen = frozen_dir / canonical.name
                     remapped = [
-                        {aliases.get(next(iter(line)), next(iter(line))): next(iter(line.values()))} for line in lines
+                        {
+                            aliases.get(next(iter(line)), next(iter(line))): next(
+                                iter(line.values())
+                            )
+                        }
+                        for line in lines
                     ]
-                    if "".join(next(iter(line.values())) for line in remapped) != source:
+                    if (
+                        "".join(next(iter(line.values())) for line in remapped)
+                        != source
+                    ):
                         raise ValueError("frozen alias remap changed source text")
-                    payload = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in remapped).encode("utf-8")
+                    payload = "".join(
+                        json.dumps(line, ensure_ascii=False) + "\n" for line in remapped
+                    ).encode("utf-8")
                     if not frozen.exists():
                         frozen.write_bytes(payload)
                     elif frozen.read_bytes() != payload:
-                        raise ValueError("frozen alias script content differs from existing cache")
+                        raise ValueError(
+                            "frozen alias script content differs from existing cache"
+                        )
                     frozen_meta = frozen.with_name(frozen.name + ".hour.meta.json")
                     atomic_json(
                         frozen_meta,
                         {
                             "mode": "immutable-spans",
-                            "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                            "source_sha256": hashlib.sha256(
+                                source.encode()
+                            ).hexdigest(),
                             "sha256": hashlib.sha256(payload).hexdigest(),
                             "legacy_script": str(canonical.relative_to(project)),
                             "remapped_speakers": sorted(set(unknown)),
@@ -393,7 +503,13 @@ def script_for_chapter(
 
                 validate_script_lines(lines, source, sorted(cast))
             return canonical
-        except (ValueError, StopIteration, TypeError, KeyError, AttributeError) as error:
+        except (
+            ValueError,
+            StopIteration,
+            TypeError,
+            KeyError,
+            AttributeError,
+        ) as error:
             raise DataIssue(
                 "canonical_script_invalid",
                 f"existing canonical script {canonical.name} failed read-only validation: {error}",
@@ -401,11 +517,14 @@ def script_for_chapter(
             ) from error
         except OSError as error:
             raise OperationalError(
-                "canonical_script_unreadable", f"existing canonical script {canonical.name} is unreadable"
+                "canonical_script_unreadable",
+                f"existing canonical script {canonical.name} is unreadable",
             ) from error
     from src.hourly_spans import generate_hourly_script_sync
 
-    generate_hourly_script_sync(chapter, canonical, sorted(cast), aliases, scoped_references)
+    generate_hourly_script_sync(
+        chapter, canonical, sorted(cast), aliases, scoped_references
+    )
     payload = canonical.read_bytes()
     atomic_json(
         metadata,
@@ -446,10 +565,14 @@ def copy_chapter_context(hour_dir: Path, chapter: Path) -> None:
 # ##################################################################
 # synthesize window
 # synthesize only an upcoming chapter, then select complete spoken pieces that fit the strict hour cap.
-def synthesize_window(project: Path, script: Path, remaining: float, start_piece: int) -> tuple[list[dict], int]:
+def synthesize_window(
+    project: Path, script: Path, remaining: float, start_piece: int
+) -> tuple[list[dict], int]:
     audio_dir = project / "audio_cache"
     audio_dir.mkdir(exist_ok=True)
-    _, paths, jobs, metadata = plan_chapter(script, audio_dir, project / "voices", tts_engine.speaker_set(project))
+    _, paths, jobs, metadata = plan_chapter(
+        script, audio_dir, project / "voices", tts_engine.speaker_set(project)
+    )
     if jobs:
         tts_engine.synthesize_jobs(jobs, project)
     selected: list[dict] = []
@@ -487,7 +610,9 @@ def render_hour(hour_dir: Path, title: str) -> Path:
 # ##################################################################
 # record hour timing
 # append actual lifecycle outcomes so interrupted long production is observable and resumable.
-def record_hour_timing(project: Path, hour_index: int, outcome: str, seconds: float) -> None:
+def record_hour_timing(
+    project: Path, hour_index: int, outcome: str, seconds: float
+) -> None:
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "hour": hour_index,
@@ -535,11 +660,15 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
         movie = project / prior["movie"]
         if movie.exists() and probe_duration(movie) <= HOUR_MAX_SECONDS:
             return movie
-        raise RuntimeError("completed hour ledger points at a missing or oversized movie")
+        raise RuntimeError(
+            "completed hour ledger points at a missing or oversized movie"
+        )
     if hour_index > 1:
         previous = ledger["hours"].get(str(hour_index - 1))
         if not previous or not previous.get("complete"):
-            raise RuntimeError("previous hour is not complete; refusing to duplicate or skip story content")
+            raise RuntimeError(
+                "previous hour is not complete; refusing to duplicate or skip story content"
+            )
         chapter_cursor = int(previous["next_chapter"])
         piece_cursor = int(previous["next_piece"])
     else:
@@ -574,13 +703,28 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
     for chapter_index in range(chapter_cursor, len(chapters)):
         try:
             if hour_index < 3:
-                cast = asyncio.run(extend_cast(project, chapters[chapter_index], chapter_index + 1, title, author))
+                cast = asyncio.run(
+                    extend_cast(
+                        project,
+                        chapters[chapter_index],
+                        chapter_index + 1,
+                        title,
+                        author,
+                    )
+                )
                 asyncio.run(extend_voices(project, cast))
                 extend_appearances(project, cast)
             # New hours never extend cast, voice, appearance, or portrait state.
             prepare_hour_directory(project, hour_dir, cast if hour_index >= 3 else None)
             copy_chapter_context(hour_dir, chapters[chapter_index])
-            script = script_for_chapter(project, hour_dir, chapters[chapter_index], cast, aliases, scoped_references)
+            script = script_for_chapter(
+                project,
+                hour_dir,
+                chapters[chapter_index],
+                cast,
+                aliases,
+                scoped_references,
+            )
             start_piece = piece_cursor if chapter_index == chapter_cursor else 0
             candidates, _ = synthesize_window(project, script, remaining, start_piece)
             if not candidates:
@@ -597,7 +741,10 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
             all_selected.extend(candidates)
             remaining -= elapsed
             all_metadata = plan_chapter(
-                script, project / "audio_cache", project / "voices", tts_engine.speaker_set(project)
+                script,
+                project / "audio_cache",
+                project / "voices",
+                tts_engine.speaker_set(project),
             )[3]
             consumed = start_piece + len(candidates)
             if consumed < len(all_metadata):
@@ -636,7 +783,11 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
         raise DataIssue(
             "hour_no_content",
             "no source content selected for requested hour; every remaining chapter was quarantined (see data_recovery.jsonl)",
-            {"quarantined": [r["item"] for r in recovery.entries() if r["stage"] == "hour"]},
+            {
+                "quarantined": [
+                    r["item"] for r in recovery.entries() if r["stage"] == "hour"
+                ]
+            },
         )
     audio_dir = hour_dir / "audio"
     output = audio_dir / "hour-00000.wav"
@@ -649,7 +800,10 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
         "duration_seconds": round(probe_duration(movie), 3),
         "next_chapter": next_chapter,
         "next_piece": next_piece,
-        "source_chapters": [str(path.relative_to(project)) for path in chapters[chapter_cursor : next_chapter + 1]],
+        "source_chapters": [
+            str(path.relative_to(project))
+            for path in chapters[chapter_cursor : next_chapter + 1]
+        ],
     }
     atomic_json(project / "hours.json", ledger)
     return movie

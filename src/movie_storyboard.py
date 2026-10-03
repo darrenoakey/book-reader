@@ -19,6 +19,7 @@ fine — the picture should never change mid-sentence).
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 
@@ -26,6 +27,8 @@ from src.audio_synth import wav_duration
 from src.llm import ask_sync
 
 TARGET_SECONDS = 30.0
+# Cadences at or below this use the exact time grid (one scene per step seconds).
+GRID_MAX_SECONDS = 4.0
 
 
 # ##################################################################
@@ -39,9 +42,11 @@ def choose_scene_seconds(output_dir: Path) -> float:
         try:
             value = float(cfg.read_text(encoding="utf-8").strip())
         except ValueError:
-            raise ValueError(f"scene_seconds.txt is not a number: {cfg.read_text().strip()!r}") from None
-        if not 5.0 <= value <= 120.0:
-            raise ValueError(f"scene_seconds {value} outside 5..120s")
+            raise ValueError(
+                f"scene_seconds.txt is not a number: {cfg.read_text().strip()!r}"
+            ) from None
+        if not 1.0 <= value <= 120.0:
+            raise ValueError(f"scene_seconds {value} outside 1..120s")
         return value
     return TARGET_SECONDS
 
@@ -75,9 +80,65 @@ def load_global_lines(output_dir: Path) -> list[dict]:
 
 
 # ##################################################################
+# fixed grid windows
+# one scene per `step` seconds of runtime: count = ceil(total / step), window
+# k = [k*step, min((k+1)*step, total)) so the final fractional second still
+# gets its own scene. Text comes from the lines overlapping the window; a
+# silent window borrows the nearest line so every scene has something to depict.
+def grid_windows(
+    lines: list[dict], total_seconds: float, step: float = 1.0
+) -> list[dict]:
+    if not lines:
+        raise ValueError("no lines to window")
+    count = math.ceil(round(total_seconds / step, 6))
+    windows: list[dict] = []
+    for k in range(count):
+        start = k * step
+        end = min((k + 1) * step, total_seconds)
+        inside = [l for l in lines if l["start"] < end and l["end"] > start]
+        mid = (start + end) / 2
+        nearest = min(
+            lines,
+            key=lambda l: (
+                0.0
+                if l["start"] <= mid <= l["end"]
+                else min(abs(mid - l["start"]), abs(mid - l["end"]))
+            ),
+        )
+        chosen = inside or [nearest]
+        mid_line = next((l for l in inside if l["start"] <= mid <= l["end"]), nearest)
+        windows.append(
+            {
+                "index": k,
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "speakers": sorted({l["speaker"] for l in chosen}),
+                "text": " ".join(l["text"] for l in chosen),
+                "mid_text": mid_line["text"],
+            }
+        )
+    return windows
+
+
+# ##################################################################
+# audio total seconds
+# exact length of the concatenated chapter audio the movie is timed against
+def audio_total_seconds(output_dir: Path) -> float:
+    audio_dir = output_dir / "audio"
+    total = 0.0
+    for tl_path in sorted(audio_dir.glob("*.timeline.json")):
+        total += wav_duration(
+            audio_dir / f"{tl_path.stem.replace('.timeline', '')}.wav"
+        )
+    return total
+
+
+# ##################################################################
 # window lines
 # group the global line stream into scenes of about target_seconds
-def window_lines(lines: list[dict], target_seconds: float = TARGET_SECONDS) -> list[dict]:
+def window_lines(
+    lines: list[dict], target_seconds: float = TARGET_SECONDS
+) -> list[dict]:
     scenes: list[dict] = []
     current: list[dict] = []
     for line in lines:
@@ -99,7 +160,9 @@ def window_lines(lines: list[dict], target_seconds: float = TARGET_SECONDS) -> l
         line = min(
             s,
             key=lambda l: (
-                min(abs(mid - l["start"]), abs(mid - l["end"])) if not (l["start"] <= mid <= l["end"]) else 0.0
+                min(abs(mid - l["start"]), abs(mid - l["end"]))
+                if not (l["start"] <= mid <= l["end"])
+                else 0.0
             ),
         )
         return line["text"]
@@ -188,7 +251,9 @@ def distill_appearances(output_dir: Path, bible: dict | None = None) -> dict:
     path = output_dir / "appearances.json"
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
-    characters = json.loads((output_dir / "characters.json").read_text(encoding="utf-8"))
+    characters = json.loads(
+        (output_dir / "characters.json").read_text(encoding="utf-8")
+    )
     # Prefer the dedicated `look` field (everything the text says about
     # appearance); fall back to the voice bio only when no look was captured.
     roster = "\n".join(
@@ -266,7 +331,9 @@ def _bible_block(bible: dict) -> str:
 # ##################################################################
 # prompt for scene
 # one LLM call per scene: the window's spoken text → a cinematic still prompt
-def _scene_prompt(scene: dict, style: str, appearances: dict, title: str, bible: dict | None = None) -> dict:
+def _scene_prompt(
+    scene: dict, style: str, appearances: dict, title: str, bible: dict | None = None
+) -> dict:
     cast_notes = []
     for speaker in scene["speakers"]:
         if speaker == "narrator":
@@ -315,15 +382,37 @@ def build_storyboard(output_dir: Path, title: str) -> Path:
     if storyboard_path.exists():
         return storyboard_path
     lines = load_global_lines(output_dir)
-    windows = window_lines(lines, target_seconds=choose_scene_seconds(output_dir))
+    step = choose_scene_seconds(output_dir)
+    if step <= GRID_MAX_SECONDS:
+        windows = grid_windows(lines, audio_total_seconds(output_dir), step)
+    else:
+        windows = window_lines(lines, target_seconds=step)
     style = choose_style(output_dir)
     bible = world_bible(output_dir, title)
     appearances = distill_appearances(output_dir, bible)
     locations = distill_locations(output_dir, bible)
     print(f"  storyboard: {len(windows)} scenes, style: {style[:80]}...")
+    # Resumable: each finished scene prompt is journalled (append-only) so a
+    # crash or restart over thousands of scenes never repeats finished LLM calls.
+    journal = output_dir / "storyboard.scenes.jsonl"
+    done: dict[int, dict] = {}
+    if journal.exists():
+        for raw in journal.read_text(encoding="utf-8").splitlines():
+            if raw.strip():
+                row = json.loads(raw)
+                done[int(row["index"])] = row
     scenes = []
     for window in windows:
-        scenes.append(_scene_prompt(window, style, appearances, title, bible))
+        row = done.get(window["index"])
+        if (
+            row is None
+            or row["start"] != window["start"]
+            or row["end"] != window["end"]
+        ):
+            row = _scene_prompt(window, style, appearances, title, bible)
+            with journal.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+        scenes.append(row)
         if (window["index"] + 1) % 10 == 0:
             print(f"    {window['index'] + 1}/{len(windows)} scene prompts")
     storyboard_path.write_text(

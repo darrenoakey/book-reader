@@ -90,7 +90,9 @@ def scene_move(index: int, title: bool = False) -> str:
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
-        raise RuntimeError(f"{' '.join(cmd[:3])} failed rc={result.returncode}: {result.stderr[-400:]}")
+        raise RuntimeError(
+            f"{' '.join(cmd[:3])} failed rc={result.returncode}: {result.stderr[-400:]}"
+        )
     return result
 
 
@@ -219,13 +221,18 @@ def _prescaled(image: Path, cache_dir: Path, resolution: int) -> Path:
 # worktrees so the persistent gate replays a render instead of repeating it.
 def _segment_cache_dirs() -> tuple[Path, ...]:
     root = Path(__file__).resolve().parent.parent
-    return (Path.home() / ".cache" / "book-reader" / "segment-cache", root / "local" / "segment-cache")
+    return (
+        Path.home() / ".cache" / "book-reader" / "segment-cache",
+        root / "local" / "segment-cache",
+    )
 
 
 def _segment_cache_key(image: Path, frames: int, move: str, resolution: int) -> str:
     digest = hashlib.sha256(image.read_bytes())
     digest.update(zoompan_filter(move, frames, resolution).encode())
-    digest.update(f"{frames}:{move}:{resolution}:{FPS}:{_SUPER}:medium:18:lanczos".encode())
+    digest.update(
+        f"{frames}:{move}:{resolution}:{FPS}:{_SUPER}:medium:18:lanczos".encode()
+    )
     return digest.hexdigest()
 
 
@@ -258,14 +265,22 @@ def _store_segment(key: str, src: Path) -> None:
 # render segment
 # render one still into an h264 segment of EXACTLY `frames` frames.
 # A content hit copies a previous real ffmpeg result; a miss renders and stores it.
-def render_segment(image: Path, frames: int, move: str, dest: Path, resolution: int = DEFAULT_RESOLUTION) -> Path:
+def render_segment(
+    image: Path,
+    frames: int,
+    move: str,
+    dest: Path,
+    resolution: int = DEFAULT_RESOLUTION,
+) -> Path:
     movie_dimensions(resolution)
     if dest.exists() and dest.stat().st_size > 1000:
         # A cached segment is only valid for the SAME frame count — when the
         # title card shaves frames off scene 0 its old segment must re-render.
         # (The move is encoded in the filename, so a move-engine change busts
         # the cache automatically.)
-        if probe_frames(dest) == frames and probe_resolution(dest) == movie_dimensions(resolution):
+        if probe_frames(dest) == frames and probe_resolution(dest) == movie_dimensions(
+            resolution
+        ):
             return dest
         dest.unlink()
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -305,7 +320,9 @@ def render_segment(image: Path, frames: int, move: str, dest: Path, resolution: 
     actual = probe_frames(dest)
     if actual != frames:
         dest.unlink(missing_ok=True)
-        raise RuntimeError(f"segment {dest.name} has {actual} frames, expected {frames}")
+        raise RuntimeError(
+            f"segment {dest.name} has {actual} frames, expected {frames}"
+        )
     _store_segment(key, dest)
     return dest
 
@@ -330,7 +347,9 @@ def _chapter_wavs(output_dir: Path) -> list[Path]:
 # ##################################################################
 # assemble movie
 # full step: storyboard scenes + scene stills + chapter audio → movie/movie.mp4
-def assemble_movie(output_dir: Path, title: str, resolution: int = DEFAULT_RESOLUTION) -> Path:
+def assemble_movie(
+    output_dir: Path, title: str, resolution: int = DEFAULT_RESOLUTION
+) -> Path:
     movie_dimensions(resolution)
     storyboard_path = output_dir / "storyboard.json"
     if not storyboard_path.exists():
@@ -352,7 +371,13 @@ def assemble_movie(output_dir: Path, title: str, resolution: int = DEFAULT_RESOL
     total_frames = round(audio_seconds * FPS)
 
     # Frame budget per scene: round each boundary, never the durations.
-    bounds = [round(float(s["start"]) * FPS) for s in scenes] + [total_frames]
+    # Clamp so a sub-frame fractional tail scene still owns at least one frame
+    # (every scene must have its own picture on screen) without changing the total.
+    n_scenes = len(scenes)
+    bounds = [
+        min(round(float(s["start"]) * FPS), total_frames - (n_scenes - i))
+        for i, s in enumerate(scenes)
+    ] + [total_frames]
 
     # Opening title card: when title_page.png exists it holds for the first
     # TITLE_SECONDS, carved out of scene 0's slot (total frames unchanged, so
@@ -368,7 +393,13 @@ def assemble_movie(output_dir: Path, title: str, resolution: int = DEFAULT_RESOL
     segments: list[Path] = []
     if title_frames:
         segments.append(
-            render_segment(title_image, title_frames, "zoom-in", segments_dir / "title.zoom-in.mp4", resolution)
+            render_segment(
+                title_image,
+                title_frames,
+                "zoom-in",
+                segments_dir / "title.zoom-in.mp4",
+                resolution,
+            )
         )
         print(f"    title card: {title_frames / FPS:.1f}s")
     for i, scene in enumerate(scenes):
@@ -382,7 +413,11 @@ def assemble_movie(output_dir: Path, title: str, resolution: int = DEFAULT_RESOL
             raise ValueError(f"scene image missing: {image} — run the sceneimages step")
         # One movement per scene, assigned deterministically; every 5th rests.
         move = scene_move(i, title=bool(title_frames))
-        segments.append(render_segment(image, frames, move, segments_dir / f"{i:04d}.{move}.mp4", resolution))
+        segments.append(
+            render_segment(
+                image, frames, move, segments_dir / f"{i:04d}.{move}.mp4", resolution
+            )
+        )
         if (i + 1) % 10 == 0:
             print(f"    {i + 1}/{len(scenes)} segments rendered")
 
@@ -414,7 +449,9 @@ def assemble_movie(output_dir: Path, title: str, resolution: int = DEFAULT_RESOL
         actual = probe_frames(video_only)
         if actual != total_frames:
             video_only.unlink(missing_ok=True)
-            raise RuntimeError(f"concatenated video has {actual} frames, expected {total_frames}")
+            raise RuntimeError(
+                f"concatenated video has {actual} frames, expected {total_frames}"
+            )
 
     # Mux with the narration track. Both sides are independently exact; the
     # container duration may differ by <1 frame of AAC priming, nothing drifts.
@@ -447,9 +484,12 @@ def assemble_movie(output_dir: Path, title: str, resolution: int = DEFAULT_RESOL
         raise RuntimeError(f"movie/audio drift {drift:.3f}s exceeds 0.5s tolerance")
     width, height = movie_dimensions(resolution)
     (movie_dir / "resolution.json").write_text(
-        json.dumps({"resolution": resolution, "width": width, "height": height}) + "\n", encoding="utf-8"
+        json.dumps({"resolution": resolution, "width": width, "height": height}) + "\n",
+        encoding="utf-8",
     )
-    print(f"  movie: {audio_seconds / 60:.1f} min, {total_frames} frames, {width}x{height}, drift {drift:.3f}s")
+    print(
+        f"  movie: {audio_seconds / 60:.1f} min, {total_frames} frames, {width}x{height}, drift {drift:.3f}s"
+    )
     return movie_path
 
 

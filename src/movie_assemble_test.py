@@ -140,7 +140,15 @@ def test_assemble_movie_real() -> None:
             json.dumps(
                 {
                     "chapter": "01-a",
-                    "lines": [{"index": 0, "speaker": "narrator", "text": "hi", "start": 0.0, "end": 2.0}],
+                    "lines": [
+                        {
+                            "index": 0,
+                            "speaker": "narrator",
+                            "text": "hi",
+                            "start": 0.0,
+                            "end": 2.0,
+                        }
+                    ],
                 }
             )
         )
@@ -148,7 +156,15 @@ def test_assemble_movie_real() -> None:
             json.dumps(
                 {
                     "chapter": "02-b",
-                    "lines": [{"index": 0, "speaker": "narrator", "text": "there", "start": 0.0, "end": 2.0}],
+                    "lines": [
+                        {
+                            "index": 0,
+                            "speaker": "narrator",
+                            "text": "there",
+                            "start": 0.0,
+                            "end": 2.0,
+                        }
+                    ],
                 }
             )
         )
@@ -160,8 +176,22 @@ def test_assemble_movie_real() -> None:
                     "style": "test",
                     "appearances": {},
                     "scenes": [
-                        {"index": 0, "start": 0.0, "end": 2.0, "characters": [], "prompt": "a", "text_excerpt": ""},
-                        {"index": 1, "start": 2.0, "end": 4.0, "characters": [], "prompt": "b", "text_excerpt": ""},
+                        {
+                            "index": 0,
+                            "start": 0.0,
+                            "end": 2.0,
+                            "characters": [],
+                            "prompt": "a",
+                            "text_excerpt": "",
+                        },
+                        {
+                            "index": 1,
+                            "start": 2.0,
+                            "end": 4.0,
+                            "characters": [],
+                            "prompt": "b",
+                            "text_excerpt": "",
+                        },
                     ],
                 }
             )
@@ -190,3 +220,87 @@ def test_assemble_movie_real() -> None:
         assert out_codec == "aac"
         # sanity: our source wavs really were 2s each
         assert abs(wav_duration(audio_dir / "01-a.wav") - 2.0) < 0.05
+
+
+# ##################################################################
+# test one scene per second grid movie
+# real timelines + tones (1.7s + 1.7s = 3.4s) → grid windows give ceil(3.4)=4
+# scenes (last is the fractional 0.4s); four distinct stills are assembled at
+# 480p and each second of the real mp4 shows its own still, frame-exact.
+def test_one_scene_per_second_grid_movie_real() -> None:
+    from src.movie_assemble import probe_resolution
+    from src.movie_storyboard import (
+        audio_total_seconds,
+        grid_windows,
+        load_global_lines,
+    )
+
+    colors = [(200, 30, 30), (30, 200, 30), (30, 30, 200), (200, 200, 30)]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir)
+        audio_dir = out / "audio"
+        scenes_dir = out / "scenes"
+        audio_dir.mkdir()
+        scenes_dir.mkdir()
+        for name, text in (("01-a", "first words"), ("02-b", "second words")):
+            _make_tone(audio_dir / f"{name}.wav", 1.7)
+            (audio_dir / f"{name}.timeline.json").write_text(
+                json.dumps(
+                    {
+                        "chapter": name,
+                        "lines": [
+                            {
+                                "index": 0,
+                                "speaker": "narrator",
+                                "text": text,
+                                "start": 0.0,
+                                "end": 1.7,
+                            }
+                        ],
+                    }
+                )
+            )
+        total = audio_total_seconds(out)
+        windows = grid_windows(load_global_lines(out), total, 1.0)
+        assert len(windows) == 4
+        assert [w["start"] for w in windows] == [0.0, 1.0, 2.0, 3.0]
+        assert (
+            abs(windows[-1]["end"] - total) < 0.01
+            and windows[-1]["end"] - windows[-1]["start"] < 0.5
+        )
+        scenes = []
+        for w, color in zip(windows, colors, strict=True):
+            _make_still(scenes_dir / f"{w['index']:04d}.png", color)
+            scenes.append({**w, "characters": [], "prompt": "p", "text_excerpt": ""})
+        (out / "storyboard.json").write_text(
+            json.dumps({"style": "t", "appearances": {}, "scenes": scenes})
+        )
+        movie = assemble_movie(out, "Grid", resolution=480)
+        assert probe_resolution(movie) == (854, 480)
+        assert probe_frames(movie.parent / "480p" / "video_only.mp4") == round(
+            total * FPS
+        )
+        assert abs(probe_duration(movie) - total) < 0.2
+        for second, color in zip((0.5, 1.5, 2.5, 3.2), colors, strict=True):
+            frame = out / f"f{second}.png"
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    str(second),
+                    "-i",
+                    str(movie),
+                    "-frames:v",
+                    "1",
+                    str(frame),
+                ],
+                capture_output=True,
+                check=True,
+            )
+            pixel = Image.open(frame).convert("RGB").getpixel((427, 240))
+            assert all(abs(a - b) < 40 for a, b in zip(pixel, color, strict=True)), (
+                second,
+                pixel,
+                color,
+            )

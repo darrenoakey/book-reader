@@ -22,6 +22,14 @@ def test_choose_scene_seconds() -> None:
             raise AssertionError("garbage scene_seconds must raise")
         except ValueError:
             pass
+        (out / "scene_seconds.txt").write_text("1")
+        assert choose_scene_seconds(out) == 1.0
+        (out / "scene_seconds.txt").write_text("0.5")
+        try:
+            choose_scene_seconds(out)
+            raise AssertionError("sub-second scene_seconds must raise")
+        except ValueError:
+            pass
         (out / "scene_seconds.txt").write_text("999")
         try:
             choose_scene_seconds(out)

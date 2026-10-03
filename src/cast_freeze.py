@@ -26,7 +26,7 @@ from src.data_recovery import (
 from src.epub_extract import get_output_dir
 from src.hour_runner import atomic_json, source_chapters, source_fingerprint
 from src.hourly_spans import immutable_spans
-from src.llm import LLM_STYLE, ask_sync
+from src.llm import LLM_STYLE, ask_sync, telemetry_scope
 from src.movie_images import generate_missing_character_refs
 from src.voice_description import _voice_description_for_one
 
@@ -3981,10 +3981,11 @@ def recoverable_batches(
         work = {"registry": copy.deepcopy(progress["registry"]), "aliases": dict(progress["aliases"])}
         classifications: list[dict] = []
         # Each window is an immutable-unit slice that fits the native context; discoveries accumulate on the working copy only.
-        for window in unit_windows(units, work["registry"], work["aliases"]):
-            discoveries, window_classes = discover_batch(
-                project, start, paths, window, source_text, work, ambiguous, prompt, ask
-            )
+        for window_index, window in enumerate(unit_windows(units, work["registry"], work["aliases"])):
+            with telemetry_scope("cast_discovery", start, start + len(paths), window_index):
+                discoveries, window_classes = discover_batch(
+                    project, start, paths, window, source_text, work, ambiguous, prompt, ask
+                )
             apply_discoveries(work["registry"], work["aliases"], discoveries)
             classifications.extend(window_classes)
         return {

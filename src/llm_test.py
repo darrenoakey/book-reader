@@ -1,6 +1,7 @@
 """Real native-Ollama tests for Book Reader's ping-gated LLM router."""
 
 import asyncio
+import json
 import tempfile
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from src.llm import (
     request_for,
     select_backend,
     strip_think,
+    telemetry_scope,
 )
 
 BACKUP = Backend("http://127.0.0.1:11434", "127.0.0.1", "qwen3:8b", "ollama", 40960, False)
@@ -81,6 +83,35 @@ def test_backup_native_schema_chat() -> None:
         max_attempts=1,
     )
     assert response == '{"ok":true}'
+
+
+# ##################################################################
+# test live native telemetry
+# use the real backup response to prove stdout diagnostics carry only numeric/provider metadata and no source or prompt text.
+def test_live_native_telemetry_is_metadata_only(capsys: pytest.CaptureFixture[str]) -> None:
+    config = RouterConfig(
+        Backend("http://203.0.113.1:11434", "203.0.113.1", "absent", "ollama", 32768, False), BACKUP, 1
+    )
+    prompt = 'Reply with the JSON object {"ok":true} only. Do not repeat this diagnostic sentinel: CAST_SOURCE_SECRET.'
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+    with telemetry_scope("native_telemetry_test", 7, 8, 0):
+        assert ask_sync(prompt, response_schema=schema, max_tokens=64, timeout=90, config=config, max_attempts=1) == '{"ok":true}'
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    call = next(event for event in events if event["event"] == "book_reader_llm_call")
+    phase = next(event for event in events if event["event"] == "book_reader_llm_phase")
+    assert call["phase"] == "native_telemetry_test"
+    assert call["batch_start"] == 7 and call["batch_end"] == 8 and call["phase_call"] == 1
+    assert call["model"] == BACKUP.model and call["think_requested"] is False
+    assert call["input_chars"] == len(prompt) and call["output_chars"] == len('{"ok":true}')
+    assert call["total_duration_ns"] is not None and call["prompt_eval_count"] is not None and call["eval_count"] is not None
+    assert call["thinking_tokens_reported"] is None
+    assert "CAST_SOURCE_SECRET" not in json.dumps(call)
+    assert phase["calls_started"] == 1 and phase["outcome"] == "ok" and phase["wall_duration_ns"] > 0
 
 
 # ##################################################################

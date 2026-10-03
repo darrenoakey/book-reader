@@ -13,8 +13,10 @@ from PIL import Image
 
 from src.cast_freeze import (
     ANCHOR_IDS,
+    CONTEXT_PROPOSALS_NAME,
     MANIFEST_NAME,
     REJECTIONS_NAME,
+    active_quality_pending,
     apply_alias_audit,
     asset_hashes,
     cache_model_records,
@@ -24,6 +26,7 @@ from src.cast_freeze import (
     context_safe_batch,
     discovery_schema,
     immutable_evidence_units,
+    ingest_context_quality_proposals,
     materialize_classifications,
     memoized_model_ask,
     partition_classification_chunk,
@@ -35,6 +38,7 @@ from src.cast_freeze import (
     validate_preparation_coverage,
     verify_frozen_cast,
 )
+from src.data_recovery import OperationalError, RecoveryLedger
 from src.epub_extract import get_output_dir
 from src.hour_runner import source_fingerprint
 
@@ -1289,6 +1293,57 @@ def test_adjudication_rejects_verdict_contradicting_person_answer(tmp_path: Path
         "refers_to_person" in prompt and "candidate_kind" in prompt and "endearment" in prompt for prompt in prompts
     )
     assert any("semantic_type" in prompt and "Do not output a decision" in prompt for prompt in prompts)
+
+
+# ##################################################################
+# caretaker quality proposal intake
+# Caretaker input is source-bound, quote-relative Unicode scoped, append-only in recovery,
+# and cannot approve or alter an actor mapping.
+def test_context_quality_proposal_requires_exact_scope_and_preserves_resolution_history(tmp_path: Path) -> None:
+    chapter = tmp_path / "01-part_01.txt"
+    chapter.write_text("Ren greeted Zed.", encoding="utf-8")
+    unit = immutable_evidence_units([chapter])[0]
+    scope = {
+        "chapter": chapter.name,
+        "chapter_sha256": unit["chapter_sha256"],
+        "unit_id": unit["id"],
+        "quote": unit["quote"],
+        "quote_sha256": hashlib.sha256(unit["quote"].encode()).hexdigest(),
+        "label": "Ren",
+        "span_start": unit["quote"].index("Ren"),
+    }
+    witness = {key: scope[key] for key in ("chapter", "chapter_sha256", "unit_id", "quote", "quote_sha256")}
+    pending = {
+        "proposal_id": "quality-ren-1",
+        "registry_id": "ren",
+        "kind": "garble",
+        "status": "pending",
+        "scope": scope,
+        "witnesses": [witness],
+        "note": "review source spelling",
+        "resolution": None,
+    }
+    payload = {"version": 1, "source_sha256": "source-sha", "proposals": [pending]}
+    (tmp_path / CONTEXT_PROPOSALS_NAME).write_text(json.dumps(payload), encoding="utf-8")
+    recovery = RecoveryLedger(tmp_path)
+    assert len(ingest_context_quality_proposals(tmp_path, "source-sha", [chapter], {"ren": {"name": "Ren"}}, recovery)) == 1
+    row = recovery.open_pending("cast_quality")[0]
+    assert row["evidence"]["proposal_id"] == "quality-ren-1" and row["evidence"]["proposal_sha256"]
+    assert active_quality_pending(recovery, {"ren": {"name": "Ren"}}) == [row]
+    assert active_quality_pending(recovery, {}) == []
+    resolved = {**pending, "status": "resolved", "resolution": {"reason": "caretaker verified source"}}
+    (tmp_path / CONTEXT_PROPOSALS_NAME).write_text(
+        json.dumps({"version": 1, "source_sha256": "source-sha", "proposals": [resolved]}), encoding="utf-8"
+    )
+    assert ingest_context_quality_proposals(tmp_path, "source-sha", [chapter], {"ren": {"name": "Ren"}}, recovery) == []
+    assert recovery.open_pending("cast_quality") == []
+    assert any(entry["severity"] == "resolved" for entry in recovery.entries())
+    invalid = {**pending, "scope": {**scope, "span_start": 1}}
+    (tmp_path / CONTEXT_PROPOSALS_NAME).write_text(
+        json.dumps({"version": 1, "source_sha256": "source-sha", "proposals": [invalid]}), encoding="utf-8"
+    )
+    with pytest.raises(OperationalError):
+        ingest_context_quality_proposals(tmp_path, "source-sha", [chapter], {"ren": {"name": "Ren"}}, recovery)
 
 
 # ##################################################################

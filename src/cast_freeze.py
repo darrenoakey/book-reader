@@ -19,6 +19,7 @@ from src.data_recovery import (
     OperationalError,
     RecoveryLedger,
     bounded,
+    payload_hash,
     row_key,
     row_scope,
     safe_evidence,
@@ -4438,6 +4439,206 @@ def replay_model_bindings(project: Path, units: list[dict]) -> list[dict]:
 
 
 PROPOSALS_NAME = "cast_pending_proposals.jsonl"
+CONTEXT_PROPOSALS_NAME = "cast_context_resolution_proposals.json"
+CONTEXT_PROPOSALS_VERSION = 1
+QUALITY_KINDS = frozenset({"country", "garble", "duplicate_actor"})
+
+
+# ##################################################################
+# caretaker quality proposal input
+# The caretaker supplies one atomically-renamed snapshot. It is input only: ingestion may
+# create/resolve typed recovery rows, but never changes registry or aliases. A proposal is
+# therefore incapable of approving a country/garble/duplicate actor or misrouting it to narrator.
+def _quality_source_scope(
+    value: object, chapters: dict[str, Path], units_cache: dict[str, dict[str, dict]]
+) -> tuple[dict, Path]:
+    if not isinstance(value, dict) or set(value) != {
+        "chapter",
+        "chapter_sha256",
+        "unit_id",
+        "quote",
+        "quote_sha256",
+        "label",
+        "span_start",
+    }:
+        raise OperationalError("cast_integrity", "quality proposal scope has an invalid schema")
+    chapter, chapter_sha, unit_id, quote, quote_sha, label, span = (
+        value["chapter"],
+        value["chapter_sha256"],
+        value["unit_id"],
+        value["quote"],
+        value["quote_sha256"],
+        value["label"],
+        value["span_start"],
+    )
+    if (
+        not all(isinstance(item, str) and item for item in (chapter, chapter_sha, unit_id, quote, quote_sha, label))
+        or type(span) is not int
+        or span < 0
+    ):
+        raise OperationalError("cast_integrity", "quality proposal scope has invalid values")
+    path = chapters.get(chapter)
+    if path is None or file_digest(path) != chapter_sha:
+        raise OperationalError("cast_integrity", "quality proposal chapter is not the exact current source")
+    by_id = units_cache.setdefault(chapter, {unit["id"]: unit for unit in immutable_evidence_units([path])})
+    unit = by_id.get(unit_id)
+    if (
+        unit is None
+        or unit["quote"] != quote
+        or text_digest(quote) != quote_sha
+        or quote[span : span + len(label)] != label
+    ):
+        raise OperationalError("cast_integrity", "quality proposal main mention is not an exact immutable scope")
+    return value, path
+
+
+def _quality_witnesses(
+    value: object, chapters: dict[str, Path], units_cache: dict[str, dict[str, dict]]
+) -> list[dict]:
+    if not isinstance(value, list) or not value:
+        raise OperationalError("cast_integrity", "quality proposal requires source witnesses")
+    witnesses: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for witness in value:
+        if not isinstance(witness, dict) or set(witness) != {
+            "chapter",
+            "chapter_sha256",
+            "unit_id",
+            "quote",
+            "quote_sha256",
+        }:
+            raise OperationalError("cast_integrity", "quality proposal witness has an invalid schema")
+        chapter, chapter_sha, unit_id, quote, quote_sha = (
+            witness["chapter"],
+            witness["chapter_sha256"],
+            witness["unit_id"],
+            witness["quote"],
+            witness["quote_sha256"],
+        )
+        if not all(isinstance(item, str) and item for item in (chapter, chapter_sha, unit_id, quote, quote_sha)):
+            raise OperationalError("cast_integrity", "quality proposal witness has invalid values")
+        path = chapters.get(chapter)
+        if path is None or file_digest(path) != chapter_sha:
+            raise OperationalError("cast_integrity", "quality proposal witness is not the exact current source")
+        unit = units_cache.setdefault(chapter, {item["id"]: item for item in immutable_evidence_units([path])}).get(unit_id)
+        if unit is None or unit["quote"] != quote or text_digest(quote) != quote_sha:
+            raise OperationalError("cast_integrity", "quality proposal witness is not an exact immutable unit")
+        key = (chapter, unit_id)
+        if key in seen:
+            raise OperationalError("cast_integrity", "quality proposal repeats a source witness")
+        seen.add(key)
+        witnesses.append(witness)
+    return witnesses
+
+
+def active_quality_pending(recovery: RecoveryLedger, registry: dict) -> list[dict]:
+    return [
+        row
+        for row in recovery.open_pending("cast_quality")
+        if row.get("code") in {f"quality_{kind}" for kind in QUALITY_KINDS}
+        and row.get("evidence", {}).get("registry_id") in registry
+    ]
+
+
+def ingest_context_quality_proposals(
+    project: Path, source_sha: str, chapters: list[Path], registry: dict, recovery: RecoveryLedger
+) -> list[dict]:
+    """Atomically merge caretaker quality input at a producer batch boundary.
+
+    Every proposal is source-validated before a typed pending/resolution history row is appended.
+    The immutable material digest excludes only its requested resolution, so a changed proposal
+    cannot silently replace prior evidence under the same proposal ID.
+    """
+    path = project / CONTEXT_PROPOSALS_NAME
+    if not path.is_file():
+        return active_quality_pending(recovery, registry)
+    payload = load_object(path, "caretaker context proposals")
+    if set(payload) != {"version", "source_sha256", "proposals"} or payload["version"] != CONTEXT_PROPOSALS_VERSION:
+        raise OperationalError("cast_integrity", "caretaker context proposals have an invalid schema")
+    if payload["source_sha256"] != source_sha or not isinstance(payload["proposals"], list):
+        raise OperationalError("cast_integrity", "caretaker context proposals belong to a different source")
+    by_chapter = {chapter.name: chapter for chapter in chapters}
+    units_cache: dict[str, dict[str, dict]] = {}
+    prior_rows = [row for row in recovery.entries() if row.get("stage") == "cast_quality"]
+    prior_by_id: dict[str, str] = {}
+    open_by_id = {row.get("evidence", {}).get("proposal_id"): row for row in active_quality_pending(recovery, registry)}
+    seen_ids: set[str] = set()
+    seen_scopes: set[tuple[str, str, str, int]] = set()
+    input_sha = payload_hash(payload)
+    for proposal in payload["proposals"]:
+        if not isinstance(proposal, dict) or set(proposal) != {
+            "proposal_id",
+            "registry_id",
+            "kind",
+            "status",
+            "scope",
+            "witnesses",
+            "note",
+            "resolution",
+        }:
+            raise OperationalError("cast_integrity", "caretaker quality proposal has an invalid schema")
+        proposal_id, registry_id, kind, status, note = (
+            proposal["proposal_id"], proposal["registry_id"], proposal["kind"], proposal["status"], proposal["note"]
+        )
+        if (
+            not isinstance(proposal_id, str)
+            or not proposal_id
+            or proposal_id in seen_ids
+            or not isinstance(registry_id, str)
+            or registry_id == "narrator"
+            or registry_id not in registry
+            or kind not in QUALITY_KINDS
+            or status not in {"pending", "resolved"}
+            or not isinstance(note, str)
+        ):
+            raise OperationalError("cast_integrity", "caretaker quality proposal has invalid values")
+        seen_ids.add(proposal_id)
+        scope, _ = _quality_source_scope(proposal["scope"], by_chapter, units_cache)
+        witnesses = _quality_witnesses(proposal["witnesses"], by_chapter, units_cache)
+        scope_key = (scope["chapter_sha256"], scope["quote_sha256"], scope["label"], scope["span_start"])
+        if scope_key in seen_scopes:
+            raise OperationalError("cast_integrity", "caretaker quality proposals duplicate one exact mention scope")
+        seen_scopes.add(scope_key)
+        material = {key: proposal[key] for key in proposal if key not in {"status", "resolution"}}
+        material_sha = payload_hash(material)
+        for row in prior_rows:
+            evidence = row.get("evidence", {})
+            if evidence.get("proposal_id") == proposal_id:
+                previous = evidence.get("proposal_sha256")
+                if previous and previous != material_sha:
+                    raise OperationalError("cast_integrity", "caretaker quality proposal changed immutable evidence under one ID")
+                prior_by_id[proposal_id] = material_sha
+        item = f"quality:{registry_id}:{proposal_id}"
+        evidence = {
+            "source": [scope["chapter"]],
+            "source_hash": {scope["chapter"]: scope["chapter_sha256"]},
+            "proposal_id": proposal_id,
+            "proposal_sha256": material_sha,
+            "input_sha256": input_sha,
+            "registry_id": registry_id,
+            "kind": kind,
+            "scope": scope,
+            "witnesses": witnesses,
+        }
+        if status == "pending":
+            if proposal["resolution"] is not None:
+                raise OperationalError("cast_integrity", "pending quality proposal has a resolution")
+            recovery.record("cast_quality", item, f"quality_{kind}", note, severity="pending", evidence=evidence)
+        else:
+            resolution = proposal["resolution"]
+            if not isinstance(resolution, dict) or set(resolution) != {"reason"} or not isinstance(resolution["reason"], str):
+                raise OperationalError("cast_integrity", "resolved quality proposal lacks a typed resolution reason")
+            row = open_by_id.get(proposal_id)
+            if row is None:
+                if proposal_id not in prior_by_id:
+                    raise OperationalError("cast_integrity", "quality resolution has no prior pending proposal")
+                continue
+            recovery.resolve(
+                row,
+                "caretaker_resolved_quality_flag",
+                {"proposal_id": proposal_id, "proposal_sha256": material_sha, "input_sha256": input_sha, "reason": resolution["reason"]},
+            )
+    return active_quality_pending(recovery, registry)
 
 
 # ##################################################################
@@ -4794,6 +4995,7 @@ def prepare_cast(
     batches = 0
     coverage = semantic_coverage(progress)
     recovery = RecoveryLedger(project)
+    ingest_context_quality_proposals(project, source_sha, chapters, progress["registry"], recovery)
     earlier = {row_key(row) for row in recovery.open_quarantined("cast")}
     # Historical 0..cursor batches had structural hashes only. Reclassify that prefix under the semantic ledger before touching the next production batch.
     # A data problem quarantines only the offending chapter (semantic ledger only; the structural cursor never moves backwards).
@@ -4806,6 +5008,7 @@ def prepare_cast(
     while int(progress["next_chapter"]) < len(chapters):
         # Audit records may be appended while this resumable preparation is paused; refresh is idempotent and leaves cursor and media untouched.
         inactive, ambiguous = refresh_alias_audit(project, source_text, progress)
+        ingest_context_quality_proposals(project, source_sha, chapters, progress["registry"], recovery)
         atomic_json(progress_path, progress)
         start = int(progress["next_chapter"])
         for unit in recoverable_batches(
@@ -4830,13 +5033,16 @@ def prepare_cast(
     atomic_json(progress_path, progress)
     blocked = quarantined_chapter_names(progress)
     pending_rows = recovery.open_pending("cast")
-    if blocked or pending_rows:
-        # Publication refuses (typed status, no manifest) only after every scan artifact and cursor is durable.
+    quality_rows = active_quality_pending(recovery, progress["registry"])
+    if blocked or pending_rows or quality_rows:
+        # Publication refuses (typed status, no manifest) until cast uncertainty and every
+        # active country/garble/duplicate-actor quality flag have durable resolutions.
         return {
             "status": "blocked",
             "chapters": len(chapters),
-            "pending": len(blocked) + len(pending_rows),
+            "pending": len(blocked) + len(pending_rows) + len(quality_rows),
             "quarantined_chapters": blocked,
+            "quality_pending": len(quality_rows),
             "warnings": len(recovery.entries()),
         }
     if int(semantic_coverage(progress)["next_chapter"]) != len(chapters):

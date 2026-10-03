@@ -19,8 +19,16 @@ from src.cast_freeze import (
     CONTEXT_V2_STAGE,
     DISTINCT_VERDICT,
     MANIFEST_NAME,
+    NATIVE_REVIEW,
+    NEW_IDENTITY_AUDIT_NAME,
+    PROGRESS_NAME,
+    PROPOSALS_NAME,
     REJECTIONS_NAME,
+    ROOT_APPROVAL_CONTRACT,
+    ROOT_APPROVAL_NAME,
+    ROOT_APPROVAL_STAGE,
     SCOPED_AUDIT_NAME,
+    SOURCE_REVIEW,
     active_quality_pending,
     adapt_context_resolution_v2,
     apply_alias_audit,
@@ -35,9 +43,12 @@ from src.cast_freeze import (
     immutable_name_references,
     ingest_context_quality_proposals,
     ingest_context_resolution_v2,
+    ingest_root_approvals,
     materialize_classifications,
     memoized_model_ask,
+    mention_scoped_audit_index,
     partition_classification_chunk,
+    prepared_profile,
     proposal_sha,
     record_rejected_discovery,
     refresh_alias_audit,
@@ -1967,6 +1978,328 @@ def test_variant_root_approval_gate_needs_strong_facts_and_never_changes_the_reg
     assert "root has no mentions" in blockers({"variants": []})
     # the gate is pure: nothing it saw was modified
     assert [registry, aliases, root, reviews] == snapshot
+
+
+# ##################################################################
+# variant root approval and materialization
+# Real temp chapters, real ledger, real files: a root becomes a registry actor only through the documented approval input,
+# after every gate; everything else leaves registry, aliases, scoped audit and original profile files byte-identical.
+def staged_root_project(
+    tmp_path: Path, chapters: list[Path], registry: dict, rows: list[dict], drafts: list[dict]
+) -> tuple[dict, RecoveryLedger, dict[str, dict]]:
+    aliases = {key: key for key in registry}
+    _write_v2(tmp_path, rows, drafts)
+    progress = {"registry": registry, "aliases": aliases}
+    (tmp_path / PROGRESS_NAME).write_text(json.dumps(progress), encoding="utf-8")
+    (tmp_path / "characters.json").write_text(
+        json.dumps({"ana": {"name": "Ana", "bio": "a scout", "look": "tall"}}), encoding="utf-8"
+    )
+    (tmp_path / "voices.json").write_text(json.dumps({"ana": {"description": "calm"}}), encoding="utf-8")
+    recovery = RecoveryLedger(tmp_path)
+    ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, aliases, recovery)
+    roots = {}
+    for line in (tmp_path / PROPOSALS_NAME).read_text().splitlines():
+        root = json.loads(line)
+        roots[root["actor_id"]] = root
+    return progress, recovery, roots
+
+
+def native_audit(tmp_path: Path, root: dict, verdict: str = DISTINCT_VERDICT, skip: int | None = None) -> None:
+    records = [
+        {**record, "verdict": verdict, "raw_review": {"verdict": verdict, "witness_unit_ids": [], "confidence": 0.9}}
+        for index, record in enumerate(_review_records(root))
+        if index != skip
+    ]
+    (tmp_path / NEW_IDENTITY_AUDIT_NAME).write_text(json.dumps({"records": records}), encoding="utf-8")
+
+
+def root_reviews(root: dict, chapters: list[Path], provenance: str = NATIVE_REVIEW, witness: tuple[int, int] = (0, 3)) -> list[dict]:
+    sha = proposal_sha(root)
+    reviews = []
+    for variant in root["variants"]:
+        for item in variant["scopes"]:
+            native = provenance == NATIVE_REVIEW
+            reviews.append(
+                {
+                    "proposal_sha256": sha,
+                    "scope": item["scope"],
+                    "provenance": provenance,
+                    "verdict": DISTINCT_VERDICT,
+                    "reviewer_role": None if native else "caretaker",
+                    "factual_witnesses": [] if native else [v2_witness(chapters, *witness)],
+                    "factual_basis": "" if native else "the cited unit names this identity as a living person",
+                }
+            )
+    return reviews
+
+
+def write_root_approval(tmp_path: Path, root: dict, reviews: list[dict], sha: str | None = None, **over) -> None:
+    approval = {
+        "action": "approve_root",
+        "actor_id": root["actor_id"],
+        "proposal_sha256": sha or proposal_sha(root),
+        "reviews": reviews,
+        "note": "caretaker checked the cited source",
+        **over,
+    }
+    payload = {"contract": ROOT_APPROVAL_CONTRACT, "version": 1, "source_sha256": V2_SOURCE_SHA, "approvals": [approval]}
+    (tmp_path / ROOT_APPROVAL_NAME).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def untouched_state(tmp_path: Path) -> dict:
+    names = (PROGRESS_NAME, "characters.json", "voices.json", SCOPED_AUDIT_NAME, PROPOSALS_NAME)
+    return {name: (tmp_path / name).read_bytes() if (tmp_path / name).exists() else None for name in names}
+
+
+def approve(tmp_path: Path, chapters: list[Path], progress: dict, recovery: RecoveryLedger) -> dict:
+    return ingest_root_approvals(tmp_path, V2_SOURCE_SHA, chapters, progress, recovery)
+
+
+def test_root_approval_materializes_native_reviewed_root_once_and_only_exactly(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    native_audit(tmp_path, root)
+    write_root_approval(tmp_path, root, root_reviews(root, chapters))
+    originals = {name: (tmp_path / name).read_bytes() for name in ("characters.json", "voices.json")}
+    ana_before = json.loads(json.dumps(progress["registry"]["ana"]))
+    assert any(row["code"] == "context_variant_draft_root" for row in recovery.open_pending(CONTEXT_V2_STAGE))
+
+    outcome = approve(tmp_path, chapters, progress, recovery)
+
+    assert outcome == {"materialized": ["zed"], "already": [], "blocked": []}
+    entry = progress["registry"]["zed"]
+    assert entry["origin"] == "approved_root" and entry["approved_root"]["proposal_sha256"] == proposal_sha(root)
+    assert entry["approved_root"]["approval"]["reviews"], "raw review refs are retained"
+    assert prepared_profile(entry) == {"name": "Zed", "bio": root["bio"], "look": root["look"]}
+    assert progress["registry"]["ana"] == ana_before
+    # only the exact actor id/name are global aliases; Professor stays mention-scoped
+    assert progress["aliases"] == {"ana": "ana", "zed": "zed"}
+    saved = json.loads((tmp_path / PROGRESS_NAME).read_text())
+    assert saved["registry"]["zed"]["name"] == "Zed" and saved["aliases"]["zed"] == "zed"
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert sorted((r["label"], r["decision"], r["canonical"]) for r in records) == [
+        ("Professor", "alias", "zed"),
+        ("Zed", "alias", "zed"),
+        ("Zed", "alias", "zed"),
+    ]
+    assert all(r["approved_root"]["review_provenance"] == NATIVE_REVIEW for r in records)
+    mention_scoped_audit_index(records)
+    # original profiles and voices are never rewritten; the pending rows for this root are closed
+    assert {name: (tmp_path / name).read_bytes() for name in originals} == originals
+    assert recovery.open_pending(CONTEXT_V2_STAGE) == [] and recovery.open_pending(ROOT_APPROVAL_STAGE) == []
+    # idempotent: replaying the approval and re-ingesting the unchanged v2 file change nothing and leave nothing pending
+    snapshot, size = untouched_state(tmp_path), len(recovery.entries())
+    assert approve(tmp_path, chapters, progress, recovery) == {"materialized": [], "already": ["zed"], "blocked": []}
+    assert ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, progress["registry"], progress["aliases"], recovery) == []
+    assert untouched_state(tmp_path) == snapshot and len(recovery.entries()) == size
+    fresh = RecoveryLedger(tmp_path)
+    assert fresh.open_pending(CONTEXT_V2_STAGE) == []
+
+
+def test_root_approval_accepts_source_reviewed_trusted_role_proof_with_truthful_provenance(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    reviews = root_reviews(root, chapters, SOURCE_REVIEW)
+    reviews[0] = root_reviews(root, chapters)[0]  # one mention native...
+    native_audit(tmp_path, root)  # ...backed by the audit, the others source-reviewed
+    write_root_approval(tmp_path, root, reviews)
+    assert approve(tmp_path, chapters, progress, recovery)["materialized"] == ["zed"]
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert {r["approved_root"]["review_provenance"] for r in records} == {NATIVE_REVIEW, SOURCE_REVIEW}
+    assert all("human" not in json.dumps(r).casefold() for r in records)
+    assert {r["approved_root"]["reviewer_role"] for r in records} == {None, "caretaker"}
+
+
+def test_root_approval_input_violations_fail_closed_before_any_write(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    native_audit(tmp_path, root)
+    good = root_reviews(root, chapters)
+    source_good = root_reviews(root, chapters, SOURCE_REVIEW)
+    before = untouched_state(tmp_path)
+
+    def attempt(reviews: list[dict], **over) -> None:
+        write_root_approval(tmp_path, root, reviews, **over)
+        with pytest.raises(OperationalError):
+            approve(tmp_path, chapters, progress, recovery)
+        assert untouched_state(tmp_path) == before and "zed" not in progress["registry"]
+
+    def mutated(reviews: list[dict], **change) -> list[dict]:
+        return [{**reviews[0], **change}, *reviews[1:]]
+
+    attempt(good, sha="0" * 64)  # unknown proposal sha
+    attempt(good, action="approve_all")
+    attempt(good, actor_id="someone_else")
+    attempt(good, extra="field")
+    attempt(good, note="approved after human review of the book")  # an untruthful provenance claim
+    attempt(good[1:])  # a mention without a review
+    attempt([*good, good[0]])  # a repeated review
+    attempt(mutated(good, proposal_sha256="1" * 64))
+    attempt(mutated(good, provenance="human_reviewed"))
+    attempt(mutated(good, provenance="source_reviewed_human"))
+    attempt(mutated(good, verdict="uncertain"))
+    attempt(mutated(good, scope={**good[0]["scope"], "span_start": good[0]["scope"]["span_start"] + 1}))
+    attempt(mutated(good, reviewer_role="caretaker"))  # a native reference carries no reviewer role
+    attempt(mutated(source_good, reviewer_role="reviewer"))  # not a trusted role
+    attempt(mutated(source_good, reviewer_role="human"))
+    attempt(mutated(source_good, factual_basis=" "))
+    attempt(mutated(source_good, factual_witnesses=[]))
+    forged = {**v2_witness(chapters, 0, 3), "unit_quote": "invented"}
+    attempt(mutated(source_good, factual_witnesses=[forged]))
+    # wrong book, wrong contract, and a changed chapter byte
+    write_root_approval(tmp_path, root, good)
+    approval_path = tmp_path / ROOT_APPROVAL_NAME
+    payload = json.loads(approval_path.read_text())
+    for change in ({"source_sha256": "c" * 64}, {"contract": "other"}, {"version": 2}):
+        approval_path.write_text(json.dumps({**payload, **change}), encoding="utf-8")
+        with pytest.raises(OperationalError):
+            approve(tmp_path, chapters, progress, recovery)
+    approval_path.write_text(json.dumps(payload), encoding="utf-8")
+    chapters[1].write_text("Zed carried a lantern. Ana waited at the door!", encoding="utf-8")
+    with pytest.raises(OperationalError):
+        approve(tmp_path, chapters, progress, recovery)
+    assert untouched_state(tmp_path) == before and "zed" not in progress["registry"]
+
+
+def test_root_approval_blocks_every_failed_gate_without_writing_anything(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    before = untouched_state(tmp_path)
+
+    def blocked(reviews: list[dict], contains: str) -> None:
+        write_root_approval(tmp_path, root, reviews)
+        result = approve(tmp_path, chapters, progress, recovery)
+        assert result["materialized"] == [] and len(result["blocked"]) == 1
+        assert any(contains in blocker for blocker in result["blocked"][0]["blockers"]), result["blocked"]
+        assert untouched_state(tmp_path) == before and "zed" not in progress["registry"]
+        assert [r["code"] for r in recovery.open_pending(ROOT_APPROVAL_STAGE)] == ["root_approval_blocked"]
+
+    # no native review at all, an uncertain/existing verdict, or a raw-less record is no native proof
+    blocked(root_reviews(root, chapters), "no native distinct-living-identity review")
+    native_audit(tmp_path, root, skip=0)
+    blocked(root_reviews(root, chapters), "no native distinct-living-identity review")
+    native_audit(tmp_path, root, verdict="uncertain")
+    blocked(root_reviews(root, chapters), "no native distinct-living-identity review")
+    # a source review can never override a contradicting native verdict
+    native_audit(tmp_path, root, verdict="existing:ana")
+    blocked(root_reviews(root, chapters, SOURCE_REVIEW), "contradicts the native review verdict")
+    # a source-review witness that names neither the mention nor the identity proves nothing
+    (tmp_path / NEW_IDENTITY_AUDIT_NAME).unlink()
+    blocked(root_reviews(root, chapters, SOURCE_REVIEW, witness=(0, 0)), "no source-review witness literally names")
+    blocked(root_reviews(root, chapters, SOURCE_REVIEW, witness=(0, 1)), "no source-review witness literally names")
+    # the same proposal after the blockers change supersedes the older blocked row instead of stacking
+    assert len(recovery.open_pending(ROOT_APPROVAL_STAGE)) == 1
+
+
+def test_root_approval_independent_duplicate_and_kind_gates(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    reviews = root_reviews(root, chapters, SOURCE_REVIEW)
+    write_root_approval(tmp_path, root, reviews)
+
+    def blockers_with(**state) -> list[str]:
+        local = json.loads(json.dumps(progress))
+        local["registry"].update(state.get("registry", {}))
+        local["aliases"].update(state.get("aliases", {}))
+        for name, value in state.get("files", {}).items():
+            (tmp_path / name).write_text(json.dumps(value), encoding="utf-8")
+        result = approve(tmp_path, chapters, local, recovery)
+        assert result["materialized"] == [] and "zed" not in local["registry"]
+        return [b for entry in result["blocked"] for b in entry["blockers"]]
+
+    assert any("name 'Zed' is already the name of registered actor" in b for b in blockers_with(registry={"old_zed": {"name": "Zed"}}))
+    assert any("variant 'Professor' is already an alias of ana" in b for b in blockers_with(aliases={"professor": "ana"}))
+    assert any("literally carried by registered actor" in b for b in blockers_with(registry={"prof_lin": {"name": "Professor Lin"}}))
+    assert any("original profile entry" in b for b in blockers_with(files={"characters.json": {"ana": {"name": "Ana"}, "zed": {"name": "Z"}}}))
+    assert any("original voice entry" in b for b in blockers_with(files={"characters.json": {"ana": {"name": "Ana"}}, "voices.json": {"zed": {}}}))
+    (tmp_path / "voices.json").write_text(json.dumps({"ana": {}}), encoding="utf-8")
+
+
+def test_root_approval_never_collapses_into_the_narrator_or_a_non_living_kind(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    creature = {**v2_draft(chapters, "zephyr", "Zephyr"), "kind": "creature"}
+    creature["witnesses"] = creature["citations"]["bio"] = creature["citations"]["look"] = [v2_witness(chapters, 0, 2)]
+    progress, recovery, roots = staged_root_project(
+        tmp_path, chapters, registry, [v2_row(chapters, 0, "Zephyr", "new_actor", "zephyr", 1)], [creature]
+    )
+    before = untouched_state(tmp_path)
+    root = roots["zephyr"]
+    write_root_approval(tmp_path, root, root_reviews(root, chapters, SOURCE_REVIEW, witness=(0, 2)))
+    result = approve(tmp_path, chapters, progress, recovery)
+    assert result["materialized"] == [] and any("living-capable kind" in b for b in result["blocked"][0]["blockers"])
+    assert untouched_state(tmp_path) == before and "zephyr" not in progress["registry"]
+    # staging does not refuse a draft that names the narrator, so the approval step must: no review can collapse a root into it
+    (tmp_path / PROPOSALS_NAME).unlink()
+    other = tmp_path / "narr"
+    other.mkdir()
+    chapters, registry = v2_fixture(other)
+    named = v2_draft(chapters, "narrator", "Narrator")
+    progress, recovery, roots = staged_root_project(
+        other, chapters, registry, [v2_row(chapters, 0, "Zed", "new_actor", "narrator", 1)], [named]
+    )
+    root = roots["narrator"]
+    write_root_approval(other, root, root_reviews(root, chapters, SOURCE_REVIEW))
+    result = approve(other, chapters, progress, recovery)
+    assert result["materialized"] == [] and any("narrator" in b for b in result["blocked"][0]["blockers"])
+    assert "narrator" not in progress["registry"] and not (other / SCOPED_AUDIT_NAME).exists()
+
+
+def test_root_approval_materializes_only_the_root_the_input_names(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    other = v2_draft(chapters, "zephyr", "Zephyr")
+    other["witnesses"] = other["citations"]["bio"] = other["citations"]["look"] = [v2_witness(chapters, 0, 2)]
+    rows = [*_draft_rows(chapters), v2_row(chapters, 0, "Zephyr", "new_actor", "zephyr", 1)]
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, rows, [v2_draft(chapters), other])
+    assert set(roots) == {"zed", "zephyr"}
+    root = roots["zed"]
+    native_audit(tmp_path, root)
+    write_root_approval(tmp_path, root, root_reviews(root, chapters))
+    assert approve(tmp_path, chapters, progress, recovery)["materialized"] == ["zed"]
+    assert "zephyr" not in progress["registry"] and "zephyr" not in progress["aliases"]
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert {r["canonical"] for r in records} == {"zed"}
+    still = {row["code"] for row in recovery.open_pending(CONTEXT_V2_STAGE)}
+    assert still == {"context_variant_draft_root", "context_new_actor"}  # the unapproved root and its mention stay pending
+    # a stale approval (the proposal changed) names a sha that is no longer pending: refused, not re-targeted
+    stale = {**root, "bio": root["bio"] + " Changed."}
+    write_root_approval(tmp_path, root, root_reviews(root, chapters), sha=proposal_sha(stale))
+    with pytest.raises(OperationalError):
+        approve(tmp_path, chapters, progress, recovery)
+
+
+def kin_staged(tmp_path: Path, sibling_text: str) -> tuple[list[Path], dict, RecoveryLedger, dict]:
+    chapters = kin_fixture(tmp_path)
+    chapters[0].write_text(sibling_text, encoding="utf-8")
+    registry = {"ana": {"name": "Ana", "bio": "a scout"}}
+    draft = {**v2_draft(chapters), "variant_links": [kin_link(chapters, "kinship", [(0, 3)])]}
+    draft["witnesses"] = draft["citations"]["bio"] = draft["citations"]["look"] = [v2_witness(chapters, 0, 0)]
+    rows = [kin_row(chapters, "Zed", 0, 0, 0), kin_row(chapters, "Auntie", 0, 2, 1)]
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, rows, [draft])
+    return chapters, progress, recovery, roots["zed"]
+
+
+def test_family_only_label_cannot_join_a_root_when_the_scene_shows_two_participants(tmp_path: Path) -> None:
+    alone = (
+        "Zed appeared at the gate. The hall was quiet. Auntie waved from the porch. Auntie is the sister of Zed. "
+        "Rain fell on the roof. Dust blew."
+    )
+    chapters, progress, recovery, root = kin_staged(tmp_path / "alone", alone) if (tmp_path / "alone").mkdir() is None else None
+    write_root_approval(tmp_path / "alone", root, root_reviews(root, chapters, SOURCE_REVIEW))
+    assert approve(tmp_path / "alone", chapters, progress, recovery)["materialized"] == ["zed"]  # one participant: the kinship link stands
+    siblings = alone.replace("Zed appeared at the gate.", "Zed appeared at the gate beside Mara.")
+    (tmp_path / "pair").mkdir()
+    chapters, progress, recovery, root = kin_staged(tmp_path / "pair", siblings)
+    assert {v["label"] for v in root["variants"]} == {"Zed", "Auntie"}
+    before = untouched_state(tmp_path / "pair")
+    write_root_approval(tmp_path / "pair", root, root_reviews(root, chapters, SOURCE_REVIEW))
+    result = approve(tmp_path / "pair", chapters, progress, recovery)
+    assert result["materialized"] == [] and any("family label 'Auntie'" in b and "ambiguous" in b for b in result["blocked"][0]["blockers"])
+    assert untouched_state(tmp_path / "pair") == before and "zed" not in progress["registry"]
 
 
 # ##################################################################

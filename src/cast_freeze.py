@@ -4863,6 +4863,17 @@ def adapt_context_resolution_v2(
                     "provenance": row["provenance"] if isinstance(row.get("provenance"), dict) else {},
                 }
             )
+        bound = prior.get(scope) if decision == "new_actor" else None
+        if (
+            bound
+            and (bound["decision"], bound["canonical"]) == ("alias", target)
+            and isinstance(bound.get("approved_root"), dict)
+            and bound["approved_root"].get("actor_id") == target
+            and _materialized_root_sha(registry, target) == bound["approved_root"].get("proposal_sha256")
+        ):
+            # already bound to the actor registered from its approved root: closed, not a pending new_actor
+            proven.append(base["item"])
+            continue
         if decision in {"new_actor", "hold"}:
             pending.append(
                 _context_pending(
@@ -5176,22 +5187,24 @@ def _mention_link(row: dict, draft: dict, source: _ChapterSource, fact_units: di
     link = next((item for item in draft["links"] if item["scope"] == _scope_key(scope)), None)
     if link is None:
         return None, "no shared immutable unit with the draft facts and no explicit link"
-    # Both link kinds are proven only from witnesses inside this mention's own bounded scene, never from elsewhere in the book.
+    if not _scene_link_proven(link["kind"], link["witnesses"], scope, label, words, source):
+        return None, f"explicit {link['kind']} link is not proven by its witnesses"
+    return {"kind": link["kind"], "witnesses": link["witnesses"]}, ""
+
+
+def _scene_link_proven(kind: str, witnesses: list[dict], scope: dict, label: str, words: list[str], source: _ChapterSource) -> bool:
+    """Both explicit link kinds are proven only from witnesses inside the mention's own bounded scene, never from elsewhere in the book."""
     path = source.resolve(scope["chapter"], scope["chapter_sha256"], "link mention")
     ordered, by_id = source.units(path)
     order = [item["id"] for item in ordered]
     scene = {item["id"] for item in scene_units_at(by_id, order, order.index(scope["unit_id"]))}
-    within = [w["unit_quote"] for w in link["witnesses"] if w["chapter_sha256"] == scope["chapter_sha256"] and w["unit_id"] in scene]
+    within = [w["unit_quote"] for w in witnesses if w["chapter_sha256"] == scope["chapter_sha256"] and w["unit_id"] in scene]
     names_label = [_names_word(label, quote) for quote in within]
     names_draft = [any(_names_word(word, quote) for word in words) for quote in within]
-    if link["kind"] == "kinship":
+    if kind == "kinship":
         # one source sentence ties this label to the draft identity (e.g. a relation stated in the scene)
-        proven = any(a and b for a, b in zip(names_label, names_draft, strict=True))
-    else:
-        proven = any(names_label) and any(names_draft)
-    if not proven:
-        return None, f"explicit {link['kind']} link is not proven by its witnesses"
-    return {"kind": link["kind"], "witnesses": link["witnesses"]}, ""
+        return any(a and b for a, b in zip(names_label, names_draft, strict=True))
+    return any(names_label) and any(names_draft)
 
 
 def _root_variants(linked: list[tuple[dict, dict]]) -> list[dict]:
@@ -5212,6 +5225,21 @@ def _root_variants(linked: list[tuple[dict, dict]]) -> list[dict]:
 
 def _pending_material_item(actor_id: str, material: object) -> str:
     return f"{VARIANT_DRAFT_ITEM}{actor_id}:{payload_hash(material)[:16]}"
+
+
+def _materialized_root_sha(registry: dict, actor_id: str) -> str | None:
+    """The proposal sha an actor was registered from by the root approval step, or None for any other actor."""
+    entry = registry.get(actor_id)
+    approved = entry.get("approved_root") if isinstance(entry, dict) else None
+    sha = approved.get("proposal_sha256") if isinstance(approved, dict) else None
+    return sha if isinstance(sha, str) and sha else None
+
+
+def _registry_without_actor(registry: dict, aliases: dict, actor_id: str) -> tuple[dict, dict]:
+    return (
+        {key: value for key, value in registry.items() if key != actor_id},
+        {alias: target for alias, target in aliases.items() if target != actor_id},
+    )
 
 
 def variant_draft_actor(item: str) -> str:
@@ -5247,7 +5275,11 @@ def stage_variant_drafts(
         rows = rows_by_target.get(actor_id, [])
         facts = [*draft["witnesses"], *draft["citations"]["bio"], *draft["citations"]["look"]]
         fact_units = {_unit_key(w): w for w in facts}
-        duplicates = _identity_duplicates(actor_id, draft["name"], registry, aliases)
+        materialized = _materialized_root_sha(registry, actor_id)
+        view_registry, view_aliases = (
+            _registry_without_actor(registry, aliases, actor_id) if materialized else (registry, aliases)
+        )
+        duplicates = _identity_duplicates(actor_id, draft["name"], view_registry, view_aliases)
         for other in validated:
             if other["actor_id"] == actor_id:
                 continue
@@ -5308,8 +5340,15 @@ def stage_variant_drafts(
                 "source_facts": draft["witnesses"],
                 "variants": _root_variants(linked),
             }
-            roots.append(root)
             sha = proposal_sha(root)
+            if materialized == sha:
+                # exactly this proposal was already approved and registered by the approval step: nothing is pending
+                continue
+            if materialized:
+                found = [f"actor {actor_id} is already registered from approved root {materialized[:16]}; this is a different proposal"]
+                pending.append(gap(VARIANT_DRAFT_DUPLICATE, "; ".join(found), {"duplicates": found}))
+                continue
+            roots.append(root)
             pending.append(
                 _context_pending({**base, "item": f"{VARIANT_DRAFT_ITEM}{actor_id}:{sha[:16]}"}, VARIANT_DRAFT_ROOT,
                     "complete, linked, duplicate-free draft held as a pending proposed root; never approved or registered here")
@@ -5490,6 +5529,514 @@ def save_pending_proposal(project: Path, proposal: dict) -> str:
         stream.flush()
         os.fsync(stream.fileno())
     return proposal_sha(proposal)
+
+
+# ##################################################################
+# variant root approval and materialization
+# The ONLY way a pending variant_draft_root becomes a registered actor. Input is one caretaker file (documented in
+# docs/CAST_ROOT_APPROVALS.md) that names, per root, the exact pending proposal sha and one review per included mention.
+# Nothing here is inferred: a root that is not named in the input is never touched. Every claim is re-validated against the
+# exact current source, then variant_root_approval_gate plus independent duplicate and distinct-participant gates must all
+# pass before anything is written. Only then: one new registry actor (profile facts from the cited bio/look), the exact
+# actor-id/name aliases, one mention-scoped alias per included mention, and resolution of the matching pending rows. Original
+# characters/voices files are never opened for writing, and no variant spelling becomes a global alias.
+ROOT_APPROVAL_NAME = "cast_root_approvals.json"
+ROOT_APPROVAL_CONTRACT = "cast_variant_root_approval"
+ROOT_APPROVAL_VERSION = 1
+ROOT_APPROVAL_STAGE = "cast_root_approval"
+ROOT_APPROVAL_BLOCKED = "root_approval_blocked"
+ROOT_APPROVE_ACTION = "approve_root"
+NATIVE_REVIEW = "native_review_audit"
+SOURCE_REVIEW = "source_reviewed_trusted_role"
+REVIEW_PROVENANCES = frozenset({NATIVE_REVIEW, SOURCE_REVIEW})
+TRUSTED_REVIEW_ROLES = frozenset({"caretaker"})
+ROOT_FIELDS = frozenset(
+    {"type", "status", "actor_id", "name", "kind", "bio", "look", "citations", "source_facts", "variants"}
+)
+ROOT_APPROVAL_FIELDS = frozenset({"action", "actor_id", "proposal_sha256", "reviews", "note"})
+ROOT_REVIEW_FIELDS = frozenset(
+    {"proposal_sha256", "scope", "provenance", "verdict", "reviewer_role", "factual_witnesses", "factual_basis"}
+)
+ROOT_SCOPE_FIELDS = frozenset({"chapter", "chapter_sha256", "unit_id", "quote_sha256", "label", "span_start"})
+HUMAN_REVIEW_CLAIM = re.compile(r"human[\s_-]*(?:review|verif|approv|check|audit|source)", re.IGNORECASE)
+KIN_LABEL_WORDS = frozenset(
+    {
+        "mom", "mum", "mommy", "mama", "mother", "dad", "daddy", "papa", "father", "brother", "sister", "sibling",
+        "aunt", "auntie", "aunty", "uncle", "cousin", "grandmother", "grandfather", "grandma", "grandpa", "granny",
+        "son", "daughter", "wife", "husband", "nephew", "niece",
+    }
+)
+KIN_MODIFIER_WORDS = frozenset({"little", "big", "older", "younger", "elder", "dear", "great", "my", "our", "your"})
+
+
+def _approval_invalid(message: str) -> OperationalError:
+    return OperationalError("cast_integrity", f"caretaker root approval: {message}")
+
+
+def _stored_pending_roots(project: Path) -> dict[str, dict]:
+    """sha -> root for every canonical variant_draft_root line of the pending proposal file."""
+    path = project / PROPOSALS_NAME
+    found: dict[str, dict] = {}
+    if not path.is_file():
+        return found
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            proposal = json.loads(line)
+        except ValueError as error:
+            raise OperationalError("cast_integrity", f"pending proposal file has an unreadable line: {path}") from error
+        if isinstance(proposal, dict) and proposal.get("type") == "variant_draft_root" and proposal_line(proposal) == line:
+            found[proposal_sha(proposal)] = proposal
+    return found
+
+
+def _scope_tuple(scope: dict) -> tuple[str, str, str, int]:
+    return scope["chapter_sha256"], scope["quote_sha256"], scope["label"], scope["span_start"]
+
+
+def _revalidated_root(source: _ChapterSource, root: dict) -> list[dict]:
+    """Re-prove every claim of a stored root against the exact current source; any drift or forgery fails the file closed.
+
+    Returns one dict per included mention: its scope, exact unit, stored item and the mention's validated witnesses.
+    """
+    if not isinstance(root, dict) or set(root) != ROOT_FIELDS:
+        raise _approval_invalid("stored root has an invalid schema")
+    actor_id, name, bio, look = root["actor_id"], root["name"], root["bio"], root["look"]
+    if (
+        not all(isinstance(item, str) for item in (actor_id, name, root["kind"], bio, look))
+        or not IDENTIFIER.match(actor_id)
+        or not name.strip()
+    ):
+        raise _approval_invalid("stored root has invalid values")
+    facts = _exact_cited_witnesses(source, root["source_facts"], "root source fact")
+    citations = root["citations"]
+    if not facts or facts != root["source_facts"] or not isinstance(citations, dict) or set(citations) != set(VARIANT_CITATION_FIELDS):
+        raise _approval_invalid("stored root source facts or citations are not exact")
+    fact_units = {_unit_key(w) for w in facts}
+    for field in VARIANT_CITATION_FIELDS:
+        checked = _exact_cited_witnesses(source, citations[field], f"root {field} citation")
+        if checked != citations[field]:
+            raise _approval_invalid(f"stored root {field} citations are not exact")
+        fact_units |= {_unit_key(w) for w in checked}
+    words = _name_words(name)
+    variants = root["variants"]
+    if not isinstance(variants, list) or not variants:
+        raise _approval_invalid("stored root has no variants")
+    mentions: list[dict] = []
+    seen: set[tuple[str, str, str, int]] = set()
+    for variant in variants:
+        if not isinstance(variant, dict) or set(variant) != {"label", "scopes"} or not isinstance(variant["scopes"], list):
+            raise _approval_invalid("stored root variant has an invalid schema")
+        for item in variant["scopes"]:
+            if not isinstance(item, dict) or not {"scope", "decision", "reason", "provenance", "witnesses", "link"} <= set(item):
+                raise _approval_invalid("stored root mention has an invalid schema")
+            scope = item["scope"]
+            if not isinstance(scope, dict) or set(scope) != ROOT_SCOPE_FIELDS or scope["label"] != variant["label"]:
+                raise _approval_invalid("stored root mention scope is invalid")
+            span, label = scope["span_start"], scope["label"]
+            if type(span) is not int or span < 0 or not isinstance(label, str) or not label or item["decision"] != "new_actor":
+                raise _approval_invalid("stored root mention has invalid values")
+            path = source.resolve(scope["chapter"], scope["chapter_sha256"], "root mention")
+            unit = source.units(path)[1].get(scope["unit_id"])
+            if (
+                unit is None
+                or text_digest(unit["quote"]) != scope["quote_sha256"]
+                or unit["quote"][span : span + len(label)] != label
+            ):
+                raise _approval_invalid("stored root mention is not an exact immutable span of the current source")
+            if _scope_tuple(scope) in seen:
+                raise _approval_invalid("stored root repeats one exact mention scope")
+            seen.add(_scope_tuple(scope))
+            witnesses = _exact_cited_witnesses(source, item["witnesses"], "root mention witness")
+            if not witnesses:
+                raise _approval_invalid("stored root mention has no source witnesses")
+            _revalidate_link(source, item, unit, witnesses, fact_units, words)
+            mentions.append({"scope": scope, "unit": unit, "item": item, "witnesses": witnesses})
+    return mentions
+
+
+def _revalidate_link(source: _ChapterSource, item: dict, unit: dict, witnesses: list[dict], fact_units: set, words: list[str]) -> None:
+    link, scope = item["link"], item["scope"]
+    label = scope["label"]
+    if not isinstance(link, dict):
+        raise _approval_invalid("stored root mention link is invalid")
+    if link.get("kind") == "shared_immutable_unit":
+        mention_units = {(scope["chapter_sha256"], scope["unit_id"]): unit["quote"]}
+        mention_units.update({_unit_key(w): w["unit_quote"] for w in witnesses})
+        shared = link.get("units")
+        if not isinstance(shared, list) or not shared:
+            raise _approval_invalid("stored root shared-unit link names no units")
+        for entry in shared:
+            key = (entry.get("chapter_sha256"), entry.get("unit_id")) if isinstance(entry, dict) else None
+            quote = mention_units.get(key) if key in fact_units else None
+            if quote is None or not (_names_word(label, quote) or any(_names_word(word, quote) for word in words)):
+                raise _approval_invalid("stored root shared-unit link is not proven by the current source")
+        return
+    if link.get("kind") in VARIANT_LINK_KINDS:
+        proof = _exact_cited_witnesses(source, link.get("witnesses"), "root link witness")
+        if not proof or not _scene_link_proven(link["kind"], proof, scope, label, words, source):
+            raise _approval_invalid("stored root explicit link is not proven by the current source")
+        return
+    raise _approval_invalid("stored root mention link kind is unknown")
+
+
+def _kin_only_label(label: str) -> bool:
+    words = [word.casefold() for word in re.findall(r"\w+", label)]
+    return bool(words) and any(w in KIN_LABEL_WORDS for w in words) and all(
+        w in KIN_LABEL_WORDS or w in KIN_MODIFIER_WORDS or w in NON_NAME_COMPOUND_WORDS for w in words
+    )
+
+
+def variant_root_participant_blockers(root: dict, mentions: list[dict], registry: dict, aliases: dict, source: _ChapterSource) -> list[str]:
+    """A family-only label names a relation, not a person: it may join a root only while the mention's own bounded scene shows
+    exactly one named participant (the root itself). A scene that names two or more participants (e.g. two siblings)
+    leaves the relation label ambiguous, so the root is blocked rather than the label guessed."""
+    root_tokens = {normalized_id(word) for word in _name_words(root["name"])}
+    blockers: list[str] = []
+    for mention in mentions:
+        scope = mention["scope"]
+        if not _kin_only_label(scope["label"]):
+            continue
+        path = source.resolve(scope["chapter"], scope["chapter_sha256"], "root mention")
+        ordered, by_id = source.units(path)
+        order = [unit["id"] for unit in ordered]
+        scene = scene_units_at(by_id, order, order.index(scope["unit_id"]))
+        participants: set[str] = set()
+        for reference in immutable_name_references(scene).values():
+            label = reference["label"]
+            tokens = label_components(label)
+            if not tokens or not (tokens - TITLE_ROLE_TOKENS) or _kin_only_label(label):
+                continue
+            if tokens & root_tokens:
+                participants.add("\0root")
+                continue
+            owners = [
+                owner
+                for owner in adjudication_owners(label, registry, aliases)
+                if owner_relevance(label, owner, registry[owner], aliases) >= 3
+            ]
+            initial = not by_id[reference["unit_id"]]["quote"][: reference["start"]].strip()
+            if not owners and initial and " " not in label.strip():
+                # a lone sentence-initial capitalized word cannot be told from a capitalized common word by lexical evidence alone
+                continue
+            participants.add(owners[0] if owners else normalized_id(label))
+        if len(participants) >= 2:
+            blockers.append(
+                f"family label {scope['label']!r}@{scope['span_start']} is ambiguous: its scene shows {len(participants)} named participants"
+            )
+    return blockers
+
+
+def variant_root_duplicate_blockers(root: dict, registry: dict, aliases: dict, characters: dict, voices: dict) -> list[str]:
+    """Independent duplicate gate: the narrator, original profiles/voices, registered names and every variant spelling."""
+    actor_id, name = root["actor_id"], root["name"]
+    id_norm, name_norm = normalized_id(actor_id), normalized_id(name)
+    blockers: list[str] = []
+    if id_norm != actor_id or not name_norm:
+        blockers.append("actor id or name is not a normalized identifier")
+    if "narrator" in {id_norm, name_norm} or id_norm in ANCHOR_IDS or name_norm in ANCHOR_IDS:
+        blockers.append("a root can never take the narrator or an original anchor identity")
+    for key, entry in registry.items():
+        if key != "narrator" and isinstance(entry, dict) and normalized_id(str(entry.get("name", key))) == name_norm:
+            blockers.append(f"name {name!r} is already the name of registered actor {key}")
+    for store, label in ((characters, "profile"), (voices, "voice")):
+        for key, info in store.items():
+            names = {normalized_id(key)}
+            if isinstance(info, dict) and "name" in info:
+                names.add(normalized_id(str(info["name"])))
+            if names & {id_norm, name_norm}:
+                blockers.append(f"{actor_id} would duplicate original {label} entry {key}")
+    for variant in root["variants"]:
+        label = variant["label"]
+        label_id = normalized_id(label)
+        if label_id == "narrator":
+            blockers.append(f"variant {label!r} is the narrator")
+        target = aliases.get(label_id)
+        if target and target != actor_id:
+            blockers.append(f"variant {label!r} is already an alias of {target}")
+        for owner, entry in registry.items():
+            if owner != "narrator" and isinstance(entry, dict) and owner_relevance(label, owner, entry, aliases) >= 3:
+                blockers.append(f"variant {label!r} is literally carried by registered actor {owner}")
+    return list(dict.fromkeys(blockers))
+
+
+def _validated_reviews(source: _ChapterSource, sha: str, reviews: object, mentions: list[dict]) -> list[dict]:
+    if not isinstance(reviews, list) or not reviews:
+        raise _approval_invalid("approval requires one review per included mention")
+    expected = {_scope_tuple(m["scope"]): m["scope"] for m in mentions}
+    checked: dict[tuple, dict] = {}
+    for review in reviews:
+        if not isinstance(review, dict) or set(review) != ROOT_REVIEW_FIELDS or review["proposal_sha256"] != sha:
+            raise _approval_invalid("review has an invalid schema or cites a different proposal sha")
+        scope = review["scope"]
+        if not isinstance(scope, dict) or set(scope) != ROOT_SCOPE_FIELDS or type(scope["span_start"]) is not int:
+            raise _approval_invalid("review scope is invalid")
+        key = _scope_tuple(scope)
+        if expected.get(key) != scope or key in checked:
+            raise _approval_invalid("review scope is not exactly one included mention of the proposal")
+        if review["provenance"] not in REVIEW_PROVENANCES or review["verdict"] != DISTINCT_VERDICT:
+            raise _approval_invalid(f"review provenance must be one of {sorted(REVIEW_PROVENANCES)} with verdict {DISTINCT_VERDICT}")
+        witnesses = review["factual_witnesses"]
+        if review["provenance"] == NATIVE_REVIEW:
+            if review["reviewer_role"] is not None or witnesses != [] or review["factual_basis"] != "":
+                raise _approval_invalid("a native review reference carries no reviewer role, witnesses or basis")
+            exact: list[dict] = []
+        else:
+            basis = review["factual_basis"]
+            if review["reviewer_role"] not in TRUSTED_REVIEW_ROLES or not isinstance(basis, str) or not basis.strip():
+                raise _approval_invalid("a source review needs a trusted reviewer role and a factual basis")
+            exact = _exact_cited_witnesses(source, witnesses, "source review witness")
+            if not exact:
+                raise _approval_invalid("a source review needs exact factual witnesses")
+        checked[key] = {**review, "factual_witnesses": exact}
+    if set(checked) != set(expected):
+        raise _approval_invalid("reviews must cover every included mention exactly once")
+    return [checked[key] for key in expected]
+
+
+def _review_records_for_gate(reviews: list[dict], audit: list[dict], words: list[str]) -> tuple[list[dict], list[str]]:
+    """Effective per-mention review records for variant_root_approval_gate, plus the reasons any review is unusable."""
+    recorded = {
+        (r.get("chapter_sha256"), r.get("quote_sha256"), r.get("label"), r.get("span_start")): r
+        for r in audit
+        if isinstance(r, dict)
+    }
+    effective: list[dict] = []
+    blockers: list[str] = []
+    for review in reviews:
+        scope = review["scope"]
+        native = recorded.get(_scope_tuple(scope))
+        where = f"mention {scope['label']!r}@{scope['span_start']}"
+        if review["provenance"] == NATIVE_REVIEW:
+            raw = native.get("raw_review") if native else None
+            if not native or native.get("verdict") != DISTINCT_VERDICT or not isinstance(raw, dict) or raw.get("verdict") != DISTINCT_VERDICT:
+                blockers.append(f"{where} has no native distinct-living-identity review in the audit")
+                continue
+            effective.append(native)
+            continue
+        if native and native.get("verdict") != DISTINCT_VERDICT:
+            blockers.append(f"{where}: the source review contradicts the native review verdict {native.get('verdict')!r}")
+            continue
+        if not any(_names_word(scope["label"], w["unit_quote"]) or any(_names_word(x, w["unit_quote"]) for x in words) for w in review["factual_witnesses"]):
+            blockers.append(f"{where}: no source-review witness literally names the mention or the identity")
+            continue
+        effective.append(
+            {
+                "chapter_sha256": scope["chapter_sha256"],
+                "quote_sha256": scope["quote_sha256"],
+                "label": scope["label"],
+                "span_start": scope["span_start"],
+                "verdict": DISTINCT_VERDICT,
+                "review_provenance": SOURCE_REVIEW,
+                "reviewer_role": review["reviewer_role"],
+                "own_source_witness": {
+                    "unit_id": scope["unit_id"],
+                    "provenance": SOURCE_REVIEW,
+                    "label": scope["label"],
+                    "span_start": scope["span_start"],
+                },
+            }
+        )
+    return effective, blockers
+
+
+def _scoped_alias_record(actor_id: str, sha: str, mention: dict, review: dict, note: str) -> dict:
+    scope = mention["scope"]
+    return {
+        "chapter_sha256": scope["chapter_sha256"],
+        "quote_sha256": scope["quote_sha256"],
+        "label": scope["label"],
+        "span_start": scope["span_start"],
+        "canonical": actor_id,
+        "decision": "alias",
+        "confidence": 1.0,
+        "reason": f"[approved variant root {sha[:16]}; {review['provenance']}] {note or 'approved by caretaker input'}"[:300],
+        "provenance": mention["item"]["provenance"] if isinstance(mention["item"]["provenance"], dict) else {},
+        "witnesses": [{"chapter_sha256": w["chapter_sha256"], "unit_id": w["unit_id"]} for w in mention["witnesses"]],
+        "approved_root": {
+            "actor_id": actor_id,
+            "proposal_sha256": sha,
+            "review_provenance": review["provenance"],
+            "reviewer_role": review["reviewer_role"],
+        },
+    }
+
+
+def _root_source_scope(mentions: list[dict]) -> dict:
+    names = {m["scope"]["chapter"]: m["scope"]["chapter_sha256"] for m in mentions}
+    return {"source": sorted(names), "source_hash": dict(sorted(names.items()))}
+
+
+def _resolve_root_rows(recovery: RecoveryLedger, root: dict, sha: str, mentions: list[dict]) -> None:
+    """Append resolutions for exactly this root's pending rows: its draft row and the new_actor rows of its included mentions."""
+    actor_id = root["actor_id"]
+    scopes = {_scope_tuple(m["scope"]) for m in mentions}
+    for row in recovery.open_pending(CONTEXT_V2_STAGE):
+        evidence = row["evidence"] if isinstance(row["evidence"], dict) else {}
+        scope = evidence.get("scope")
+        if (
+            row["code"] == "context_new_actor"
+            and isinstance(scope, dict)
+            and evidence.get("canonical_target") == actor_id
+            and (scope.get("chapter_sha256"), scope.get("quote_sha256"), scope.get("label"), scope.get("span_start")) in scopes
+        ) or (
+            row["code"] == VARIANT_DRAFT_ROOT
+            and evidence.get("proposal_sha256") == sha
+            and variant_draft_actor(row["item"]) == actor_id
+        ):
+            recovery.resolve(row, "approved_root_materialized", {"proposal_sha256": sha})
+    for row in recovery.open_pending(ROOT_APPROVAL_STAGE):
+        if row["item"].startswith(f"root_approval:{actor_id}:{sha[:16]}:"):
+            recovery.resolve(row, "approved_root_materialized", {"proposal_sha256": sha})
+
+
+def ingest_root_approvals(
+    project: Path, source_sha: str, chapters: list[Path], progress: dict, recovery: RecoveryLedger
+) -> dict:
+    """Materialize every root the caretaker input approves and that passes every gate; return what happened.
+
+    Validation of the whole file (schema, source sha, exact proposal sha, exact current source, review structure) happens
+    before any write and fails closed. A gate failure only blocks that one root (typed pending row, nothing written).
+    Idempotent: an exact already-registered root only re-asserts its scoped audit and row resolutions.
+    """
+    outcome: dict[str, list] = {"materialized": [], "already": [], "blocked": []}
+    path = project / ROOT_APPROVAL_NAME
+    if not path.is_file():
+        return outcome
+    payload = load_object(path, "caretaker root approvals")
+    if (
+        set(payload) != {"contract", "version", "source_sha256", "approvals"}
+        or payload["contract"] != ROOT_APPROVAL_CONTRACT
+        or payload["version"] != ROOT_APPROVAL_VERSION
+        or not isinstance(payload["approvals"], list)
+    ):
+        raise _approval_invalid("unsupported contract or schema")
+    if payload["source_sha256"] != source_sha:
+        raise _approval_invalid("file belongs to a different source book")
+    source = _ChapterSource(chapters)
+    stored = _stored_pending_roots(project)
+    open_roots = {
+        row["evidence"].get("proposal_sha256")
+        for row in recovery.open_pending(CONTEXT_V2_STAGE)
+        if row["code"] == VARIANT_DRAFT_ROOT and isinstance(row["evidence"], dict)
+    }
+    registry, aliases = progress["registry"], progress["aliases"]
+    plan: list[dict] = []
+    seen_actors: set[str] = set()
+    seen_shas: set[str] = set()
+    for approval in payload["approvals"]:
+        if not isinstance(approval, dict) or set(approval) != ROOT_APPROVAL_FIELDS or approval["action"] != ROOT_APPROVE_ACTION:
+            raise _approval_invalid(f"approval has an invalid schema or action (only {ROOT_APPROVE_ACTION!r} exists)")
+        actor_id, sha, note = approval["actor_id"], approval["proposal_sha256"], approval["note"]
+        if not all(isinstance(item, str) for item in (actor_id, sha, note)) or HUMAN_REVIEW_CLAIM.search(json.dumps(approval)):
+            raise _approval_invalid("approval has invalid values or claims a human review the system cannot attest")
+        if actor_id in seen_actors or sha in seen_shas:
+            raise _approval_invalid("approval repeats an actor or proposal")
+        seen_actors.add(actor_id)
+        seen_shas.add(sha)
+        root = stored.get(sha)
+        if root is None or root["actor_id"] != actor_id:
+            raise _approval_invalid(f"no pending proposal for actor {actor_id!r} has the exact sha {sha!r}")
+        already = _materialized_root_sha(registry, actor_id) == sha
+        if not already and sha not in open_roots:
+            raise _approval_invalid(f"proposal {sha[:16]} for {actor_id!r} is not an open pending proposal (superseded or resolved)")
+        mentions = _revalidated_root(source, root)
+        reviews = _validated_reviews(source, sha, approval["reviews"], mentions)
+        plan.append({"approval": approval, "root": root, "sha": sha, "mentions": mentions, "reviews": reviews, "already": already})
+    if not plan:
+        return outcome
+    characters = load_object(project / "characters.json", "characters profile")
+    voices = load_object(project / "voices.json", "voice profiles")
+    audit = load_new_identity_audit(project)
+    records = load_scoped_audit(project)
+    for item in plan:
+        root, sha, mentions, reviews = item["root"], item["sha"], item["mentions"], item["reviews"]
+        actor_id = root["actor_id"]
+        known = mention_scoped_audit_index(records)
+        review_by_scope = {_scope_tuple(r["scope"]): r for r in reviews}
+        wanted = {
+            _scope_tuple(m["scope"]): _scoped_alias_record(actor_id, sha, m, review_by_scope[_scope_tuple(m["scope"])], item["approval"]["note"])
+            for m in mentions
+        }
+        if not item["already"]:
+            effective, blockers = _review_records_for_gate(reviews, audit, _name_words(root["name"]))
+            blockers += variant_root_approval_gate(root, registry, aliases, effective)
+            blockers += variant_root_duplicate_blockers(root, registry, aliases, characters, voices)
+            blockers += variant_root_participant_blockers(root, mentions, registry, aliases, source)
+            for scope_key, record in wanted.items():
+                prior = known.get(scope_key)
+                if prior and (prior["decision"], prior["canonical"]) != ("alias", actor_id):
+                    blockers.append(f"mention {record['label']!r}@{record['span_start']} already has scoped decision {prior['decision']}:{prior['canonical']}")
+                mention = next(m for m in mentions if _scope_tuple(m["scope"]) == scope_key)
+                if not any(
+                    ref["label"] == record["label"] and ref["start"] == record["span_start"]
+                    for ref in immutable_name_references([mention["unit"]]).values()
+                ):
+                    blockers.append(f"mention {record['label']!r}@{record['span_start']} is not an exact immutable name reference")
+            blockers = list(dict.fromkeys(blockers))
+            prefix = f"root_approval:{actor_id}:{sha[:16]}:"
+            current = f"{prefix}{payload_hash(blockers)[:12]}"
+            stale = [
+                row
+                for row in recovery.open_pending(ROOT_APPROVAL_STAGE)
+                if row["item"].startswith(prefix) and (not blockers or not row["item"].startswith(current))
+            ]
+            for row in stale:
+                recovery.resolve(row, "root_approval_superseded", {"proposal_sha256": sha})
+            if blockers and not any(row["item"].startswith(current) for row in recovery.open_pending(ROOT_APPROVAL_STAGE)):
+                # a generation suffix lets a blocker set that recurs after being superseded open a fresh row
+                generation = sum(
+                    1
+                    for e in recovery.entries()
+                    if e["stage"] == ROOT_APPROVAL_STAGE and e["severity"] == "pending" and e["item"].startswith(current)
+                )
+                recovery.record(
+                    ROOT_APPROVAL_STAGE,
+                    f"{current}:{generation}",
+                    ROOT_APPROVAL_BLOCKED,
+                    f"approval of root {actor_id} is blocked: " + "; ".join(blockers),
+                    severity="pending",
+                    evidence={**_root_source_scope(mentions), "actor_id": actor_id, "proposal_sha256": sha, "blockers": blockers},
+                )
+            if blockers:
+                outcome["blocked"].append({"actor_id": actor_id, "proposal_sha256": sha, "blockers": blockers})
+                continue
+        # 1. scoped audit (idempotent: only absent scopes are appended)
+        added = False
+        for scope_key, record in wanted.items():
+            if scope_key not in known:
+                supersede_scoped_record(records, known, scope_key, record)
+                added = True
+        if added:
+            mention_scoped_audit_index(records)
+            atomic_json(project / SCOPED_AUDIT_NAME, {"records": records})
+        # 2. registry + exact aliases, durable in the progress file
+        if not item["already"]:
+            look = root["look"].strip()
+            registry[actor_id] = {
+                "name": root["name"],
+                "bio": "",
+                "look": "",
+                "origin": "approved_root",
+                "facts": {
+                    "voice": [root["bio"]],
+                    "look": [] if look.rstrip(".").casefold() == NO_VISUAL_DETAILS else [root["look"]],
+                },
+                "approved_root": {
+                    "proposal_sha256": sha,
+                    "proposal_file": PROPOSALS_NAME,
+                    "approval": item["approval"],
+                    "variant_labels": [variant["label"] for variant in root["variants"]],
+                },
+            }
+            for alias in (actor_id, root["name"]):
+                aliases[normalized_id(alias)] = actor_id
+            atomic_json(project / PROGRESS_NAME, progress)
+        # 3. durable resolution of exactly this root's pending rows
+        _resolve_root_rows(recovery, root, sha, mentions)
+        outcome["already" if item["already"] else "materialized"].append(actor_id)
+    return outcome
 
 
 # ##################################################################
@@ -5833,6 +6380,7 @@ def prepare_cast(
     recovery = RecoveryLedger(project)
     ingest_context_quality_proposals(project, source_sha, chapters, progress["registry"], recovery)
     ingest_context_resolution_v2(project, source_sha, chapters, progress["registry"], progress["aliases"], recovery)
+    ingest_root_approvals(project, source_sha, chapters, progress, recovery)
     earlier = {row_key(row) for row in recovery.open_quarantined("cast")}
     # Historical 0..cursor batches had structural hashes only. Reclassify that prefix under the semantic ledger before touching the next production batch.
     # A data problem quarantines only the offending chapter (semantic ledger only; the structural cursor never moves backwards).
@@ -5847,6 +6395,7 @@ def prepare_cast(
         inactive, ambiguous = refresh_alias_audit(project, source_text, progress)
         ingest_context_quality_proposals(project, source_sha, chapters, progress["registry"], recovery)
         ingest_context_resolution_v2(project, source_sha, chapters, progress["registry"], progress["aliases"], recovery)
+        ingest_root_approvals(project, source_sha, chapters, progress, recovery)
         atomic_json(progress_path, progress)
         start = int(progress["next_chapter"])
         for unit in recoverable_batches(
@@ -5871,7 +6420,11 @@ def prepare_cast(
     atomic_json(progress_path, progress)
     blocked = quarantined_chapter_names(progress)
     pending_rows = recovery.open_pending("cast")
-    quality_rows = [*active_quality_pending(recovery, progress["registry"]), *recovery.open_pending(CONTEXT_V2_STAGE)]
+    quality_rows = [
+        *active_quality_pending(recovery, progress["registry"]),
+        *recovery.open_pending(CONTEXT_V2_STAGE),
+        *recovery.open_pending(ROOT_APPROVAL_STAGE),
+    ]
     if blocked or pending_rows or quality_rows:
         # Publication refuses (typed status, no manifest) until cast uncertainty and every
         # active country/garble/duplicate-actor quality flag have durable resolutions.

@@ -14,10 +14,13 @@ from pathlib import Path
 
 from src.breeze_voices import prepare_breeze_voices
 from src.data_recovery import (
+    REVALIDATION_ATTEMPT_LIMIT,
     DataIssue,
     OperationalError,
     RecoveryLedger,
     bounded,
+    row_key,
+    row_scope,
     safe_evidence,
 )
 from src.epub_extract import get_output_dir
@@ -37,6 +40,8 @@ BATCH_CHAPTERS = 6
 MAX_BATCH_CHARACTERS = 24
 EVIDENCE_REPAIR_ATTEMPTS = 2
 SEMANTIC_COVERAGE_VERSION = 1
+SEMANTIC_OPTIONAL_KEYS = frozenset({"quarantined", "empty_chapters", "revalidated"})
+QUARANTINE_REVALIDATION_LIMIT = 25
 CLASSIFICATION_CHUNK_SIZE = 16
 GENERIC_PRONOUN_ALIASES = frozenset(
     {
@@ -303,6 +308,19 @@ def undecodable_issue(chapter: Path, error: UnicodeDecodeError) -> CastDataIssue
     )
 
 
+def empty_chapter_attestations(chapters: list[Path]) -> dict[str, str]:
+    """Exact raw-byte hash of every valid-UTF-8 chapter that has no immutable span (zero-coverage, non-character)."""
+    attested: dict[str, str] = {}
+    for chapter in chapters:
+        try:
+            immutable_spans(chapter.read_text(encoding="utf-8"))
+        except UnicodeDecodeError:
+            continue
+        except ValueError:
+            attested[chapter.name] = file_digest(chapter)
+    return attested
+
+
 def immutable_evidence_units(chapters: list[Path]) -> list[dict[str, str]]:
     units: list[dict[str, str]] = []
     for chapter_index, chapter in enumerate(chapters):
@@ -313,12 +331,9 @@ def immutable_evidence_units(chapters: list[Path]) -> list[dict[str, str]]:
         chapter_hash = hashlib.sha256(chapter_text.encode("utf-8")).hexdigest()
         try:
             spans = immutable_spans(chapter_text)
-        except ValueError as error:
-            raise CastValidationError(
-                f"source chapter {chapter.name} has no immutable spans",
-                {"chapter": chapter.name, "chars": len(chapter_text)},
-                "source_empty_chapter",
-            ) from error
+        except ValueError:
+            # No characters to find: zero units; empty_chapter_attestations records the exact hash.
+            continue
         for sentence_index, quote in enumerate(spans):
             units.append(
                 {
@@ -328,12 +343,6 @@ def immutable_evidence_units(chapters: list[Path]) -> list[dict[str, str]]:
                     "quote": quote,
                 }
             )
-    if not units:
-        raise CastValidationError(
-            "source batch has no immutable evidence units",
-            {"chapters": [chapter.name for chapter in chapters]},
-            "source_empty_chapter",
-        )
     return units
 
 
@@ -441,7 +450,6 @@ def mention_scoped_audit_index(records: object) -> dict[tuple[str, str, str, int
 
 
 NON_NAME_COMPOUND_WORDS = frozenset(word.casefold() for word in NON_NAME_COMPOUND_PREFIXES)
-ADJUDICATION_ROSTER_MAX = 40
 ADJUDICATION_SNIPPET_CHARS = 80
 
 
@@ -454,41 +462,39 @@ def label_components(text: str) -> set[str]:
     }
 
 
+def owner_relevance(label: str, actor_id: str, entry: dict, aliases: dict[str, str]) -> int:
+    """Rank one established actor only from independently inspectable identity evidence; zero means no owner option exists."""
+    label_id = normalized_id(label)
+    name = str(entry.get("name", actor_id))
+    aliases_for_owner = [alias for alias, target in aliases.items() if target == actor_id]
+    literal_ids = {normalized_id(actor_id), normalized_id(name), *(normalized_id(alias) for alias in aliases_for_owner)}
+    if label_id and label_id in literal_ids:
+        return 4
+    label_words = label_components(label)
+    owner_words = label_components(name) | set(actor_id.split("_"))
+    owner_words.update(word for alias in aliases_for_owner for word in label_components(alias))
+    if label_words & owner_words:
+        return 3
+    pattern = re.compile(rf"(?<!\w){re.escape(label.strip())}(?!\w)", re.IGNORECASE)
+    if label.strip() and any(pattern.search(text) for _, text in extract_owner_profile_facts(entry)):
+        return 2
+    return 0
+
+
+# ##################################################################
+# adjudication owners
+# ranks every established actor with literal canonical/alias, name-component, or exact profile/source-fact evidence; a model proposal and roster position are never evidence, so no-relevance produces no owners and preserves an open-world pending outcome.
 def adjudication_owners(
     label: str, registry: dict, aliases: dict | None = None, proposed: str | None = None
 ) -> list[str]:
-    """Candidate canonical owners for one label, led by the primary's contextual proposal, then exact name-word
-    matches, any shared name component (Ren Dove -> ren), the audited alias owner, and, only when none of those exist, a bounded
-    roster of the whole canonical cast (Mom -> mother) ordered so owners whose own profile/facts mention the label come first."""
-    label_id = normalized_id(label)
-    components = label_components(label)
-    owners: list[str] = []
-
-    def add(actor_id: str | None) -> None:
-        if actor_id in registry and actor_id != "narrator" and actor_id not in owners:
-            owners.append(actor_id)
-
-    for actor_id, info in sorted(registry.items()):
-        words = {normalized_id(word) for word in str(info.get("name", actor_id)).split()} | set(actor_id.split("_"))
-        if label_id in words or components & words:
-            add(actor_id)
-    add((aliases or {}).get(label_id))
-    if not owners:
-        needle = label.casefold()
-        mentioning = [
-            actor_id
-            for actor_id, info in sorted(registry.items())
-            if needle in json.dumps(info, ensure_ascii=False).casefold()
-        ]
-        for actor_id in [*mentioning, *sorted(registry)]:
-            add(actor_id)
-        del owners[ADJUDICATION_ROSTER_MAX:]
-    if proposed in registry and proposed != "narrator":
-        # the proposal leads but never narrows: the offered set always covers the proposal-free set, so staleness is decidable without it
-        if proposed in owners:
-            owners.remove(proposed)
-        owners.insert(0, proposed)
-    return owners
+    del proposed
+    safe_aliases = aliases or {}
+    ranked = [
+        (owner_relevance(label, actor_id, entry, safe_aliases), actor_id)
+        for actor_id, entry in registry.items()
+        if actor_id != "narrator" and isinstance(entry, dict)
+    ]
+    return [actor_id for score, actor_id in sorted(ranked, key=lambda pair: (-pair[0], pair[1])) if score]
 
 
 def readjudication_due(record: dict, owners: list[str]) -> bool:
@@ -506,7 +512,12 @@ def scope_final(candidate: dict) -> bool:
 
 def scoped_alias_approved(candidate: dict, canonical: str) -> bool:
     scoped = candidate.get("scoped_audit")
-    return bool(scoped) and scoped["decision"] == "alias" and scoped["canonical"] == canonical
+    return (
+        bool(scoped)
+        and scoped["decision"] == "alias"
+        and scoped["canonical"] == canonical
+        and not candidate.get("scoped_unproven")
+    )
 
 
 # ##################################################################
@@ -521,6 +532,7 @@ def candidate_coverage_ledger(
     scoped = mention_scoped_audit_index(scoped_audit or [])
     grouped: dict[str, dict] = {}
     units_by_id = {unit["id"]: unit for unit in units}
+    order = [unit["id"] for unit in units]
     references = immutable_name_references(units)
     for ref_id, reference in references.items():
         label = reference["label"]
@@ -532,11 +544,34 @@ def candidate_coverage_ledger(
         if record:
             key = f"{key}@{record['decision']}:{record['canonical']}"
         candidate = grouped.setdefault(
-            key, {"label": label, "ref_ids": [], "has_standalone": False, "scoped": record, "records": []}
+            key,
+            {
+                "label": label,
+                "ref_ids": [],
+                "has_standalone": False,
+                "scoped": record,
+                "records": [],
+                "unproven": False,
+            },
         )
         candidate["ref_ids"].append(ref_id)
         if record:
             candidate["records"].append(record)
+            if (
+                record["decision"] == "alias"
+                and (
+                    scoped_alias_proof(
+                        label,
+                        record["canonical"],
+                        unit,
+                        scene_units_at(units_by_id, order, order.index(unit["id"])),
+                        registry,
+                        aliases,
+                    )[1]
+                )
+            ):
+                # a cached alias is only as good as the mechanical proof of its exact mention; an unproven one is re-decided, never trusted
+                candidate["unproven"] = True
         candidate["has_standalone"] = candidate["has_standalone"] or not reference["suffix"]
     for candidate in grouped.values():
         label_id = normalized_id(candidate["label"])
@@ -552,8 +587,11 @@ def candidate_coverage_ledger(
         if candidate["scoped"]:
             ledger_owners = adjudication_owners(candidate["label"], registry, aliases)
             candidate["stale"] = any(readjudication_due(item, ledger_owners) for item in candidate["records"])
+            candidate["stale"] = candidate["stale"] or candidate["unproven"]
             candidate["known_owner"] = (
-                candidate["scoped"]["canonical"] if candidate["scoped"]["decision"] == "alias" else None
+                candidate["scoped"]["canonical"]
+                if candidate["scoped"]["decision"] == "alias" and not candidate["unproven"]
+                else None
             )
             if candidate["scoped"]["decision"] != "alias":
                 candidate["nonentity"] = candidate["scoped"]["decision"] == "non_character"
@@ -596,6 +634,7 @@ def candidate_coverage_ledger(
             "nonentity": value["nonentity"],
             **({"scoped_audit": value["scoped"]} if value["scoped"] else {}),
             **({"scoped_stale": True} if value["stale"] else {}),
+            **({"scoped_unproven": True} if value["unproven"] else {}),
         }
         for index, (_, value) in enumerate(retained)
     ]
@@ -1785,6 +1824,137 @@ def owner_support(
     return supported, provenance
 
 
+# ##################################################################
+# scoped alias proof
+# a contextual owner proposal, a cached model verdict, or a roster position never proves identity. An alias to a canonical owner is accepted only when program-derived source facts show (1) an exact literal tie between the label and the owner (approved name, shared name word, or the label written in the owner's own profile), (2) continuity between the owner and the label's own bounded scene that does not come from the label's mention itself, and (3) no contradiction: a distinct participant or enumerated actor in the mention, a name word belonging to another cast member, or another owner equally carrying the label named in the scene. Anything else stays unresolved (pending); no owner is forced.
+TITLE_ROLE_TOKENS = frozenset({word.casefold() for word in TITLE_WORDS} | ROLE_WORDS)
+
+
+def owner_name_forms(owner: str, registry: dict, aliases: dict) -> list[str]:
+    forms = [str(registry[owner].get("name", owner))]
+    forms.extend(alias.replace("_", " ") for alias, target in aliases.items() if target == owner and alias != owner)
+    return list(dict.fromkeys(form for form in forms if form.strip()))
+
+
+def owner_name_tokens(owner: str, registry: dict, aliases: dict) -> set[str]:
+    tokens = set(owner.split("_"))
+    for form in owner_name_forms(owner, registry, aliases):
+        tokens |= label_components(form)
+    return tokens
+
+
+def literal_pattern(text: str) -> re.Pattern:
+    return re.compile(rf"(?<!\w){re.escape(text.strip())}(?!\w)", re.IGNORECASE)
+
+
+def mask_label(quote: str, label: str, protected: list[str]) -> str:
+    """The quote with every occurrence of the label blanked, except where the occurrence sits inside a longer protected owner name."""
+    shielded = [
+        match.span()
+        for name in protected
+        if len(name.strip()) > len(label.strip())
+        for match in literal_pattern(name).finditer(quote)
+    ]
+    out = quote
+    for match in literal_pattern(label).finditer(quote):
+        if not any(low <= match.start() and match.end() <= high for low, high in shielded):
+            out = out[: match.start()] + " " * (match.end() - match.start()) + out[match.end() :]
+    return out
+
+
+def scoped_alias_proof(
+    label: str,
+    owner: str,
+    mention_unit: dict,
+    scene_units: list[dict],
+    registry: dict,
+    aliases: dict,
+) -> tuple[dict | None, str | None]:
+    """(provenance, None) when the alias of this exact mention to the owner is mechanically proven, else (None, why not)."""
+    if owner not in registry or owner == "narrator":
+        return None, f"owner {owner!r} is outside the cast"
+    forms = owner_name_forms(owner, registry, aliases)
+    label_id = normalized_id(label)
+    if label_id in {normalized_id(form) for form in forms} | {normalized_id(owner)} or aliases.get(label_id) == owner:
+        return {"literal": "approved_name"}, None
+    owner_tokens = owner_name_tokens(owner, registry, aliases)
+    label_tokens = label_components(label)
+    name_tokens = label_tokens - TITLE_ROLE_TOKENS
+    profile = [text for _field, text in extract_owner_profile_facts(registry[owner])]
+    pattern = literal_pattern(label)
+    in_profile = any(pattern.search(text) for text in profile)
+    role_only = not name_tokens
+    if name_tokens:
+        if not name_tokens & owner_tokens and not in_profile:
+            return None, f"label {label!r} shares no name word with {owner!r} and is not written in its profile"
+        extra = name_tokens - owner_tokens
+        if extra and not in_profile:
+            for other in registry:
+                if other not in {owner, "narrator"} and extra & owner_name_tokens(other, registry, aliases):
+                    return None, f"label {label!r} carries the name of another cast member {other!r}"
+        literal = "shared_name_word" if name_tokens & owner_tokens else "owner_profile_literal"
+    elif not in_profile:
+        return None, f"role or title label {label!r} is not written in the profile of {owner!r}"
+    else:
+        literal = "owner_profile_literal"
+    quote = mention_unit["quote"]
+    for name in forms:
+        if are_enumerated_distinct_actors(quote, label, name):
+            return None, f"{label!r} and {name!r} are enumerated as distinct actors in the mention"
+        if (
+            not label_components(name) <= label_tokens
+            and mention_unit_has_separate_owner_token(quote, label, name)
+            and not is_apposition_mention(quote, label, name)
+        ):
+            return None, f"{name!r} is a distinct participant of the same mention as {label!r}"
+    protected = [*forms, *(registry[other].get("name", other) for other in registry if other != owner)]
+    masked = [
+        {**unit, "quote": mask_label(unit["quote"], label, [str(name) for name in protected])} for unit in scene_units
+    ]
+    for other in sorted(registry):
+        if other in {owner, "narrator"} or not label_tokens <= owner_name_tokens(other, registry, aliases):
+            continue
+        if any(source_label_present(form, masked) for form in owner_name_forms(other, registry, aliases)):
+            return None, f"the scene names {other!r}, which carries {label!r} equally"
+    supported, continuity = find_existing_owner_support(label, owner, masked, registry, aliases)
+    profile_relation = None
+    if in_profile:
+        for text in profile:
+            for sentence in re.split(r"[.;!?\n]", text):
+                if not pattern.search(sentence):
+                    continue
+                for other in registry:
+                    if other in {owner, "narrator"}:
+                        continue
+                    other_forms = owner_name_forms(other, registry, aliases)
+                    if any(literal_pattern(form).search(sentence) for form in other_forms) and any(
+                        source_label_present(form, masked) for form in other_forms
+                    ):
+                        profile_relation = {"type": "profile_relation", "related_owner": other}
+                        break
+                if profile_relation:
+                    break
+            if profile_relation:
+                break
+    if role_only:
+        # A title cannot bind by authority, role similarity, or a broad profile anchor. It needs an
+        # explicit owner name in the scene, or a profile relation whose other participant is actually named.
+        if continuity is not None and continuity.get("type") != "literal_witness":
+            supported, continuity = False, None
+        if not supported and profile_relation:
+            supported, continuity = True, profile_relation
+    elif not supported and profile_relation:
+        supported, continuity = True, profile_relation
+    if not supported:
+        return None, f"no source continuity ties {owner!r} to the scene of {label!r} independent of the mention itself"
+    return {"literal": literal, "continuity": continuity}, None
+
+
+def scene_units_at(units_by_id: dict, order: list[str], position: int) -> list[dict]:
+    low, high = bounded_scene_range(units_by_id, order, position)
+    return [units_by_id[order[index]] for index in range(low, high + 1)]
+
+
 def review_verdict_error(
     label: str,
     verdict: str,
@@ -1829,6 +1999,11 @@ def review_verdict_error(
         supported, _ = owner_support(label, owner, witness_units, episode_units, registry, aliases)
         if not supported:
             return f"new-identity review lacks source/registry support for existing {owner!r}"
+        _proof, why = scoped_alias_proof(
+            label, owner, mention_unit, episode_units or witness_units, registry, aliases
+        )
+        if why:
+            return f"new-identity review lacks independent owner proof for existing {owner!r}: {why}"
         for name in names:
             if mention_unit_has_separate_owner_token(mention_unit["quote"], label, name):
                 is_approved = (
@@ -2746,6 +2921,19 @@ def scoped_audit_attestation(records: list[dict]) -> dict:
     return {"version": 1, "count": len(ordered), "sha256": json_digest(ordered)}
 
 
+def supersede_scoped_record(records: list[dict], known: dict, scope: tuple, record: dict) -> None:
+    """Install the record for one exact mention, keeping every superseded decision and its reason as append-only history."""
+    prior = known.get(scope)
+    if prior:
+        record["history"] = [
+            *prior.get("history", []),
+            {key: prior[key] for key in ("decision", "canonical", "confidence", "reason", "owners") if key in prior},
+        ]
+        records[:] = [item for item in records if item is not prior]
+    records.append(record)
+    known[scope] = record
+
+
 def adjudicate_pending_mentions(
     project: Path, pending: list[dict], units: list[dict], registry: dict, ask, aliases: dict | None = None
 ) -> int:
@@ -2767,13 +2955,47 @@ def adjudicate_pending_mentions(
         for ref_id in candidate["ref_ids"]:
             unit = units_by_id[references[ref_id]["unit_id"]]
             scope = mention_scope(unit, references[ref_id], candidate["label"])
+            prior = known.get(scope)
+            if prior and prior["decision"] == "alias":
+                _, why = scoped_alias_proof(
+                    candidate["label"],
+                    prior["canonical"],
+                    unit,
+                    scene_units_at(units_by_id, order, order.index(unit["id"])),
+                    registry,
+                    aliases or {},
+                )
+                if why:
+                    # no model call can add proof the source lacks: the legacy alias is withdrawn mechanically and the mention stays unresolved
+                    supersede_scoped_record(
+                        records,
+                        known,
+                        scope,
+                        {
+                            "chapter_sha256": scope[0],
+                            "quote_sha256": scope[1],
+                            "label": candidate["label"],
+                            "span_start": scope[3],
+                            "canonical": "none",
+                            "decision": "ambiguous",
+                            "confidence": float(prior["confidence"]),
+                            "reason": f"[alias proof rejected: {why}] {prior['reason']}"[:300],
+                            "owners": list(owners),
+                            "raw_adjudication": prior.get("raw_adjudication")
+                            or {"decision": "alias", "canonical": prior["canonical"], "reason": prior["reason"]},
+                        },
+                    )
+                    written += 1
+                    mention_scoped_audit_index(records)
+                    atomic_json(project / SCOPED_AUDIT_NAME, {"records": records})
+                    continue
             if scope not in known or readjudication_due(known[scope], owners):
                 mentions.setdefault(scope, unit)
         scopes = list(mentions)
         for offset in range(0, len(scopes), ADJUDICATION_MENTIONS_PER_CALL):
             chunk = scopes[offset : offset + ADJUDICATION_MENTIONS_PER_CALL]
             ids = [f"m{index}" for index in range(len(chunk))]
-            decisions = ["alias", "non_character", "ambiguous"] if owners else ["non_character", "ambiguous"]
+            decisions = ["alias", "non_character", "ambiguous"] if owners else ["non_character", "ambiguous", "owner_absent"]
             item = {
                 "type": "object",
                 "properties": {
@@ -2870,11 +3092,20 @@ def adjudicate_pending_mentions(
                 person = result["refers_to_person"]
                 reason = str(result["reason"])
                 kind = result["candidate_kind"]
+                raw_decision = decision
+                if decision == "owner_absent":
+                    decision, canonical = "ambiguous", "none"
                 if decision == "alias" and (
                     canonical not in owners
                     or result["confidence"] < ADJUDICATION_MIN_CONFIDENCE
                     or person != "yes"
                     or kind not in {"individual_name", "specific_role"}
+                    or (kind == "specific_role" and not (label_components(candidate["label"]) - TITLE_ROLE_TOKENS))
+                    or (
+                        raw_decision == "non_character"
+                        and kind != "individual_name"
+                        and not (kind == "specific_role" and (label_components(candidate["label"]) - TITLE_ROLE_TOKENS))
+                    )
                 ):
                     decision, canonical = "ambiguous", "none"
                 elif decision in {"non_character", "ambiguous"} and person == "yes" and result["canonical"] in owners:
@@ -2966,6 +3197,23 @@ def adjudicate_pending_mentions(
                                 :300
                             ],
                         )
+                proof = None
+                if decision == "alias":
+                    mention_unit = mentions[scope]
+                    proof, why = scoped_alias_proof(
+                        candidate["label"],
+                        canonical,
+                        mention_unit,
+                        scene_units_at(units_by_id, order, order.index(mention_unit["id"])),
+                        registry,
+                        aliases or {},
+                    )
+                    if why:
+                        decision, canonical, reason = (
+                            "ambiguous",
+                            "none",
+                            f"[alias proof rejected: {why}] {reason}"[:300],
+                        )
                 if decision != "alias":
                     canonical = "none"
                 record = {
@@ -2978,6 +3226,7 @@ def adjudicate_pending_mentions(
                     "confidence": float(result["confidence"]),
                     "reason": reason,
                     "owners": list(owners),
+                    **({"proof": proof} if proof else {}),
                     "raw_adjudication": {
                         "decision": result["decision"],
                         "canonical": result["canonical"],
@@ -2987,20 +3236,7 @@ def adjudicate_pending_mentions(
                         "reason": result["reason"],
                     },
                 }
-                prior = known.get(scope)
-                if prior:
-                    # keep every superseded decision and its reason; the audit is append-only history, not an overwrite
-                    record["history"] = [
-                        *prior.get("history", []),
-                        {
-                            key: prior[key]
-                            for key in ("decision", "canonical", "confidence", "reason", "owners")
-                            if key in prior
-                        },
-                    ]
-                    records[:] = [item for item in records if item is not prior]
-                records.append(record)
-                known[scope] = record
+                supersede_scoped_record(records, known, scope, record)
                 written += 1
             mention_scoped_audit_index(records)
             atomic_json(project / SCOPED_AUDIT_NAME, {"records": records})
@@ -3632,7 +3868,7 @@ def validate_semantic_coverage(progress: dict, chapters: list[Path]) -> None:
     coverage = semantic_coverage(progress)
     expected_start = 0
     for batch in coverage["completed_batches"]:
-        if not isinstance(batch, dict) or set(batch) - {"quarantined"} != {
+        if not isinstance(batch, dict) or set(batch) - SEMANTIC_OPTIONAL_KEYS != {
             "start",
             "end",
             "chapter_sha256",
@@ -3656,9 +3892,55 @@ def validate_semantic_coverage(progress: dict, chapters: list[Path]) -> None:
             raise OperationalError(
                 "cast_integrity", "semantic coverage batch is not bound to exact source and candidate ledger"
             )
+        for name, digest in (batch.get("empty_chapters") or {}).items():
+            if batch["chapter_sha256"].get(name) != digest or empty_chapter_attestations(
+                [path for path in chapters[start:end] if path.name == name]
+            ) != {name: digest}:
+                raise OperationalError(
+                    "cast_integrity", "semantic coverage empty-chapter attestation does not match the exact source"
+                )
         expected_start = end
     if coverage.get("next_chapter") != expected_start:
         raise OperationalError("cast_integrity", "semantic coverage cursor does not match its completed batches")
+
+
+# ##################################################################
+# write semantic record
+# appends the complete local ledger and native classifications for one unit (never rewrites) and returns its source-hashed coverage entry; a chapter with no immutable span is attested as zero-coverage non-character with its exact hash.
+def write_semantic_record(
+    project: Path,
+    start: int,
+    batch: list[Path],
+    units: list[dict],
+    classifications: list[dict],
+    revalidation: bool,
+    quarantined: bool = False,
+    supersedes_quarantine: bool = False,
+) -> dict:
+    ledger = [] if quarantined else candidate_coverage_ledger(units, {}, {})
+    ledger_sha256 = json_digest(ledger)
+    empty = {} if quarantined else empty_chapter_attestations(batch)
+    payload = {
+        "start_chapter": start,
+        "chapters": [path.name for path in batch],
+        "semantic_revalidation": revalidation,
+        "candidate_ledger": ledger,
+        "classifications": classifications,
+        **({"quarantined": True} if quarantined else {}),
+        **({"empty_chapters": empty, "attestation": "zero_coverage_non_character"} if empty else {}),
+        **({"supersedes_quarantine": True} if supersedes_quarantine else {}),
+    }
+    with (project / DISCOVERIES_NAME).open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    return {
+        "start": start,
+        "end": start + len(batch),
+        "chapter_sha256": {path.name: file_digest(path) for path in batch},
+        "ledger_sha256": ledger_sha256,
+        **({"quarantined": True} if quarantined else {}),
+        **({"empty_chapters": empty} if empty else {}),
+        **({"revalidated": True} if supersedes_quarantine else {}),
+    }
 
 
 # ##################################################################
@@ -3674,26 +3956,8 @@ def record_semantic_batch(
     revalidation: bool,
     quarantined: bool = False,
 ) -> None:
-    ledger = [] if quarantined else candidate_coverage_ledger(units, {}, {})
-    ledger_sha256 = json_digest(ledger)
-    payload = {
-        "start_chapter": start,
-        "chapters": [path.name for path in batch],
-        "semantic_revalidation": revalidation,
-        "candidate_ledger": ledger,
-        "classifications": classifications,
-        **({"quarantined": True} if quarantined else {}),
-    }
-    with (project / DISCOVERIES_NAME).open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
     coverage["completed_batches"].append(
-        {
-            "start": start,
-            "end": start + len(batch),
-            "chapter_sha256": {path.name: file_digest(path) for path in batch},
-            "ledger_sha256": ledger_sha256,
-            **({"quarantined": True} if quarantined else {}),
-        }
+        write_semantic_record(project, start, batch, units, classifications, revalidation, quarantined)
     )
     coverage["next_chapter"] = start + len(batch)
 
@@ -3862,19 +4126,53 @@ def archive_quarantine(project: Path, start: int, paths: list[Path], error: Data
 
 
 PENDING_REPLAY_LIMIT = 3
+
+
+# ##################################################################
+# replay model bindings
+# lists every mention-scoped alias now bound inside the replayed source (exact scope, canonical, confidence, mechanical proof) so a resolved pending row states which model bindings the replay relied on.
+def replay_model_bindings(project: Path, units: list[dict]) -> list[dict]:
+    hashes = {unit["chapter_sha256"] for unit in units}
+    return [
+        {
+            **{key: record[key] for key in ("chapter_sha256", "quote_sha256", "label", "span_start", "canonical")},
+            "confidence": record["confidence"],
+            "proof": record.get("proof"),
+        }
+        for record in load_scoped_audit(project)
+        if record["decision"] == "alias" and record["chapter_sha256"] in hashes
+    ]
+
+
 PROPOSALS_NAME = "cast_pending_proposals.jsonl"
 
 
 # ##################################################################
 # save pending proposal
-# persists the exact demoted identity proposal so a pending row's evidence is reproducible.
+# persists the exact demoted identity proposal so a pending row's evidence is reproducible; the same exact proposal (same scope, mentions and evidence bytes) is stored once however often a replay or round re-presents it.
 def save_pending_proposal(project: Path, proposal: dict) -> str:
     line = json.dumps(proposal, ensure_ascii=False, sort_keys=True)
-    with (project / PROPOSALS_NAME).open("a", encoding="utf-8") as stream:
+    path = project / PROPOSALS_NAME
+    if path.is_file() and line in path.read_text(encoding="utf-8").splitlines():
+        return hashlib.sha256(line.encode("utf-8")).hexdigest()
+    with path.open("a", encoding="utf-8") as stream:
         stream.write(line + "\n")
         stream.flush()
         os.fsync(stream.fileno())
     return hashlib.sha256(line.encode("utf-8")).hexdigest()
+
+
+# ##################################################################
+# exact scope
+# a recorded row is retried only while every chapter it names still exists with its exact recorded bytes hash; anything else is stale and stays open.
+def exact_scope(row: dict, by_name: dict[str, Path]) -> bool:
+    names, hashes = row_scope(row)
+    return bool(
+        isinstance(names, list)
+        and isinstance(hashes, dict)
+        and names
+        and all(name in by_name and hashes.get(name) == file_digest(by_name[name]) for name in names)
+    )
 
 
 # ##################################################################
@@ -3891,62 +4189,186 @@ def replay_pending(
 ) -> dict:
     by_name = {path.name: path for path in chapters}
     coverage = semantic_coverage(progress)
-    summary = {"resolved": 0, "open": 0, "attempts": 0}
-    for row in recovery.open_pending("cast"):
-        evidence = row["evidence"]
-        names, hashes = evidence.get("source"), evidence.get("source_hash")
-        exact = (
-            isinstance(names, list)
-            and isinstance(hashes, dict)
-            and names
-            and all(name in by_name and hashes.get(name) == file_digest(by_name[name]) for name in names)
-        )
-        if not exact:
-            summary["open"] += 1
-            continue
-        attempts = [
-            r
-            for r in recovery.entries()
-            if r["stage"] == "cast"
-            and r["severity"] == "replay_attempt"
-            and r["item_sha256"] == row["item_sha256"]
-            and r["evidence"].get("replays") == row["code"]
-        ]
-        if len(attempts) >= PENDING_REPLAY_LIMIT:
-            summary["open"] += 1
-            continue
-        recovery.record(
-            "cast",
-            row["item"],
-            "pending_replay_attempt",
-            f"replay attempt {len(attempts) + 1}",
-            severity="replay_attempt",
-            evidence={"replays": row["code"], "source": names, "source_hash": {"attempt": len(attempts) + 1, **hashes}},
-        )
-        summary["attempts"] += 1
+
+    def retry(row: dict) -> tuple[str, dict] | None:
+        names, hashes = row_scope(row)
         paths = [by_name[name] for name in names]
         RecoveryLedger.presented.clear()
         start = chapters.index(paths[0])
         try:
             units = immutable_evidence_units(paths)
             work = {"registry": copy.deepcopy(progress["registry"]), "aliases": dict(progress["aliases"])}
-            outcome_ok = True
             for window in unit_windows(units, work["registry"], work["aliases"]):
                 discoveries, _ = discover_batch(project, start, paths, window, source_text, work, ambiguous, None, ask)
                 apply_discoveries(work["registry"], work["aliases"], discoveries)
         except DataIssue:
-            outcome_ok = False
+            return None
         key = (row["stage"], row["item_sha256"], row["code"], row.get("dedup_scope", ""), row.get("dedup_hash", ""))
-        if outcome_ok and key not in RecoveryLedger.presented:
-            progress["registry"], progress["aliases"] = (work["registry"], work["aliases"])
-            recovery.resolve(row, "replayed_exact_scope_clean", {"attempt": len(attempts) + 1})
-            coverage.setdefault("resolved_pending", []).append(
-                {"item": row["item"], "code": row["code"], "source_hash": hashes}
+        if key in RecoveryLedger.presented:
+            return None
+        progress["registry"], progress["aliases"] = (work["registry"], work["aliases"])
+        # A clean replay may have resolved the row by a mention-scoped binding; disclose only the
+        # bindings inspected from its exact source scope instead of presenting the outcome as owner-free.
+        bindings = replay_model_bindings(project, units)
+        coverage.setdefault("resolved_pending", []).append(
+            {"item": row["item"], "code": row["code"], "source_hash": hashes, "model_bindings": bindings}
+        )
+        return "replayed_exact_scope_clean", {"attempt": len(recovery.attempts(row)), "model_bindings": bindings}
+
+    return recovery.revalidate(
+        "cast",
+        lambda row: exact_scope(row, by_name),
+        retry,
+        severities=("pending",),
+        attempt_limit=PENDING_REPLAY_LIMIT,
+    )
+
+
+# ##################################################################
+# revalidate quarantines
+# generic bounded exact-hash retry of every open cast quarantine row (legacy severity rows and new parse/model quarantines alike, never only pending). A chapter is retried only while its exact recorded hash still matches; a clean result (including an empty chapter, now a zero-coverage non-character attestation) replaces the quarantined coverage entry in place and keeps the superseded entry, discoveries, rejection archive and ledger rows as append-only history. The structural cursor never moves and source bytes are never changed or reinterpreted.
+def revalidate_quarantines(
+    project: Path,
+    chapters: list[Path],
+    progress: dict,
+    ambiguous: set[str],
+    source_text: str,
+    recovery: RecoveryLedger,
+    ask,
+    limit: int | None = QUARANTINE_REVALIDATION_LIMIT,
+    earlier: set[tuple[str, str, str]] | None = None,
+) -> dict:
+    by_name = {path.name: path for path in chapters}
+    coverage = semantic_coverage(progress)
+    progress_path = project / PROGRESS_NAME
+
+    def quarantined_entries(names: list[str]) -> list[dict]:
+        return [
+            batch
+            for batch in coverage["completed_batches"]
+            if batch.get("quarantined") and set(batch["chapter_sha256"]) & set(names)
+        ]
+
+    def attested(names: list[str], hashes: dict) -> bool:
+        return all(
+            any(
+                name in batch["chapter_sha256"] and batch["chapter_sha256"][name] == hashes[name]
+                for batch in coverage["completed_batches"]
+                if not batch.get("quarantined")
             )
-            summary["resolved"] += 1
+            for name in names
+        )
+
+    def supersede(old: dict, units: list[dict]) -> None:
+        entries = [
+            write_semantic_record(
+                project,
+                unit["start"],
+                unit["batch"],
+                unit["units"],
+                unit["classifications"],
+                True,
+                unit["quarantine"] is not None,
+                unit["quarantine"] is None,
+            )
+            for unit in units
+        ]
+        batches = coverage["completed_batches"]
+        position = batches.index(old)
+        batches[position : position + 1] = entries
+        structural = progress["completed_batches"]
+        position = next(i for i, b in enumerate(structural) if (b["start"], b["end"]) == (old["start"], old["end"]))
+        structural[position : position + 1] = [
+            {
+                "start": entry["start"],
+                "end": entry["end"],
+                "chapter_sha256": entry["chapter_sha256"],
+                **({"quarantined": True} if entry.get("quarantined") else {}),
+            }
+            for entry in entries
+        ]
+        coverage.setdefault("superseded_quarantines", []).append({"entry": old, "replaced_by": entries})
+
+    def rerun(old: dict) -> list[dict]:
+        """Fresh recoverable attempt over exactly the old entry's chapters; clean units update the working registry."""
+        units: list[dict] = []
+        position = old["start"]
+        while position < old["end"]:
+            for unit in recoverable_batches(
+                project, chapters[: old["end"]], position, progress, ambiguous, source_text, recovery, ask, None
+            ):
+                if unit["quarantine"] is None:
+                    progress["registry"], progress["aliases"] = unit["registry"], unit["aliases"]
+                units.append(unit)
+                position = unit["start"] + len(unit["batch"])
+        return units
+
+    def retry(row: dict) -> tuple[str, dict] | None:
+        names, hashes = row_scope(row)
+        attempt = {"attempt": len(recovery.attempts(row))}
+        open_entries = quarantined_entries(names)
+        if not open_entries:
+            # A previous pass replaced the coverage entry but stopped before this row's resolution was appended.
+            return ("coverage_already_attested", attempt) if attested(names, hashes) else None
+        for old in open_entries:
+            exact_names = [path.name for path in chapters[old["start"] : old["end"]]]
+            if exact_names != list(old["chapter_sha256"]) or not set(exact_names) <= set(names):
+                return None
+            units = rerun(old)
+            if any(unit["quarantine"] is None for unit in units):
+                supersede(old, units)
+                atomic_json(progress_path, progress)
+        if quarantined_entries(names):
+            return None
+        return "revalidated_clean", {
+            **attempt,
+            "empty_chapters": empty_chapter_attestations([by_name[n] for n in names]),
+        }
+
+    return recovery.revalidate(
+        "cast",
+        lambda row: exact_scope(row, by_name),
+        retry,
+        severities=("quarantine",),
+        limit=limit,
+        # A row recorded during this very run just failed; it waits for the next pass instead of burning an attempt.
+        defer=None if earlier is None else lambda row: row_key(row) not in earlier,
+    )
+
+
+# ##################################################################
+# plan quarantine revalidation
+# read-only proof preparation: classifies every open cast quarantine row as eligible (exact hash matches, attempts remain), stale (source bytes differ or hash not recorded), or exhausted, plus quarantined coverage chapters, without any inference, write, or cursor change.
+def plan_quarantine_revalidation(source: Path, project: Path | None = None) -> dict:
+    source = source.resolve()
+    project = project or get_output_dir(source)
+    _, _, chapters = source_chapters(source, project)
+    by_name = {path.name: path for path in chapters}
+    recovery = RecoveryLedger(project)
+    rows = recovery.entries()
+    counts: dict[str, dict[str, int]] = {}
+    for row in recovery.open_rows("cast", ("quarantine",)):
+        if not exact_scope(row, by_name):
+            state = "stale"
+        elif len(recovery.attempts(row, rows)) >= REVALIDATION_ATTEMPT_LIMIT:
+            state = "exhausted"
         else:
-            summary["open"] += 1
-    return summary
+            state = "eligible"
+        bucket = counts.setdefault(row["code"], {"eligible": 0, "stale": 0, "exhausted": 0})
+        bucket[state] += 1
+    progress_path = project / PROGRESS_NAME
+    quarantined = empty = []
+    if progress_path.exists():
+        progress = load_object(progress_path, "cast preparation progress")
+        quarantined = quarantined_chapter_names(progress)
+        empty = sorted(empty_chapter_names(progress))
+    return {
+        "open_quarantine_rows": sum(sum(bucket.values()) for bucket in counts.values()),
+        "by_code": counts,
+        "quarantined_chapters": len(quarantined),
+        "empty_chapters_attested": len(empty),
+        "empty_chapters_in_source": len(empty_chapter_attestations(chapters)),
+    }
 
 
 # ##################################################################
@@ -3993,9 +4415,26 @@ def quarantined_chapter_names(progress: dict) -> list[str]:
 
 
 # ##################################################################
+# empty chapter names
+# chapters attested as zero-coverage non-character (exact hash recorded); they never veto a freeze.
+def empty_chapter_names(progress: dict) -> dict[str, str]:
+    return {
+        name: digest
+        for batch in semantic_coverage(progress)["completed_batches"]
+        for name, digest in sorted((batch.get("empty_chapters") or {}).items())
+    }
+
+
+# ##################################################################
 # prepare cast
 # resumes each bounded native-Ollama batch from durable progress and atomically publishes a freeze only after all chapters and assets validate.
-def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | None = None, ask=None) -> dict:
+def prepare_cast(
+    source: Path,
+    verify_only: bool = False,
+    max_batches: int | None = None,
+    ask=None,
+    max_revalidations: int | None = QUARANTINE_REVALIDATION_LIMIT,
+) -> dict:
     source = source.resolve()
     if not source.is_file():
         raise OperationalError("source_missing", f"input source is not a file: {source}")
@@ -4062,6 +4501,7 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
     batches = 0
     coverage = semantic_coverage(progress)
     recovery = RecoveryLedger(project)
+    earlier = {row_key(row) for row in recovery.open_quarantined("cast")}
     # Historical 0..cursor batches had structural hashes only. Reclassify that prefix under the semantic ledger before touching the next production batch.
     # A data problem quarantines only the offending chapter (semantic ledger only; the structural cursor never moves backwards).
     while int(coverage["next_chapter"]) < int(progress["next_chapter"]):
@@ -4090,6 +4530,10 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
                 "warnings": len(recovery.entries()),
             }
     replay_pending(project, chapters, progress, ambiguous, source_text, recovery, ask)
+    atomic_json(progress_path, progress)
+    revalidate_quarantines(
+        project, chapters, progress, ambiguous, source_text, recovery, ask, max_revalidations, earlier
+    )
     atomic_json(progress_path, progress)
     blocked = quarantined_chapter_names(progress)
     pending_rows = recovery.open_pending("cast")
@@ -4134,6 +4578,7 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
         "asset_hashes": asset_hashes(project, set(actors)),
         "scoped_audit": scoped_audit_attestation(load_scoped_audit(project)),
         "quarantined_chapters": quarantined_chapter_names(progress),
+        "empty_chapters": empty_chapter_names(progress),
     }
     atomic_json(project / MANIFEST_NAME, manifest)
     verify_frozen_cast(source, project)

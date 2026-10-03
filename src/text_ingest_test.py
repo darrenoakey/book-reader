@@ -6,7 +6,13 @@ chapters/ layout the rest of the pipeline consumes. No mocks, no services.
 import tempfile
 from pathlib import Path
 
-from src.text_ingest import chunk_paragraphs, extract_any, ingest_text, split_sections, strip_markdown
+from src.text_ingest import (
+    chunk_paragraphs,
+    extract_any,
+    ingest_text,
+    split_sections,
+    strip_markdown,
+)
 
 
 # ##################################################################

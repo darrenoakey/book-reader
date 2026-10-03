@@ -117,10 +117,19 @@ def command_prepare_cast(args: argparse.Namespace) -> int:
     installed = command_install(args)
     if installed:
         return installed
+    if args.plan_quarantines:
+        code = f'''\
+import json
+from pathlib import Path
+from src.cast_freeze import plan_quarantine_revalidation
+print(json.dumps(plan_quarantine_revalidation(Path({str(source)!r})), indent=2, sort_keys=True))
+'''
+        return run_venv([str(VENV_PYTHON), "-c", code])
+    limit = "QUARANTINE_REVALIDATION_LIMIT" if args.max_revalidations is None else repr(args.max_revalidations)
     code = f'''\
 from pathlib import Path
-from src.cast_freeze import prepare_cast
-print(prepare_cast(Path({str(source)!r}), verify_only={args.verify_only!r}, max_batches={args.max_batches!r}))
+from src.cast_freeze import QUARANTINE_REVALIDATION_LIMIT, prepare_cast
+print(prepare_cast(Path({str(source)!r}), verify_only={args.verify_only!r}, max_batches={args.max_batches!r}, max_revalidations={limit}))
 '''
     return run_venv([str(VENV_PYTHON), "-c", code])
 
@@ -296,6 +305,8 @@ def main(argv: list[str]) -> int:
     p_prepare.add_argument("source", help="Full EPUB, Markdown, or text input")
     p_prepare.add_argument("--verify-only", action="store_true", help="Verify an existing frozen cast manifest without inference or generation")
     p_prepare.add_argument("--max-batches", type=int, default=None, help="Process at most this many durable source batches, then exit cleanly")
+    p_prepare.add_argument("--max-revalidations", type=int, default=None, help="Retry at most this many open quarantine rows (exact source hash, bounded attempts per row) this pass")
+    p_prepare.add_argument("--plan-quarantines", action="store_true", help="Read-only: report which open quarantine rows are eligible, stale or exhausted; no inference or writes")
     p_prepare.set_defaults(func=command_prepare_cast)
 
     p_continue = sub.add_parser("continue", help="Resume sequential 480p hourly production to the established source EOF; never uploads")

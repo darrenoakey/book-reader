@@ -1,5 +1,6 @@
 """Real-filesystem behavior tests for the resilient data contract (no mocks)."""
 
+import hashlib
 import json
 import shutil
 import uuid
@@ -9,8 +10,17 @@ import pytest
 
 from src.audio_synth import plan_chapter
 from src.cast_freeze import ANCHOR_IDS, MANIFEST_NAME, PROGRESS_NAME, prepare_cast
-from src.character_analysis import apply_dedup_groups, merge_character_info, parse_json_response_strict
-from src.data_recovery import DataIssue, OperationalError, RecoveryLedger, load_json_store
+from src.character_analysis import (
+    apply_dedup_groups,
+    merge_character_info,
+    parse_json_response_strict,
+)
+from src.data_recovery import (
+    DataIssue,
+    OperationalError,
+    RecoveryLedger,
+    load_json_store,
+)
 from src.epub_extract import get_output_dir
 from src.hour_runner import chapter_order
 
@@ -59,12 +69,18 @@ def test_original49_and_62_with_malformed_neighbours_continue_and_block_freeze()
         progress = json.loads((project / PROGRESS_NAME).read_text())
         assert progress["next_chapter"] == 5 and progress["semantic_coverage"]["next_chapter"] == 5
         rows = RecoveryLedger(project).entries()
-        quarantined = {r["evidence"]["chapters"][0] for r in rows if r["stage"] == "cast"}
-        assert {"01-real49.txt", "02-empty.txt", "04-real62.txt", "05-José.txt"} <= quarantined
-        assert all(r["checkpoint"]["next_chapter"] >= 1 and r["evidence"]["error_type"] for r in rows)
+        quarantine_rows = [r for r in rows if r["severity"] == "quarantine"]
+        quarantined = {r["evidence"]["chapters"][0] for r in quarantine_rows}
+        # An empty chapter is a valid zero-coverage attestation with its exact hash, never a quarantine or freeze veto.
+        assert {"01-real49.txt", "04-real62.txt", "05-José.txt"} <= quarantined and "02-empty.txt" not in quarantined
+        assert progress["semantic_coverage"]["completed_batches"][1]["empty_chapters"] == {
+            "02-empty.txt": hashlib.sha256(b"   \n").hexdigest()
+        }
+        assert all(r["checkpoint"]["next_chapter"] >= 1 and r["evidence"]["error_type"] for r in quarantine_rows)
         # restart: no raise, no duplicate rows, still blocked
         again = prepare_cast(source, ask=bad_json_ask)
-        assert again["status"] == "blocked" and len(RecoveryLedger(project).entries()) == len(rows)
+        assert again["status"] == "blocked" and again["quarantined_chapters"] == result["quarantined_chapters"]
+        assert [r for r in RecoveryLedger(project).entries() if r["severity"] == "quarantine"] == quarantine_rows
     finally:
         shutil.rmtree(project, ignore_errors=True)
         source.unlink(missing_ok=True)
@@ -224,8 +240,69 @@ def test_replay_resolves_only_exact_scope_and_leaves_cursor(tmp_path: Path) -> N
     assert len(semantic_coverage(progress)["resolved_pending"]) == 1
 
 
+def test_replay_resolution_records_the_model_bindings_it_relied_on(tmp_path: Path) -> None:
+    import hashlib
+
+    from src.cast_freeze import (
+        SCOPED_AUDIT_NAME,
+        file_digest,
+        immutable_evidence_units,
+        replay_pending,
+        semantic_coverage,
+    )
+
+    chapter = tmp_path / "01-a.txt"
+    chapter.write_text("Young Ren smiled. Young bowed.", encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    quote = units[1]["quote"]
+    record = {
+        "chapter_sha256": units[1]["chapter_sha256"],
+        "quote_sha256": hashlib.sha256(quote.encode()).hexdigest(),
+        "label": "Young",
+        "span_start": 0,
+        "canonical": "young_ren",
+        "decision": "alias",
+        "confidence": 0.9,
+        "reason": "context",
+        "proof": {"literal": "shared_name_word"},
+    }
+    (tmp_path / SCOPED_AUDIT_NAME).write_text(json.dumps({"records": [record]}))
+    progress = {"registry": {"young_ren": {"name": "Young Ren"}}, "aliases": {}, "next_chapter": 1}
+    ledger = RecoveryLedger(tmp_path)
+    scope = {"source": ["01-a.txt"], "source_hash": {"01-a.txt": file_digest(chapter)}}
+    ledger.record(
+        "cast", "chapters 0-0:young", "pending_uncertain_living", "pending", severity="pending", evidence=scope
+    )
+
+    def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
+        out = []
+        for option in response_schema["properties"]["classifications"]["items"]["oneOf"]:
+            branches = option.get("oneOf", [option])
+            cid = branches[0]["properties"]["candidate_id"]["enum"][0]
+            row = next(line for line in prompt.splitlines() if line.startswith(cid + " label="))
+            statuses = {st: b["properties"] for b in branches for st in b["properties"]["status"]["enum"]}
+            status = next(iter(statuses)) if len(branches) == 1 else "non_character"
+            out.append(
+                {
+                    "candidate_id": cid,
+                    "status": status,
+                    "identity": statuses[status]["identity"]["enum"][0],
+                    "evidence_unit_ids": [row.split("witnesses: [")[1].split("]")[0]],
+                }
+            )
+        return json.dumps({"classifications": out})
+
+    summary = replay_pending(tmp_path, [chapter], progress, set(), chapter.read_text(), ledger, ask)
+    assert summary["resolved"] == 1
+    (entry,) = semantic_coverage(progress)["resolved_pending"]
+    (binding,) = entry["model_bindings"]
+    assert binding["label"] == "Young" and binding["canonical"] == "young_ren" and binding["proof"]
+    resolution = [r for r in ledger.entries() if r["severity"] == "resolved"]
+    assert resolution[0]["evidence"]["model_bindings"] == entry["model_bindings"]
+
+
 def test_quarantine_archives_raw_bytes_empty_code_and_invalid_unicode(tmp_path: Path) -> None:
-    from src.cast_freeze import recoverable_batches
+    from src.cast_freeze import empty_chapter_attestations, recoverable_batches
 
     empty = tmp_path / "01-empty.txt"
     empty.write_text("  \n", encoding="utf-8")
@@ -238,20 +315,26 @@ def test_quarantine_archives_raw_bytes_empty_code_and_invalid_unicode(tmp_path: 
         units += list(
             recoverable_batches(tmp_path, [empty, bad], index, progress, set(), "", ledger, bad_json_ask, None)
         )
-    assert all(u["quarantine"] for u in units)
+    assert units[0]["quarantine"] is None and units[0]["units"] == []
+    assert empty_chapter_attestations([empty]) == {"01-empty.txt": hashlib.sha256(b"  \n").hexdigest()}
+    assert units[1]["quarantine"] == ["02-bad.txt"]
     rows = [r for r in ledger.entries() if r["stage"] == "cast"]
-    assert [r["code"] for r in rows] == ["source_empty_chapter", "source_not_utf8"]
+    assert [r["code"] for r in rows] == ["source_not_utf8"]
     archive = [json.loads(line) for line in (tmp_path / "cast_preparation_rejections.jsonl").read_text().splitlines()]
     assert (
-        len(archive) == 2
-        and archive[1]["raw_chapter_sha256"]["02-bad.txt"] == rows[1]["evidence"]["raw_chapter_sha256"]["02-bad.txt"]
+        len(archive) == 1
+        and archive[0]["raw_chapter_sha256"]["02-bad.txt"] == rows[0]["evidence"]["raw_chapter_sha256"]["02-bad.txt"]
     )
-    assert rows[1]["evidence"]["archive_line"] == 1
-    assert archive[1]["evidence"]["invalid_bytes_hex"] == "e381"
+    assert rows[0]["evidence"]["archive_line"] == 0
+    assert archive[0]["evidence"]["invalid_bytes_hex"] == "e381"
 
 
 def test_programming_errors_are_not_quarantined_and_oversized_chapter_windows(tmp_path: Path) -> None:
-    from src.cast_freeze import PREPARATION_PROMPT_MAX_CHARS, recoverable_batches, unit_windows
+    from src.cast_freeze import (
+        PREPARATION_PROMPT_MAX_CHARS,
+        recoverable_batches,
+        unit_windows,
+    )
 
     chapter = tmp_path / "01-a.txt"
     chapter.write_text("Ren spoke.", encoding="utf-8")
@@ -271,3 +354,120 @@ def test_programming_errors_are_not_quarantined_and_oversized_chapter_windows(tm
     ]
     windows = unit_windows(units, {}, {})
     assert len(windows) > 1 and [u for w in windows for u in w] == units
+
+
+def legacy_quarantine_project(tmp_path: Path, texts: dict[str, bytes]) -> tuple[list[Path], dict, RecoveryLedger]:
+    """Real files plus a legacy-shaped quarantine ledger row and quarantined coverage entry per chapter."""
+    from src.cast_freeze import file_digest, semantic_coverage
+
+    chapters = []
+    for name, data in texts.items():
+        path = tmp_path / name
+        path.write_bytes(data)
+        chapters.append(path)
+    progress = {"registry": {}, "aliases": {}, "next_chapter": len(chapters), "completed_batches": []}
+    coverage = semantic_coverage(progress)
+    ledger = RecoveryLedger(tmp_path)
+    for index, path in enumerate(chapters):
+        digest = file_digest(path)
+        entry = {"start": index, "end": index + 1, "chapter_sha256": {path.name: digest}}
+        progress["completed_batches"].append({**entry, "quarantined": True})
+        coverage["completed_batches"].append({**entry, "ledger_sha256": "x", "quarantined": True})
+        # legacy shape: no source/source_hash, only chapters/raw_chapter_sha256 and a severity of quarantine
+        ledger.record(
+            "cast",
+            f"chapters {index}-{index}",
+            "cast_evidence_rejected",
+            "legacy rejection",
+            severity="quarantine",
+            evidence={"chapters": [path.name], "raw_chapter_sha256": {path.name: digest}, "hash": digest},
+        )
+    coverage["next_chapter"] = len(chapters)
+    (tmp_path / "cast_preparation_progress.json").write_text("{}", encoding="utf-8")
+    return chapters, progress, ledger
+
+
+def test_legacy_quarantines_revalidate_by_exact_hash_with_append_only_history(tmp_path: Path) -> None:
+    from src.cast_freeze import (
+        empty_chapter_names,
+        quarantined_chapter_names,
+        revalidate_quarantines,
+    )
+
+    chapters, progress, ledger = legacy_quarantine_project(
+        tmp_path, {"01-plain.txt": b"it rained all day.", "02-empty.txt": b"  \n", "03-bad.txt": b"Ren said \xe3\x81 x"}
+    )
+    before = (tmp_path / "data_recovery.jsonl").read_text()
+    summary = revalidate_quarantines(tmp_path, chapters, progress, set(), "", ledger, bad_json_ask)
+    assert summary["resolved"] == 2 and summary["open"] == 1 and summary["attempts"] == 3
+    # clean + empty chapters are attested; invalid UTF-8 stays quarantined with exact evidence, never blanket-accepted
+    assert quarantined_chapter_names(progress) == ["03-bad.txt"]
+    assert empty_chapter_names(progress) == {"02-empty.txt": hashlib.sha256(b"  \n").hexdigest()}
+    after = (tmp_path / "data_recovery.jsonl").read_text()
+    assert after.startswith(before)  # ledger history is append-only
+    rows = [json.loads(line) for line in after.splitlines()]
+    assert [r["severity"] for r in rows[3:]].count("resolved") == 2
+    assert {r["code"] for r in rows if r["severity"] == "quarantine"} == {
+        "cast_evidence_rejected",
+        "source_not_utf8",  # the fresh exact evidence of the still-undecodable chapter is appended, not overwritten
+    }
+    assert len(progress["semantic_coverage"]["superseded_quarantines"]) == 2
+    assert chapters[2].read_bytes() == b"Ren said \xe3\x81 x" and progress["next_chapter"] == 3
+    # Bounded: a persistent failure stops after the attempt limit, and resolved rows are never retried.
+    for _ in range(5):
+        revalidate_quarantines(tmp_path, chapters, progress, set(), "", RecoveryLedger(tmp_path), bad_json_ask)
+    final = RecoveryLedger(tmp_path)
+    open_rows = final.open_quarantined("cast")
+    assert {r["code"] for r in open_rows} == {"cast_evidence_rejected", "source_not_utf8"}
+    assert [len(final.attempts(r)) for r in open_rows] == [3, 3]
+    assert len([r for r in final.entries() if r["severity"] == "resolved"]) == 2
+
+
+def test_changed_source_bytes_are_stale_and_never_retried(tmp_path: Path) -> None:
+    from src.cast_freeze import quarantined_chapter_names, revalidate_quarantines
+
+    chapters, progress, ledger = legacy_quarantine_project(tmp_path, {"01-plain.txt": b"it rained all day."})
+    chapters[0].write_bytes(b"it rained all night.")
+    summary = revalidate_quarantines(tmp_path, chapters, progress, set(), "", ledger, bad_json_ask)
+    assert summary["stale"] == 1 and summary["attempts"] == 0 and summary["resolved"] == 0
+    assert quarantined_chapter_names(progress) == ["01-plain.txt"]
+
+
+def test_revalidation_call_limit_defers_remaining_rows(tmp_path: Path) -> None:
+    from src.cast_freeze import revalidate_quarantines
+
+    chapters, progress, ledger = legacy_quarantine_project(
+        tmp_path, {f"0{i}-plain.txt": f"it rained {i}.".encode() for i in range(1, 4)}
+    )
+    first = revalidate_quarantines(tmp_path, chapters, progress, set(), "", ledger, bad_json_ask, limit=1)
+    assert first["resolved"] == 1 and first["deferred"] == 2
+    second = revalidate_quarantines(tmp_path, chapters, progress, set(), "", RecoveryLedger(tmp_path), bad_json_ask)
+    assert second["resolved"] == 2 and not RecoveryLedger(tmp_path).open_quarantined("cast")
+
+
+def test_plan_reports_eligible_stale_without_writing(tmp_path: Path) -> None:
+    from src.cast_freeze import plan_quarantine_revalidation
+
+    source, project = make_project({"01-plain.txt": "it rained.", "02-other.txt": "it snowed."})
+    try:
+        prepare_cast(source, ask=bad_json_ask, max_batches=0)
+        chapters = sorted((project / "chapters").glob("0[12]-*.txt"))
+        ledger = RecoveryLedger(project)
+        for index, path in enumerate(chapters):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest() if index == 0 else "0" * 64
+            ledger.record(
+                "cast",
+                f"legacy {index}",
+                "cast_evidence_rejected",
+                "legacy",
+                severity="quarantine",
+                evidence={"chapters": [path.name], "raw_chapter_sha256": {path.name: digest}},
+            )
+        before = {p.name: p.read_bytes() for p in project.iterdir() if p.is_file()}
+        plan = plan_quarantine_revalidation(source, project)
+        assert plan["open_quarantine_rows"] == 2
+        assert plan["by_code"]["cast_evidence_rejected"] == {"eligible": 1, "stale": 1, "exhausted": 0}
+        assert before == {p.name: p.read_bytes() for p in project.iterdir() if p.is_file()}
+    finally:
+        shutil.rmtree(project, ignore_errors=True)
+        source.unlink(missing_ok=True)

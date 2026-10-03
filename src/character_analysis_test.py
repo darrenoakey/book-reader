@@ -1,7 +1,11 @@
 import tempfile
 from pathlib import Path
 
-from src.character_analysis import analyze_characters_sync, merge_character_info, parse_json_response
+from src.character_analysis import (
+    analyze_characters_sync,
+    merge_character_info,
+    parse_json_response,
+)
 
 
 # ##################################################################

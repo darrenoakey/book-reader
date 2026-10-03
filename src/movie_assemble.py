@@ -29,7 +29,11 @@ import tempfile
 from pathlib import Path
 
 from src.audio_synth import concat_wavs, wav_duration
-from src.movie_resolution import DEFAULT_RESOLUTION, SUPPORTED_RESOLUTIONS, movie_dimensions
+from src.movie_resolution import (
+    DEFAULT_RESOLUTION,
+    SUPPORTED_RESOLUTIONS,
+    movie_dimensions,
+)
 from src.title_page import TITLE_SECONDS
 
 FPS = 30

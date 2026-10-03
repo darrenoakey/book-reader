@@ -19,11 +19,13 @@ import hashlib
 import json
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
 
 LEDGER_NAME = "data_recovery.jsonl"
+REVALIDATION_ATTEMPT_LIMIT = 3
 EVIDENCE_LIMIT = 600
 EVIDENCE_MAX_DEPTH = 6
 EVIDENCE_MAX_ITEMS = 50
@@ -178,6 +180,26 @@ def error_code(error: BaseException) -> str:
     return error.code if isinstance(error, DataIssue) else type(error).__name__
 
 
+def row_key(row: dict) -> tuple[str, str, str]:
+    """Identity of one recorded row independent of its position: item, code and exact source hash digest."""
+    return (row["item_sha256"], row["code"], row.get("dedup_hash", ""))
+
+
+def row_scope(row: dict) -> tuple[object, object]:
+    """The exact source names and hashes a row recorded (current ``source``/``source_hash``, else legacy ``chapters``/``raw_chapter_sha256``)."""
+    evidence = row["evidence"] if isinstance(row["evidence"], dict) else {}
+    return (
+        evidence.get("source") or evidence.get("chapters"),
+        evidence.get("source_hash") or evidence.get("raw_chapter_sha256"),
+    )
+
+
+def _attempted_hashes(attempt_row: dict) -> object:
+    """The exact source hashes an attempt row was made against (its counter excluded)."""
+    recorded = attempt_row["evidence"].get("source_hash")
+    return recorded.get("exact") if isinstance(recorded, dict) else None
+
+
 def _row_key(row: dict) -> tuple[str, str, str, str, str]:
     return (
         row["stage"],
@@ -276,11 +298,16 @@ class RecoveryLedger:
         self._seen.add(key)
         return row
 
-    def open_pending(self, stage: str) -> list[dict]:
-        """Pending rows of a stage with no durable resolution row for the same item/code/source hash."""
+    def open_rows(self, stage: str, severities: tuple[str, ...] = ("pending", "quarantine")) -> list[dict]:
+        """Unresolved rows of a stage and severity with no durable resolution row for the same item/code/source hash."""
         rows = self.entries()
         resolved = {
-            (r["stage"], r["item_sha256"], r["evidence"].get("resolves_code"), r.get("dedup_hash", ""))
+            (
+                r["stage"],
+                r["item_sha256"],
+                r["evidence"].get("resolves_code"),
+                r["evidence"].get("resolves_dedup_hash", r.get("dedup_hash", "")),
+            )
             for r in rows
             if r["severity"] == "resolved"
         }
@@ -288,27 +315,109 @@ class RecoveryLedger:
             r
             for r in rows
             if r["stage"] == stage
-            and r["severity"] == "pending"
+            and r["severity"] in severities
             and (r["stage"], r["item_sha256"], r["code"], r.get("dedup_hash", "")) not in resolved
         ]
 
+    def open_pending(self, stage: str) -> list[dict]:
+        """Pending rows of a stage with no durable resolution row for the same item/code/source hash."""
+        return self.open_rows(stage, ("pending",))
+
+    def open_quarantined(self, stage: str) -> list[dict]:
+        """Quarantine rows of a stage with no durable resolution row for the same item/code/source hash."""
+        return self.open_rows(stage, ("quarantine",))
+
     def resolve(self, row: dict, outcome: str, detail: dict | None = None) -> dict:
-        """Append (never rewrite) the durable resolution of one pending row; history stays intact."""
-        evidence = row["evidence"] if isinstance(row["evidence"], dict) else {}
+        """Append (never rewrite) the durable resolution of one pending/quarantine row; history stays intact."""
+        names, hashes = row_scope(row)
         return self.record(
             row["stage"],
             row["item"],
-            "pending_resolved",
-            f"pending {row['code']} resolved: {outcome}",
+            f"{row['severity']}_resolved",
+            f"{row['severity']} {row['code']} resolved: {outcome}",
             severity="resolved",
             evidence={
-                "source": evidence.get("source"),
-                "source_hash": evidence.get("source_hash"),
+                "source": names,
+                "source_hash": hashes,
                 "resolves_code": row["code"],
+                "resolves_dedup_hash": row.get("dedup_hash", ""),
                 "outcome": outcome,
                 **(detail or {}),
             },
         )
+
+    def attempts(self, row: dict, rows: list[dict] | None = None) -> list[dict]:
+        """Durable replay-attempt rows for exactly this row's item, code and recorded source hashes."""
+        hashes = row_scope(row)[1]
+        return [
+            r
+            for r in (self.entries() if rows is None else rows)
+            if r["stage"] == row["stage"]
+            and r["severity"] == "replay_attempt"
+            and r["item_sha256"] == row["item_sha256"]
+            and r["evidence"].get("replays") == row["code"]
+            and _attempted_hashes(r) == hashes
+        ]
+
+    def record_attempt(self, row: dict, detail: dict | None = None) -> dict:
+        """Append the next bounded replay-attempt row for this row before any work is done (counts survive crashes)."""
+        names, hashes = row_scope(row)
+        number = len(self.attempts(row)) + 1
+        return self.record(
+            row["stage"],
+            row["item"],
+            f"{row['severity']}_replay_attempt:{row['code']}",  # code-qualified so sibling rows never dedupe each other
+            f"replay attempt {number}",
+            severity="replay_attempt",
+            evidence={
+                "replays": row["code"],
+                "source": names,
+                "source_hash": {"attempt": number, "exact": hashes},
+                **(detail or {}),
+            },
+        )
+
+    def revalidate(
+        self,
+        stage: str,
+        exact: Callable[[dict], bool],
+        retry: Callable[[dict], tuple[str, dict] | None],
+        *,
+        severities: tuple[str, ...] = ("quarantine",),
+        attempt_limit: int = REVALIDATION_ATTEMPT_LIMIT,
+        limit: int | None = None,
+        defer: Callable[[dict], bool] | None = None,
+    ) -> dict:
+        """Bounded exact-hash retry of every unresolved row of a stage; history is only ever appended to.
+
+        A row is retried only when ``exact(row)`` proves its recorded source still has its recorded hash, at most
+        ``attempt_limit`` times per row and ``limit`` attempts per call. ``retry(row)`` returns ``(outcome, detail)``
+        when the row is now validly handled (a durable resolution row is appended) or None when it still fails (the
+        row stays open with its exact evidence). Stale, exhausted and deferred rows (``defer(row)``, e.g. just recorded this
+        run) stay open and are counted.
+        """
+        summary = {"resolved": 0, "open": 0, "stale": 0, "exhausted": 0, "deferred": 0, "attempts": 0}
+        snapshot = self.entries()
+        for row in self.open_rows(stage, severities):
+            if not exact(row):
+                summary["stale"] += 1
+                summary["open"] += 1
+            elif len(self.attempts(row, snapshot)) >= attempt_limit:
+                summary["exhausted"] += 1
+                summary["open"] += 1
+            elif (limit is not None and summary["attempts"] >= limit) or (defer is not None and defer(row)):
+                summary["deferred"] += 1
+                summary["open"] += 1
+            else:
+                snapshot.append(self.record_attempt(row))
+                summary["attempts"] += 1
+                result = retry(row)
+                if result is None:
+                    summary["open"] += 1
+                else:
+                    self.resolve(row, result[0], result[1])
+                    summary["resolved"] += 1
+        return summary
 
     def record_error(
         self,

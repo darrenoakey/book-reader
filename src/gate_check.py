@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MOVIE_PATHS = {
     "run",
+    "src/m4b_assemble_test.py",
     "src/movie_assemble.py",
     "src/movie_resolution.py",
     "src/movie_assemble_test.py",
@@ -124,6 +125,7 @@ IMPACT: dict[str, tuple[str, ...]] = {
         "src/title_page_test.py",
     ),
     "src/movie_assemble_test.py": ("src/movie_assemble_test.py",),
+    "src/m4b_assemble_test.py": ("src/m4b_assemble_test.py",),
     "src/movie_resolution.py": ("src/movie_resolution_test.py", "src/movie_assemble_test.py"),
     "src/movie_resolution_test.py": ("src/movie_resolution_test.py",),
     "src/pipeline.py": ("src/movie_resolution_test.py", "src/pipeline_test.py"),

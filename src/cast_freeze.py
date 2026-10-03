@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import collections
+import difflib
 import hashlib
 import json
 import re
@@ -674,6 +676,574 @@ def verify_proposed_living_entities(batch_units: list[dict], discoveries: list[d
 
 
 # ##################################################################
+# proposed-new identity review
+# before any proposed new identity is accepted, a native schema-bound review of each exact mention against the full bounded scene and the registry's prior facts decides existing:<id>, distinct_living_identity, nonidentity_fragment or uncertain. The raw verdict, witnesses and scope are persisted; existing/fragment verdicts become mention-scoped audit decisions; uncertain fails closed.
+NEW_IDENTITY_AUDIT_NAME = "new-identity-review-audit.json"
+NEW_IDENTITY_MENTIONS_PER_CALL = 4
+DISTINCT_VERDICT = "distinct_living_identity"
+FRAGMENT_VERDICT = "nonidentity_fragment"
+SAME_PROVISIONAL = "same_provisional:"
+
+
+def load_new_identity_audit(project: Path) -> list[dict]:
+    path = project / NEW_IDENTITY_AUDIT_NAME
+    return load_object(path, "new-identity review audit").get("records", []) if path.is_file() else []
+
+
+NEW_IDENTITY_REASKS = 2
+ROLE_WORDS = {"mom", "mum", "dad", "father", "mother", "uncle", "aunt", "sister", "brother", "boss", "master", "teacher", "captain", "king", "queen", "lord", "lady", "sir", "madam", "doctor", "guard", "elder", "boy", "girl", "man", "woman"}
+
+COMMON_STOP_WORDS = frozenset({
+    "a", "about", "above", "after", "again", "against", "all", "also", "am", "an",
+    "and", "another", "any", "are", "as", "at", "be", "because", "been", "before",
+    "being", "below", "between", "both", "but", "by", "can", "could", "did", "do",
+    "does", "doing", "down", "during", "each", "even", "every", "few", "for", "from",
+    "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself",
+    "him", "himself", "his", "how", "if", "in", "into", "is", "it", "its", "itself",
+    "just", "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of",
+    "off", "on", "once", "only", "or", "other", "our", "ours", "ourselves", "out",
+    "over", "own", "same", "she", "should", "so", "some", "such", "than", "that",
+    "the", "their", "theirs", "them", "themselves", "then", "there", "these", "they",
+    "this", "those", "through", "to", "too", "under", "until", "up", "very", "was",
+    "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why",
+    "will", "with", "would", "you", "your", "yours", "yourself", "yourselves",
+})
+
+CONTENT_ANCHOR_STOP_WORDS = frozenset({
+    "about", "above", "after", "again", "against", "all", "also", "among", "and",
+    "another", "any", "are", "back", "because", "been", "before", "being", "between",
+    "both", "came", "come", "could", "did", "does", "doing", "down", "during", "each",
+    "even", "every", "first", "from", "good", "great", "had", "has", "have", "having",
+    "here", "into", "just", "know", "like", "made", "make", "many", "more", "most",
+    "much", "must", "never", "only", "other", "over", "said", "same", "should", "some",
+    "still", "such", "than", "that", "the", "their", "them", "then", "there", "these",
+    "they", "this", "those", "through", "time", "under", "very", "well", "were", "what",
+    "when", "where", "which", "while", "who", "whom", "will", "with", "would", "your",
+    # generic descriptive words in character profiles
+    "look", "voice", "male", "female", "young", "adult", "companion", "character",
+    "person", "facts", "prior", "general", "name", "none", "true", "false",
+})
+
+
+def provisional_plausible(label: str, other: str) -> bool:
+    """A provisional same-person link is only offered between lexically continuous names (shared non-stop token, near spelling) or when both labels are role/kinship forms; unrelated names (Han vs Sora) or ordinary stop words (than vs Han) are never options."""
+    a, b = label.casefold().strip(), other.casefold().strip()
+    if a in COMMON_STOP_WORDS or b in COMMON_STOP_WORDS:
+        return False
+    tokens_a = {t for t in re.findall(r"\w+", a) if t not in COMMON_STOP_WORDS}
+    tokens_b = {t for t in re.findall(r"\w+", b) if t not in COMMON_STOP_WORDS}
+    if tokens_a & tokens_b or (tokens_a & ROLE_WORDS and tokens_b & ROLE_WORDS):
+        return True
+    # A high typo threshold admits Jun/June and Lou/Lu but not coincidental
+    # multi-word overlap or substring matching.
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.8
+
+
+NEW_IDENTITY_VARIANT_REFS = 6
+NEW_IDENTITY_VARIANT_SCENE_CHARS = 600
+
+
+def provisional_variant_refs(candidates: list[dict], classifications: list[dict], references: dict, units_by_id: dict) -> dict[str, list[dict]]:
+    """Per new-root candidate id, the other candidates the primary classification (or a source audit) already maps known->that root, each with its literally verified mention units. Registry-owned labels are never provisional; a chain is followed to its root with a visited set so a cycle or a chain that does not end at a root yields nothing; a label that does not literally occur at its recorded span is dropped."""
+    by_id = {candidate["id"]: candidate for candidate in candidates}
+    record_by_id = {item["candidate_id"]: item for item in classifications}
+
+    def direct_target(candidate: dict) -> str | None:
+        item = record_by_id.get(candidate["id"])
+        target = item["identity"] if item and item["status"] == "known" else candidate.get("audited_target")
+        return target if target in by_id and target != candidate["id"] else None
+
+    variants: dict[str, list[dict]] = {}
+    for candidate in candidates:
+        if candidate.get("known_owner") or normalized_id(candidate["label"]) == "":
+            continue
+        seen, root = {candidate["id"]}, direct_target(candidate)
+        while root is not None and direct_target(by_id[root]) is not None and root not in seen:
+            seen.add(root)
+            root = direct_target(by_id[root])
+        root_item = record_by_id.get(root) if root else None
+        if root is None or root in seen or by_id[root].get("known_owner") or normalized_id(by_id[root]["label"]) == normalized_id(candidate["label"]) or (root_item and root_item["status"] != "new"):
+            continue
+        mention_units = []
+        for ref_id in candidate["ref_ids"]:
+            reference = references[ref_id]
+            unit = units_by_id[reference["unit_id"]]
+            if unit["quote"][reference["start"] : reference["start"] + len(reference["label"])] == reference["label"]:
+                mention_units.append((unit, reference))
+        if mention_units:
+            variants.setdefault(root, []).append({"candidate": candidate, "mentions": mention_units})
+    return variants
+
+
+def extract_owner_profile_facts(entry: dict) -> list[tuple[str, str]]:
+    fields: list[tuple[str, str]] = []
+    if "bio" in entry and isinstance(entry["bio"], str):
+        fields.append(("bio", entry["bio"]))
+    if "look" in entry and isinstance(entry["look"], str):
+        fields.append(("look", entry["look"]))
+    facts = entry.get("facts")
+    if isinstance(facts, dict):
+        for k, v in sorted(facts.items()):
+            if isinstance(v, list):
+                fields.append((f"facts.{k}", " ".join(str(x) for x in v)))
+            elif isinstance(v, str):
+                fields.append((f"facts.{k}", v))
+    elif isinstance(facts, list):
+        fields.append(("facts", " ".join(str(x) for x in facts)))
+    source_facts = entry.get("source_facts")
+    if isinstance(source_facts, str):
+        fields.append(("source_facts", source_facts))
+    elif isinstance(source_facts, list):
+        fields.append(("source_facts", " ".join(str(x) for x in source_facts)))
+    return fields
+
+
+def registry_name_words(registry: dict, aliases: dict | None = None) -> set[str]:
+    names = set(ROLE_WORDS)
+    for owner_id, entry in registry.items():
+        names.update(re.findall(r"[a-z]+", owner_id.casefold()))
+        if isinstance(entry, dict) and "name" in entry:
+            names.update(re.findall(r"[a-z]+", str(entry["name"]).casefold()))
+    if aliases:
+        for alias, target in aliases.items():
+            names.update(re.findall(r"[a-z]+", alias.casefold()))
+            names.update(re.findall(r"[a-z]+", target.casefold()))
+    return names
+
+
+def registry_anchor_counts(registry: dict, name_words: set[str]) -> dict[str, int]:
+    counts: dict[str, int] = collections.Counter()
+    for entry in registry.values():
+        if not isinstance(entry, dict):
+            continue
+        owner_words = set()
+        for _, text in extract_owner_profile_facts(entry):
+            words = {
+                w.casefold()
+                for w in re.findall(r"\b[a-zA-Z]{4,}\b", text)
+                if w.casefold() not in CONTENT_ANCHOR_STOP_WORDS and w.casefold() not in name_words
+            }
+            owner_words.update(words)
+        for w in owner_words:
+            counts[w] += 1
+    return counts
+
+
+def find_existing_owner_support(
+    label: str,
+    owner: str,
+    witness_units: list[dict],
+    registry: dict,
+    aliases: dict,
+) -> tuple[bool, dict | None]:
+    names = [registry[owner].get("name", owner), *(alias.replace("_", " ") for alias, target in aliases.items() if target == owner)]
+    for unit in witness_units:
+        for name in names:
+            if source_label_present(name, [unit]):
+                field = "name" if name == registry[owner].get("name") else "alias"
+                return True, {"type": "literal_witness", "owner_name": name, "owner_profile_field": field, "witness_unit_id": unit["id"]}
+
+    name_words = registry_name_words(registry, aliases) | set(re.findall(r"[a-z]+", label.casefold()))
+    counts = registry_anchor_counts(registry, name_words)
+    fields = extract_owner_profile_facts(registry[owner])
+    best_candidate: tuple[int, int, str, str, str] | None = None
+
+    for unit in witness_units:
+        unit_words = {
+            w.casefold()
+            for w in re.findall(r"\b[a-zA-Z]{4,}\b", unit["quote"])
+            if w.casefold() not in CONTENT_ANCHOR_STOP_WORDS and w.casefold() not in name_words
+        }
+        for field_name, field_text in fields:
+            field_words = {
+                w.casefold()
+                for w in re.findall(r"\b[a-zA-Z]{4,}\b", field_text)
+                if w.casefold() not in CONTENT_ANCHOR_STOP_WORDS and w.casefold() not in name_words
+            }
+            shared = unit_words & field_words
+            for anchor in shared:
+                owner_count = counts.get(anchor, 1)
+                if owner_count <= 2:
+                    cand = (owner_count, -len(anchor), anchor, field_name, unit["id"])
+                    if best_candidate is None or cand < best_candidate:
+                        best_candidate = cand
+
+    if best_candidate is not None:
+        owner_count, _neg_len, anchor, field_name, unit_id = best_candidate
+        return True, {
+            "type": "content_anchor",
+            "anchor": anchor,
+            "owner_profile_field": field_name,
+            "witness_unit_id": unit_id,
+            "owner_count": owner_count,
+        }
+    return False, None
+
+
+def is_apposition_mention(quote: str, label: str, name: str) -> bool:
+    """True when label and name appear in apposition (parenthetical, comma alias, or adjacent title/name)."""
+    l_esc = re.escape(label.strip())
+    n_esc = re.escape(name.strip())
+    patterns = [
+        rf"\b{l_esc}\b\s*\(\s*{n_esc}\b",
+        rf"\b{n_esc}\b\s*\(\s*{l_esc}\b",
+        rf"\b{l_esc}\b,\s*(?:also known as|known as|called|alias|aka|namely)\s+{n_esc}\b",
+        rf"\b{n_esc}\b,\s*(?:also known as|known as|called|alias|aka|namely)\s+{l_esc}\b",
+        rf"\b{l_esc}\b\s+(?:that is|aka|also known as|known as|called|alias)\s+{n_esc}\b",
+        rf"\b{n_esc}\b\s+(?:that is|aka|also known as|known as|called|alias)\s+{l_esc}\b",
+        rf"\b{l_esc}\b,\s*{n_esc}\b(?!\s+(?:and|or|nor)\b)",
+        rf"\b{n_esc}\b,\s*{l_esc}\b(?!\s+(?:and|or|nor)\b)",
+        rf"\b{l_esc}\s+{n_esc}\b",
+        rf"\b{n_esc}\s+{l_esc}\b",
+    ]
+    return any(re.search(pat, quote, re.IGNORECASE) for pat in patterns)
+
+
+def mention_unit_has_separate_owner_token(quote: str, label: str, name: str) -> bool:
+    """True if quote has own label and a separate owner token outside that label occurrence."""
+    label_matches = list(re.finditer(rf"(?<!\w){re.escape(label.strip())}(?!\w)", quote, re.IGNORECASE))
+    if not label_matches:
+        return False
+    m = label_matches[0]
+    masked = quote[: m.start()] + " " * (m.end() - m.start()) + quote[m.end() :]
+    return bool(re.search(rf"(?<!\w){re.escape(name.strip())}(?!\w)", masked, re.IGNORECASE))
+
+
+def are_enumerated_distinct_actors(quote: str, label_a: str, label_b: str) -> bool:
+    """True when two labels appear enumerated as distinct actors (e.g. coordinated with and/or/comma list)."""
+    a = re.escape(label_a.strip())
+    b = re.escape(label_b.strip())
+    patterns = [
+        rf"\b{a}\b\s+(?:and|or|nor|&)\s+\b{b}\b",
+        rf"\b{b}\b\s+(?:and|or|nor|&)\s+\b{a}\b",
+        rf"\b(?:both|either|between)\s+{a}\s+(?:and|or)\s+{b}\b",
+        rf"\b(?:both|either|between)\s+{b}\s+(?:and|or)\s+{a}\b",
+        rf"\b{a}\b\s+(?:as well as|along with|alongside|together with)\s+\b{b}\b",
+        rf"\b{b}\b\s+(?:as well as|along with|alongside|together with)\s+\b{a}\b",
+        rf"\b{a}\b\s*,\s*(?:and\s+|or\s+)?\b{b}\b",
+        rf"\b{b}\b\s*,\s*(?:and\s+|or\s+)?\b{a}\b",
+    ]
+    return any(re.search(pat, quote, re.IGNORECASE) for pat in patterns)
+
+
+def owner_support(label: str, owner: str, witness_units: list[dict], episode_units: list[dict] | None, registry: dict, aliases: dict) -> tuple[bool, dict | None]:
+    """Source/registry support for an existing owner: the cited units first, then (only when a continuous episode was reviewed) the mention's own episode. Provenance is exactly what find_existing_owner_support found, naming the real unit it came from."""
+    supported, provenance = find_existing_owner_support(label, owner, witness_units, registry, aliases)
+    if not supported and episode_units:
+        supported, provenance = find_existing_owner_support(label, owner, episode_units, registry, aliases)
+    return supported, provenance
+
+
+def review_verdict_error(label: str, verdict: str, witnesses: list[str], candidate: dict, plausible: dict, registry: dict, aliases: dict, units_by_id: dict, mention_unit: dict, episode_units: list[dict] | None = None) -> str | None:
+    """Why a review verdict is invalid, or None. Witnesses must carry the label's own mention; an existing target needs its own source/registry support (cited units, or the mention's own reviewed episode) and may not be a distinct participant of the same quote."""
+    witness_units = [units_by_id[w] for w in witnesses]
+    # Every verdict—including nonidentity_fragment—must cite this exact label's
+    # immutable span. A shorter adjacent form cannot turn a source-introduced
+    # full name into prose merely by being the sole witness.
+    if not source_label_present(label, witness_units):
+        return "new-identity review lacks own-label witness"
+    if verdict.startswith(SAME_PROVISIONAL):
+        target = plausible[verdict[len(SAME_PROVISIONAL) :]]
+        own_units = {ref_id.rsplit("n", 1)[0] for ref_id in candidate["ref_ids"]}
+        if not source_label_present(label, witness_units) or not source_label_present(target["label"], witness_units) or not own_units.intersection(witnesses):
+            return f"new-identity review lacks literal witnesses for same as {target['label']!r}"
+        if target.get("known_owner") or target.get("audited_target"):
+            return f"new-identity review cannot chain provisional into existing {target['label']!r}"
+        relevant_units = [*witness_units, mention_unit]
+        if any(are_enumerated_distinct_actors(unit["quote"], label, target["label"]) for unit in relevant_units):
+            return f"new-identity review links {label!r} to {target['label']!r}, enumerated distinct actors of the same scene"
+    if verdict.startswith("existing:"):
+        owner = verdict.split(":", 1)[1]
+        names = [registry[owner].get("name", owner), *(alias.replace("_", " ") for alias, target in aliases.items() if target == owner)]
+        if not source_label_present(label, witness_units):
+            return f"new-identity review lacks own-mention witness for existing {owner!r}"
+        supported, _ = owner_support(label, owner, witness_units, episode_units, registry, aliases)
+        if not supported:
+            return f"new-identity review lacks source/registry support for existing {owner!r}"
+        for name in names:
+            if mention_unit_has_separate_owner_token(mention_unit["quote"], label, name):
+                is_approved = aliases.get(normalized_id(label)) == owner or aliases.get(label.casefold()) == owner or normalized_id(label) == normalized_id(registry[owner].get("name", owner))
+                if not is_approved and not is_apposition_mention(mention_unit["quote"], label, name):
+                    return f"new-identity review maps to {owner!r}, a distinct participant of the same scene"
+    return None
+
+
+def review_proposed_identities(project: Path, units: list[dict], classifications: list[dict], candidates: list[dict], progress: dict, ask) -> bool:
+    """Review every candidate classified new, mention by mention. Returns True when scoped audit decisions were written and classification must be redone."""
+    registry, aliases = progress["registry"], progress["aliases"]
+    candidate_by_id = {candidate["id"]: candidate for candidate in candidates}
+    proposed = [candidate_by_id[item["candidate_id"]] for item in classifications if item["status"] == "new"]
+    if not proposed:
+        return False
+    references = immutable_name_references(units)
+    units_by_id = {unit["id"]: unit for unit in units}
+    order = [unit["id"] for unit in units]
+    audit = load_new_identity_audit(project)
+    by_scope = {(r["chapter_sha256"], r["quote_sha256"], r["label"], r["span_start"]): r for r in audit}
+    scoped_records = load_scoped_audit(project)
+    wrote_scoped = False
+    final_verdicts: dict[str, set[str]] = {}
+    variants_by_root = provisional_variant_refs(candidates, classifications, references, units_by_id)
+    for candidate in proposed:
+        label = candidate["label"]
+        provisional = [other for other in proposed if other is not candidate]
+        provisional_ids = {other["id"]: other for other in provisional}
+        # Do not offer the full roster merely because generic adjudication found it: a
+        # new label can map to an established owner only when its spelling/role form
+        # has a plausible lexical-continuity path to that owner's canonical name or
+        # approved aliases. Scene evidence then proves (rather than creates) it.
+        owners = [owner for owner in adjudication_owners(label, registry, aliases) if any(provisional_plausible(label, name) for name in [registry[owner].get("name", owner), *(alias.replace("_", " ") for alias, target in aliases.items() if target == owner)])]
+        # Each mention is scoped by its own immutable reference label (several spellings can share one
+        # normalized candidate key); the candidate label only seeds roster/provisional plausibility.
+        mentions: dict[tuple[str, str, str, int], dict] = {}
+        for ref_id in candidate["ref_ids"]:
+            unit = units_by_id[references[ref_id]["unit_id"]]
+            mentions.setdefault(mention_scope(unit, references[ref_id]), unit)
+        verdicts: dict[tuple[str, str, str, int], str] = {}
+        todo = []
+        for scope in mentions:
+            cached = by_scope.get(scope)
+            if cached and cached.get("owners") == owners and (cached["verdict"] == DISTINCT_VERDICT or (cached["verdict"].startswith(SAME_PROVISIONAL) and cached["verdict"][len(SAME_PROVISIONAL) :] in provisional_ids)):
+                verdicts[scope] = cached["verdict"]
+            else:
+                todo.append(scope)
+        # A root is also a plausible target when one of its source-provisional variant refs (a short form the primary
+        # classification already mapped to it) is lexically continuous with this label; the variant only widens context,
+        # never the target (links always end at the independently introduced root).
+        plausible = {other_id: other for other_id, other in provisional_ids.items() if provisional_plausible(label, other["label"]) or any(provisional_plausible(label, variant["candidate"]["label"]) for variant in variants_by_root.get(other_id, []))}
+        # This root's own variant refs: same-participant context nearest its mentions, bounded.
+        own_positions = [order.index(unit["id"]) for unit in mentions.values()]
+        variant_refs = sorted(((unit, reference, variant["candidate"]) for variant in variants_by_root.get(candidate["id"], []) for unit, reference in variant["mentions"]), key=lambda row: (min(abs(order.index(row[0]["id"]) - position) for position in own_positions), order.index(row[0]["id"]), row[1]["start"]))[:NEW_IDENTITY_VARIANT_REFS]
+        base_options = [*(f"existing:{owner}" for owner in owners), *(f"{SAME_PROVISIONAL}{other_id}" for other_id in plausible), DISTINCT_VERDICT, FRAGMENT_VERDICT, "uncertain"]
+
+        def build_review(chunk, options, note="", scene_chars=None, label=label, owners=owners, plausible=plausible, mentions=mentions, variant_refs=variant_refs):
+            ids = [f"m{index}" for index in range(len(chunk))]
+            item = {"type": "object", "properties": {"mention_id": {"type": "string", "enum": ids}, "verdict": {"type": "string", "enum": options}, "witness_unit_ids": {"type": "array", "minItems": 0, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "enum": order}}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "reason": {"type": "string", "minLength": 1, "maxLength": 300}}, "required": ["mention_id", "verdict", "witness_unit_ids", "confidence", "reason"], "additionalProperties": False}
+            schema = {"type": "object", "properties": {"mentions": {"type": "array", "minItems": len(chunk), "maxItems": len(chunk), "items": item}}, "required": ["mentions"], "additionalProperties": False}
+            compact = scene_chars is not None
+            # Compact mode renders every mention's scene AND every source-provisional variant ref's scene as merged
+            # continuous episodes (each unit once); the first pass keeps per-mention scenes and gives variant refs their own compact episodes.
+            mention_positions = [order.index(mentions[scope]["id"]) for scope in chunk] if compact else []
+            variant_positions = [order.index(unit["id"]) for unit, _, _ in variant_refs]
+            episode_ranges, episode_of = scene_episode_ranges(units_by_id, order, [*mention_positions, *variant_positions], scene_chars if compact else NEW_IDENTITY_VARIANT_SCENE_CHARS)
+            episodes = [" ".join(f"[{order[index]}] {units_by_id[order[index]]['quote']}" for index in range(low, high + 1)) for low, high in episode_ranges]
+            if compact:
+                rows = [f"{mention_id} [{mentions[scope]['chapter']}] unit {mentions[scope]['id']} label {scope[2]!r} at char {scope[3]} mention: {mentions[scope]['quote']}\n   scene: episode E{episode_of[index] + 1}" for index, (mention_id, scope) in enumerate(zip(ids, chunk, strict=True))]
+            else:
+                rows = [f"{mention_id} [{mentions[scope]['chapter']}] unit {mentions[scope]['id']} mention: {mentions[scope]['quote']}\n   bounded scene (unit ids in brackets): {bounded_scene_with_ids(units_by_id, order, order.index(mentions[scope]['id']))}" for mention_id, scope in zip(ids, chunk, strict=True)]
+            scene_block = "CONTINUOUS SOURCE EPISODES (unit ids in brackets; each unit appears once):\n" + "\n".join(f"E{index + 1}: {text}" for index, text in enumerate(episodes)) + "\n" if episodes else ""
+            if variant_refs:
+                scene_block += f"SOURCE-PROVISIONAL VARIANT REFS (other labels the primary classification already mapped to {label!r}; same-participant CONTEXT only, never proof of a verdict and never a target):\n" + "\n".join(f"V{index + 1} label {reference['label']!r} ({variant['id']}) unit {unit['id']} at char {reference['start']} mention: {unit['quote']}\n   scene: episode E{episode_of[len(mention_positions) + index] + 1}" for index, (unit, reference, variant) in enumerate(variant_refs)) + "\n"
+            episode_units = {scope: [units_by_id[order[index]] for index in range(episode_ranges[episode_of[position_index]][0], episode_ranges[episode_of[position_index]][1] + 1)] for position_index, scope in enumerate(chunk)} if compact else {}
+            live_owners = [owner for owner in owners if f"existing:{owner}" in options]
+            live_provisional = [other for other in plausible.values() if f"{SAME_PROVISIONAL}{other['id']}" in options]
+            episode_clause = ' In a CONTINUOUS SOURCE EPISODES review the owner\'s name or profile anchor may also come from any unit of the mention\'s own episode (cite it when you can). ' if compact else ''
+            prompt = f"The label {label!r} was proposed as a NEW character identity. For each exact mention decide, from its full bounded scene and the registry's prior facts only (never from spelling or sound similarity, never generalising across mentions): existing:<id> when this exact span names or addresses that already-registered character (including a misspelling, nickname, title form, or a name merged with an adjacent word or hesitation); distinct_living_identity when it names a living individual or creature that is a different person from every registered character; nonidentity_fragment when the span is a prose fragment, a sentence-initial/hesitation/verb-bearing run of words, an equipment/skill/place/group name or otherwise not a stable actor name; same_provisional:<candidate> when this exact span is the same living individual as another proposed-new candidate listed below (a spelling variant, typo or short form of that candidate's own name proven by the scene, never by similarity alone) and not any registered character; No existing match is NOT the same as nonliving or uncertain: when the source introduces a named living individual (it acts, speaks, is addressed or is described as a person or creature) and no registered candidate credibly owns the span, that supports distinct_living_identity; nonidentity_fragment is only for spans that are not a living actor's name; uncertain only when the source leaves genuinely open whether the span is a living individual or which owner it belongs to. Each mention's own unit is attached automatically as the span's own-source witness. Cite 0-3 ADDITIONAL witness unit IDs only where they prove the verdict; existing:<id> and same_provisional:<candidate> must cite at least one unit, and the owner's name/facts (existing) or the target candidate's label literally (same_provisional) must appear in the units cited together with the mention's own unit. {episode_clause}Give honest confidence.\nOther proposed-new candidates: {'; '.join(f'{other['id']}={other['label']!r}' for other in live_provisional) or '(none)'}\nRegistered candidates: {'; '.join(f'{owner}={registry[owner].get('name', owner)!r}' for owner in live_owners) or '(none)'}\nCanonical prior facts:\n{owner_prior_facts(registry, live_owners, label)}\n{note}{scene_block}MENTIONS:\n" + "\n".join(rows)
+            return prompt, schema, ids, episode_units
+
+        def review_chunk(chunk, options, note="", scene_chars=None, label=label, candidate=candidate, mentions=mentions, plausible=plausible):
+            prompt, schema, ids, episode_units = build_review(chunk, options, note, scene_chars)
+            if len(prompt) > PREPARATION_PROMPT_MAX_CHARS:
+                raise RuntimeError(f"new-identity review prompt exceeds native context budget for {label!r}")
+            raw = ask(prompt, max_tokens=min(NATIVE_RESERVED_OUTPUT_TOKENS, max(1500, 200 + REVIEW_OUTPUT_TOKENS_PER_MENTION * len(chunk))), max_attempts=1, response_schema=schema)
+            value = json.loads(raw)
+            returned = value.get("mentions") if isinstance(value, dict) else None
+            if not isinstance(returned, list) or len(returned) != len(ids) or {r.get("mention_id") for r in returned if isinstance(r, dict)} != set(ids):
+                raise RuntimeError(f"new-identity review omitted or duplicated mentions for {label!r}")
+            out = []
+            for result in returned:
+                scope = chunk[ids.index(result["mention_id"])]
+                verdict, selected = result["verdict"], result["witness_unit_ids"]
+                if verdict not in options or not isinstance(selected, list) or not set(selected) <= set(order):
+                    raise RuntimeError(f"new-identity review returned an invalid verdict for {label!r}")
+                # The mention's own unit is deterministic input, never a model choice: bind it to the exact
+                # immutable reference (label bytes at the recorded span) and attach it as a witness.
+                own = mentions[scope]
+                if own["quote"][scope[3] : scope[3] + len(scope[2])] != scope[2]:
+                    raise RuntimeError(f"immutable candidate reference for {scope[2]!r} does not match its source span")
+                witnesses = [own["id"], *dict.fromkeys(w for w in selected if w != own["id"])]
+                error = review_verdict_error(scope[2], verdict, witnesses, candidate, plausible, registry, aliases, units_by_id, own, episode_units.get(scope))
+                episode_support = None
+                if not error and verdict.startswith("existing:"):
+                    # support found only in the mention's own reviewed episode keeps its exact unit as a recorded witness
+                    _, prov = owner_support(scope[2], verdict.split(":", 1)[1], [units_by_id[w] for w in witnesses], episode_units.get(scope), registry, aliases)
+                    if prov and prov["witness_unit_id"] not in witnesses:
+                        episode_support = prov["witness_unit_id"]
+                        witnesses = [*witnesses, episode_support]
+                if not error and verdict.startswith((SAME_PROVISIONAL, "existing:")) and not selected and episode_support is None and not (verdict.startswith("existing:") and episode_units.get(scope)):
+                    error = f"new-identity review cites no support for {verdict}"
+                result = {**result, "witness_unit_ids": witnesses, "selected_witness_unit_ids": selected, "episode_support_unit_id": episode_support}
+                out.append((scope, result, error))
+            return out
+
+        def record_result(scope, result, owners=owners, verdicts=verdicts):
+            verdict, witnesses = result["verdict"], result["witness_unit_ids"]
+            if result["confidence"] < ADJUDICATION_MIN_CONFIDENCE and verdict != "uncertain":
+                verdict = "uncertain"
+            record = {"chapter_sha256": scope[0], "quote_sha256": scope[1], "label": scope[2], "span_start": scope[3], "verdict": verdict, "witness_unit_ids": witnesses, "own_source_witness": {"unit_id": witnesses[0], "provenance": "immutable_candidate_reference", "label": scope[2], "span_start": scope[3]}, "confidence": float(result["confidence"]), "reason": result["reason"], "owners": list(owners), "raw_review": {"verdict": result["verdict"], "witness_unit_ids": result["selected_witness_unit_ids"], "confidence": result["confidence"], "reason": result["reason"]}}
+            if result.get("episode_support_unit_id"):
+                record["episode_support_unit_id"] = result["episode_support_unit_id"]
+            if verdict.startswith("existing:"):
+                owner = verdict.split(":", 1)[1]
+                witness_units = [units_by_id[w] for w in witnesses]
+                _, prov = find_existing_owner_support(scope[2], owner, witness_units, registry, aliases)
+                if prov:
+                    record["provenance"] = prov
+                    record["witness"] = prov["witness_unit_id"]
+                    record["owner_profile_field"] = prov["owner_profile_field"]
+                    if prov.get("anchor"):
+                        record["anchor"] = prov["anchor"]
+            prior = by_scope.get(scope)
+            if prior:
+                record["history"] = [*prior.get("history", []), {key: prior[key] for key in ("verdict", "confidence", "reason", "owners", "provenance", "witness", "owner_profile_field", "anchor") if key in prior}]
+                audit[:] = [r for r in audit if r is not prior]
+            audit.append(record)
+            by_scope[scope] = record
+            verdicts[scope] = verdict
+
+        def correct_mention(scope, removed, error, context_note="", scene_chars=None, label=label, base_options=base_options, review_chunk=review_chunk):
+            """Bounded correction shared by the ordinary and the consistency review: re-ask this one mention with every invalid target removed from the options (never supply aliases by hand); still invalid after the bounded reasks fails closed."""
+            result = None
+            for _ in range(NEW_IDENTITY_REASKS):
+                options = [option for option in base_options if option not in removed]
+                ((_, result, error),) = review_chunk([scope], options, f"{context_note}A previous answer for this exact mention was invalid ({error}); the mention's own unit is already attached.\n", scene_chars)
+                if not error:
+                    return result
+                removed.add(result["verdict"])
+            raise RuntimeError(f"{error} for {label!r} after bounded correction")
+
+        for offset in range(0, len(todo), NEW_IDENTITY_MENTIONS_PER_CALL):
+            chunk = todo[offset : offset + NEW_IDENTITY_MENTIONS_PER_CALL]
+            invalid: list[tuple] = []
+            for scope, result, error in review_chunk(chunk, base_options):
+                if error:
+                    invalid.append((scope, {result["verdict"]}, error))
+                else:
+                    record_result(scope, result)
+            for scope, removed, error in invalid:
+                record_result(scope, correct_mention(scope, removed, error))
+            atomic_json(project / NEW_IDENTITY_AUDIT_NAME, {"records": audit})
+        # Bounded normalization of a per-scope conflict: one label whose exact scopes got different verdict kinds.
+        # Source-validated existing / same_provisional scopes bind exactly (never collapsed onto each other); a
+        # distinct verdict among them is an independent identity only if a single contextual re-review that
+        # sees its siblings' verdicts reaffirms it with valid witnesses. Anything else fails closed.
+        def verdict_kind(verdict):
+            return "existing" if verdict.startswith("existing:") else "same_provisional" if verdict.startswith(SAME_PROVISIONAL) else verdict
+        kinds = {verdict_kind(v) for v in verdicts.values()}
+        if len(kinds - {FRAGMENT_VERDICT}) > 1 and "uncertain" not in kinds:
+            recheck = [scope for scope, v in verdicts.items() if v != FRAGMENT_VERDICT and not by_scope[scope].get("reconciled")]
+            if recheck:
+                summary = "; ".join(f"unit {mentions[scope]['id']} char {scope[3]}: {verdicts[scope]}" for scope in recheck)
+                note = f"CONSISTENCY REVIEW of conflicting verdicts for this one label across its exact mentions ({summary}). Decide every mention below once, on its own quote, direct owner anchors and continuous scene, never by majority and never by global alias. A mention may be existing:<id> or same_provisional only if its own scene proves that individual; distinct_living_identity only if its own scene proves a different living individual from every other verdict here. Genuine contextual splits between different people sharing a label are allowed when each scope is separately proven; otherwise choose uncertain.\n"
+                output_cap = max(1, (NATIVE_RESERVED_OUTPUT_TOKENS - 200) // REVIEW_OUTPUT_TOKENS_PER_MENTION)
+
+                def fits(group, width, output_cap=output_cap, base_options=base_options, note=note):
+                    return len(group) <= output_cap and len(build_review(group, base_options, note, width)[0]) <= PREPARATION_PROMPT_MAX_CHARS
+
+                # One logical review: all conflicts in one call over compacted continuous episodes, narrowing every
+                # scene uniformly until it fits. Only if even own-unit-only evidence (or the output budget) cannot hold
+                # every scope are scopes split across calls; each call still carries the full conflict summary and
+                # every scope is decided exactly once.
+                width = next((w for w in CONSISTENCY_SCENE_WIDTHS if fits(recheck, w)), None)
+                groups: list[list] = [recheck]
+                if width is None:
+                    width = ADJUDICATION_SCENE_CHARS
+                    groups, current = [], []
+                    for scope in recheck:
+                        if current and not fits([*current, scope], width):
+                            groups.append(current)
+                            current = []
+                        current.append(scope)
+                    groups.append(current)
+                for group in groups:
+                    for scope, result, error in review_chunk(group, base_options, note, width):
+                        if error:
+                            # an invalid verdict (e.g. same_provisional without literal dual-label witnesses) gets the same bounded correction as an ordinary review, keeping the consistency context
+                            result = correct_mention(scope, {result["verdict"]}, error, note, width)
+                        record_result(scope, result)
+                        by_scope[scope]["reconciled"] = True
+                atomic_json(project / NEW_IDENTITY_AUDIT_NAME, {"records": audit})
+        if "uncertain" in verdicts.values():
+            raise RuntimeError(f"proposed new identity {label!r} is uncertain for at least one mention: {sorted(set(verdicts.values()))}")
+        final_verdicts[candidate["id"]] = set(verdicts.values())
+        for scope in mentions:
+            verdict = verdicts[scope]
+            if verdict == DISTINCT_VERDICT or verdict.startswith(SAME_PROVISIONAL):
+                continue
+            record = by_scope[scope]
+            existing = verdict.startswith("existing:")
+            scoped = {"chapter_sha256": scope[0], "quote_sha256": scope[1], "label": scope[2], "span_start": scope[3], "canonical": verdict.split(":", 1)[1] if existing else "none", "decision": "alias" if existing else "non_character", "confidence": record["confidence"], "reason": f"[new-identity review {record['witness_unit_ids']}] {record['reason']}"[:300], "owners": list(owners), "raw_adjudication": {"source": "new_identity_review", "verdict": record["raw_review"]["verdict"], "confidence": record["raw_review"]["confidence"], "reason": record["raw_review"]["reason"]}}
+            if "provenance" in record:
+                scoped["provenance"] = record["provenance"]
+                if "anchor" in record:
+                    scoped["anchor"] = record["anchor"]
+                if "owner_profile_field" in record:
+                    scoped["owner_profile_field"] = record["owner_profile_field"]
+            prior = next((r for r in scoped_records if (r["chapter_sha256"], r["quote_sha256"], r["label"], r["span_start"]) == scope), None)
+            if prior:
+                scoped["history"] = [*prior.get("history", []), {key: prior[key] for key in ("decision", "canonical", "confidence", "reason", "owners") if key in prior}]
+                scoped_records[:] = [r for r in scoped_records if r is not prior]
+            scoped_records.append(scoped)
+            wrote_scoped = True
+        mention_scoped_audit_index(scoped_records)
+        atomic_json(project / SCOPED_AUDIT_NAME, {"records": scoped_records})
+    link_provisional_identities(proposed, classifications, final_verdicts, by_scope, references, units_by_id)
+    return wrote_scoped
+
+
+def resolve_provisional_chains_before_materialize(
+    records: list[dict],
+    candidates: list[dict],
+    registry: dict,
+) -> None:
+    """Resolve candidate chains before materialization. If a candidate targets another candidate that resolved to an established registry owner, re-route to that canonical owner; if it targets a candidate by normalized label, map to the candidate ID; if the target is invalid or not a valid discovery, fail closed."""
+    candidate_by_id = {c["id"]: c for c in candidates}
+    candidate_by_label_id = {normalized_id(c["label"]): c["id"] for c in candidates}
+    record_by_id = {item["candidate_id"]: item for item in records}
+    for item in records:
+        if item.get("status") != "known":
+            continue
+        identity = item.get("identity")
+        if identity in registry:
+            continue
+        if identity not in candidate_by_id and identity in candidate_by_label_id:
+            identity = candidate_by_label_id[identity]
+            item["identity"] = identity
+        if identity in candidate_by_id:
+            target_record = record_by_id.get(identity)
+            if target_record is None:
+                raise RuntimeError(f"candidate {item['candidate_id']!r} targets unrecorded candidate {identity!r}")
+            if target_record["status"] == "known" and target_record["identity"] in registry:
+                item["identity"] = target_record["identity"]
+            elif target_record["status"] == "new":
+                pass
+            else:
+                raise RuntimeError(f"candidate {item['candidate_id']!r} targets candidate {identity!r} which is not a living discovery ({target_record['status']})")
+        else:
+            raise RuntimeError(f"known classification has unknown identity target: {identity!r}")
+
+
+def link_provisional_identities(proposed: list[dict], classifications: list[dict], final_verdicts: dict[str, set[str]], by_scope: dict, references: dict, units_by_id: dict) -> None:
+    """Turn same_provisional verdicts into known->new links. The target must be independently introduced (its own mentions are reviewed distinct_living_identity), never itself a link (no chains or cycles), and every surviving mention of the linked label must agree."""
+    record_by_id = {item["candidate_id"]: item for item in classifications}
+    for candidate in proposed:
+        links = {verdict for verdict in final_verdicts[candidate["id"]] if verdict.startswith(SAME_PROVISIONAL)}
+        if not links:
+            continue
+        if len(links) > 1 or DISTINCT_VERDICT in final_verdicts[candidate["id"]]:
+            raise RuntimeError(f"proposed new identity {candidate['label']!r} has conflicting provisional verdicts: {sorted(final_verdicts[candidate['id']])}")
+        target_id = next(iter(links))[len(SAME_PROVISIONAL) :]
+        target_verdicts = final_verdicts[target_id]
+        if DISTINCT_VERDICT not in target_verdicts or any(verdict.startswith(SAME_PROVISIONAL) for verdict in target_verdicts) or any(verdict.startswith("existing:") for verdict in target_verdicts):
+            raise RuntimeError(f"provisional target {target_id!r} for {candidate['label']!r} is not an independently introduced identity")
+        candidate_scopes = {mention_scope(units_by_id[references[ref_id]["unit_id"]], references[ref_id]) for ref_id in candidate["ref_ids"]}
+        witnesses = sorted({w for scope in candidate_scopes if by_scope[scope]["verdict"] == next(iter(links)) for w in by_scope[scope]["witness_unit_ids"]})
+        item = record_by_id[candidate["id"]]
+        item["status"], item["identity"], item["evidence_unit_ids"] = "known", target_id, witnesses
+        candidate["audited_target"] = target_id
+
+
+# ##################################################################
 # scoped native adjudication
 # decides each pending mention separately (exact chapter/quote scope, never a global label alias), and persists the interpretive record before any mapping uses it.
 SCOPED_AUDIT_NAME = "mention-scoped-audit.json"
@@ -681,12 +1251,14 @@ ADJUDICATION_MENTIONS_PER_CALL = 12
 ADJUDICATION_MAX_ROUNDS = 4
 ADJUDICATION_MIN_CONFIDENCE = 0.7
 ADJUDICATION_SCENE_CHARS = 2400
+CONSISTENCY_SCENE_WIDTHS = (ADJUDICATION_SCENE_CHARS, 1200, 600, 300, 0)
+REVIEW_OUTPUT_TOKENS_PER_MENTION = 140
 ADJUDICATION_OWNER_FACT_CHARS = 700
 ADJUDICATION_FACTS_TOTAL_CHARS = 6000
 
 
-def bounded_scene(units_by_id: dict, order: list[str], position: int) -> str:
-    """Contiguous same-chapter source around one mention, grown alternately both ways within a fixed character budget; the mention's own unit is always whole."""
+def bounded_scene_range(units_by_id: dict, order: list[str], position: int, chars: int = ADJUDICATION_SCENE_CHARS) -> tuple[int, int]:
+    """Inclusive order positions of the contiguous same-chapter source around one mention, grown alternately both ways within a character budget; the mention's own unit is always whole."""
     chapter = units_by_id[order[position]]["chapter_sha256"]
     low = high = position
     used = len(units_by_id[order[position]]["quote"])
@@ -697,11 +1269,39 @@ def bounded_scene(units_by_id: dict, order: list[str], position: int) -> str:
             edge = (low if step < 0 else high) + step
             if 0 <= edge < len(order) and units_by_id[order[edge]]["chapter_sha256"] == chapter:
                 size = len(units_by_id[order[edge]]["quote"]) + 1
-                if used + size <= ADJUDICATION_SCENE_CHARS:
+                if used + size <= chars:
                     used += size
                     low, high = (edge, high) if step < 0 else (low, edge)
                     grew = True
-    return " ".join(units_by_id[order[index]]["quote"] for index in range(low, high + 1))
+    return low, high
+
+
+def bounded_scene(units_by_id: dict, order: list[str], position: int, with_ids: bool = False) -> str:
+    """Contiguous same-chapter source around one mention, grown alternately both ways within a fixed character budget; the mention's own unit is always whole."""
+    low, high = bounded_scene_range(units_by_id, order, position)
+    return " ".join((f"[{order[index]}] " if with_ids else "") + units_by_id[order[index]]["quote"] for index in range(low, high + 1))
+
+
+def scene_episode_ranges(units_by_id: dict, order: list[str], positions: list[int], chars: int) -> tuple[list[tuple[int, int]], list[int]]:
+    """Merge every position's bounded scene into maximal continuous same-chapter episodes (inclusive order ranges). Returns the ranges and, per input position, its episode index (no position is dropped)."""
+    ranges = [bounded_scene_range(units_by_id, order, position, chars) for position in positions]
+    merged: list[list[int]] = []
+    for low, high in sorted(set(ranges)):
+        if merged and low <= merged[-1][1] + 1 and units_by_id[order[low]]["chapter_sha256"] == units_by_id[order[merged[-1][0]]]["chapter_sha256"]:
+            merged[-1][1] = max(merged[-1][1], high)
+        else:
+            merged.append([low, high])
+    return [(low, high) for low, high in merged], [next(i for i, (low, high) in enumerate(merged) if low <= r_low and r_high <= high) for r_low, r_high in ranges]
+
+
+def scene_episodes(units_by_id: dict, order: list[str], positions: list[int], chars: int) -> tuple[list[str], list[int]]:
+    """Episode texts (each unit rendered once with its ID) and, per input position, its episode index."""
+    merged, episode_of = scene_episode_ranges(units_by_id, order, positions, chars)
+    return [" ".join(f"[{order[index]}] {units_by_id[order[index]]['quote']}" for index in range(low, high + 1)) for low, high in merged], episode_of
+
+
+def bounded_scene_with_ids(units_by_id: dict, order: list[str], position: int) -> str:
+    return bounded_scene(units_by_id, order, position, True)
 
 
 def owner_prior_facts(registry: dict, owners: list[str], label: str | None = None) -> str:
@@ -842,6 +1442,28 @@ def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[
 def discover_batch(project: Path, start: int, batch: list[Path], batch_units: list[dict[str, str]], batch_text: str, progress: dict, ambiguous: set[str], prompt: str | None = None, ask=None) -> tuple[list[dict], list[dict]]:
     del ambiguous, prompt
     ask = ask or ask_sync
+    for review_round in range(2):
+        records, candidates = collect_classifications(project, start, batch, batch_units, batch_text, progress, ask)
+        # The proposed-new review runs on the raw classification BEFORE materialization, which fails closed on unresolved named-person spans.
+        if not review_proposed_identities(project, batch_units, records, candidates, progress, ask):
+            break
+        if review_round == 1:
+            raise RuntimeError("proposed-new identity review did not converge")
+    resolve_provisional_chains_before_materialize(records, candidates, progress["registry"])
+    discoveries, classifications = materialize_classifications({"classifications": records}, batch_units, candidates, progress["registry"], progress["aliases"])
+    approved = verify_proposed_living_entities(batch_units, discoveries, ask)
+    rejected = {item["id"] for item in discoveries} - approved
+    if rejected:
+        for record in classifications:
+            candidate = next(item for item in candidates if item["id"] == record["candidate_id"])
+            candidate_id = normalized_id(candidate["label"])
+            if candidate_id in rejected or record["identity"] in {next(item["id"] for item in discoveries if item["id"] == rejected_id) for rejected_id in rejected}:
+                record["status"], record["identity"] = "non_character", "none"
+        discoveries = [item for item in discoveries if item["id"] in approved]
+    return discoveries, classifications
+
+
+def collect_classifications(project: Path, start: int, batch: list[Path], batch_units: list[dict[str, str]], batch_text: str, progress: dict, ask) -> tuple[list[dict], list[dict]]:
     for adjudication_round in range(ADJUDICATION_MAX_ROUNDS):
         candidates = candidate_coverage_ledger(batch_units, progress["registry"], progress["aliases"], load_scoped_audit(project))
         if not candidates:
@@ -883,17 +1505,7 @@ def discover_batch(project: Path, start: int, batch: list[Path], batch_units: li
             break
         if adjudication_round == ADJUDICATION_MAX_ROUNDS - 1:
             raise RuntimeError(f"scoped adjudication did not converge within {ADJUDICATION_MAX_ROUNDS} classification rounds")
-    discoveries, classifications = materialize_classifications({"classifications": records}, batch_units, candidates, progress["registry"], progress["aliases"])
-    approved = verify_proposed_living_entities(batch_units, discoveries, ask)
-    rejected = {item["id"] for item in discoveries} - approved
-    if rejected:
-        for record in classifications:
-            candidate = next(item for item in candidates if item["id"] == record["candidate_id"])
-            candidate_id = normalized_id(candidate["label"])
-            if candidate_id in rejected or record["identity"] in {next(item["id"] for item in discoveries if item["id"] == rejected_id) for rejected_id in rejected}:
-                record["status"], record["identity"] = "non_character", "none"
-        discoveries = [item for item in discoveries if item["id"] in approved]
-    return discoveries, classifications
+    return records, candidates
 
 
 # ##################################################################

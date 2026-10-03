@@ -971,6 +971,206 @@ def materialize_classifications(
 
 
 # ##################################################################
+# exact decision memo
+# Reuses only a syntactically valid response to byte-identical offered prompt/schema/options
+# inside one discovery transaction. Every caller still performs its normal source-anchor and
+# schema validation; malformed replies are deliberately never memoized.
+def memoized_model_ask(ask):
+    cache: dict[str, dict] = {}
+
+    def cached(prompt: str, **kwargs) -> str:
+        schema = kwargs.get("response_schema")
+        key = json_digest({"prompt": prompt, "max_tokens": kwargs.get("max_tokens"), "schema": schema})
+        prior = cache.get(key)
+        if prior is not None:
+            return prior["response"]
+        response = ask(prompt, **kwargs)
+        try:
+            parsed = json.loads(response)
+        except (TypeError, ValueError):
+            return response
+        if isinstance(parsed, dict):
+            cache[key] = {
+                "response": response,
+                "request_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "response_sha256": hashlib.sha256(response.encode("utf-8")).hexdigest(),
+                "schema_sha256": json_digest(schema),
+            }
+        return response
+
+    return cached
+
+
+# ##################################################################
+# partition classification chunk
+# Keeps a well-formed response's independently valid candidate rows when one row has unusable
+# citation/semantic evidence. The rejected row becomes typed pending evidence with a
+# program-derived own witness; malformed envelopes and unidentifiable rows still require the
+# bounded whole-chunk repair path because there is no safe exact-row attribution.
+def partition_classification_chunk(
+    value: object,
+    candidates: list[dict],
+    registry: dict,
+    aliases: dict,
+    all_candidates: list[dict],
+    units: list[dict],
+    pending: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"classifications"}
+        or not isinstance(value["classifications"], list)
+    ):
+        raise CastValidationError("classification chunk is not the exact object schema")
+    by_id = {candidate["id"]: candidate for candidate in candidates}
+    all_ids = {candidate["id"] for candidate in all_candidates}
+    supplied: dict[str, list[dict]] = {candidate_id: [] for candidate_id in by_id}
+    for record in value["classifications"]:
+        # A row for another known chunk candidate is attributable cardinality drift: retain
+        # the rows that belong here and hold the omitted expected row pending. An unknown ID
+        # or an object with no ID remains an unusable envelope requiring bounded repair.
+        if not isinstance(record, dict) or record.get("candidate_id") not in all_ids:
+            raise CastValidationError("classification chunk has an unidentifiable record")
+        if record["candidate_id"] in by_id:
+            supplied[record["candidate_id"]].append(record)
+    accepted: list[dict] = []
+    rejected: list[dict] = []
+    for candidate in candidates:
+        rows = supplied[candidate["id"]]
+        if len(rows) != 1:
+            reason = "classification omitted this candidate" if not rows else "classification duplicated this candidate"
+            rejected.append({"candidate": candidate, "reason": reason})
+        else:
+            local_pending: list[dict] = []
+            try:
+                accepted.extend(
+                    validate_classification_chunk(
+                        {"classifications": rows},
+                        [candidate],
+                        registry,
+                        aliases,
+                        all_candidates,
+                        units,
+                        local_pending,
+                    )
+                )
+                pending.extend(local_pending)
+                continue
+            except CastValidationError as error:
+                rejected.append({"candidate": candidate, "reason": str(error)})
+        # This is not a model decision: it is a conservative transport of the candidate's
+        # immutable first witness into the pending lane. It keeps ledger exact-once coverage
+        # while preventing a bad row from invalidating unrelated rows in the same response.
+        accepted.append(
+            {
+                "candidate_id": candidate["id"],
+                "status": "ambiguous",
+                "identity": "none",
+                "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]],
+            }
+        )
+    return accepted, rejected
+
+
+# ##################################################################
+# classification decision cache
+# Maps model-produced records through immutable candidate scopes, never transient pNNNN IDs.
+# An entry can only be reused during this batch when its complete offered identities/facts and
+# immutable scene digest are identical, then it is fed back through normal validation.
+def candidate_scope_fingerprint(candidate: dict) -> str:
+    return json_digest(
+        {
+            "label": candidate["label"],
+            "ref_ids": candidate["ref_ids"],
+            "known_owner": candidate.get("known_owner"),
+            "nonentity": candidate.get("nonentity", False),
+            "audited_target": candidate.get("audited_target"),
+            "scoped_audit": candidate.get("scoped_audit"),
+            "scoped_stale": candidate.get("scoped_stale", False),
+        }
+    )
+
+
+def classification_offer_fingerprint(
+    chunk: list[dict], candidates: list[dict], registry: dict, aliases: dict, units: list[dict]
+) -> tuple[str, dict]:
+    scopes = {candidate["id"]: candidate_scope_fingerprint(candidate) for candidate in candidates}
+    provenance = {
+        "candidate_scope_fingerprints": [scopes[candidate["id"]] for candidate in chunk],
+        "offered_options_fingerprint": json_digest(
+            sorted(
+                [
+                    {
+                        "scope": scopes[candidate["id"]],
+                        "known_owner": candidate.get("known_owner"),
+                        "audited_target": candidate.get("audited_target"),
+                        "scoped_audit": candidate.get("scoped_audit"),
+                    }
+                    for candidate in candidates
+                ],
+                key=lambda item: item["scope"],
+            )
+        ),
+        "offered_facts_fingerprint": json_digest({"registry": registry, "aliases": aliases}),
+        "scene_fingerprint": json_digest(
+            [
+                {
+                    "id": unit["id"],
+                    "chapter_sha256": unit["chapter_sha256"],
+                    "quote_sha256": hashlib.sha256(unit["quote"].encode("utf-8")).hexdigest(),
+                }
+                for unit in units
+            ]
+        ),
+    }
+    return json_digest(provenance), {**provenance, "candidate_id_to_scope": scopes}
+
+
+def cache_model_records(records: list[dict], provenance: dict) -> list[dict]:
+    scopes = provenance["candidate_id_to_scope"]
+    return [
+        {
+            "candidate_scope": scopes[record["candidate_id"]],
+            "status": record["status"],
+            "identity": (
+                {"candidate_scope": scopes[record["identity"]]}
+                if record["identity"] in scopes
+                else {"canonical": record["identity"]}
+            ),
+            "evidence_unit_ids": record["evidence_unit_ids"],
+        }
+        for record in records
+    ]
+
+
+def restore_cached_model_records(records: list[dict], provenance: dict) -> list[dict] | None:
+    current = {scope: candidate_id for candidate_id, scope in provenance["candidate_id_to_scope"].items()}
+    restored: list[dict] = []
+    for record in records:
+        candidate_id = current.get(record.get("candidate_scope"))
+        identity = record.get("identity")
+        if candidate_id is None or not isinstance(identity, dict):
+            return None
+        if "candidate_scope" in identity:
+            target = current.get(identity["candidate_scope"])
+            if target is None:
+                return None
+        elif isinstance(identity.get("canonical"), str):
+            target = identity["canonical"]
+        else:
+            return None
+        restored.append(
+            {
+                "candidate_id": candidate_id,
+                "status": record.get("status"),
+                "identity": target,
+                "evidence_unit_ids": record.get("evidence_unit_ids"),
+            }
+        )
+    return restored
+
+
+# ##################################################################
 # source-audited variant targets
 # converts only read-only audit groups whose full owner is present in the current ledger into schema targets, preserving source-audited rather than guessed identity links.
 def source_audited_variant_targets(
@@ -1999,9 +2199,7 @@ def review_verdict_error(
         supported, _ = owner_support(label, owner, witness_units, episode_units, registry, aliases)
         if not supported:
             return f"new-identity review lacks source/registry support for existing {owner!r}"
-        _proof, why = scoped_alias_proof(
-            label, owner, mention_unit, episode_units or witness_units, registry, aliases
-        )
+        _proof, why = scoped_alias_proof(label, owner, mention_unit, episode_units or witness_units, registry, aliases)
         if why:
             return f"new-identity review lacks independent owner proof for existing {owner!r}: {why}"
         for name in names:
@@ -2019,7 +2217,13 @@ def review_verdict_error(
 # ##################################################################
 # typed pending new-identity review lane
 # a named span the source leaves unresolved is never forced onto an existing owner and never fatal to its chapter: the candidate is held out of the registry and aliases (a non_character classification, so no narrator or global alias can form), and a typed recoverable pending row preserves every literal mention, witness and nearby fact for replay or later review.
-PENDING_IDENTITY_TYPES = ("new_identity", "garbled_variant", "unapproved_alias", "uncertain_living")
+PENDING_IDENTITY_TYPES = (
+    "new_identity",
+    "garbled_variant",
+    "unapproved_alias",
+    "uncertain_living",
+    "invalid_classification",
+)
 PENDING_IDENTITY_CODE_PREFIX = "pending_"
 PERSON_KINDS = frozenset({"individual_name", "specific_role"})
 
@@ -3015,7 +3219,9 @@ def adjudicate_pending_mentions(
         for offset in range(0, len(scopes), ADJUDICATION_MENTIONS_PER_CALL):
             chunk = scopes[offset : offset + ADJUDICATION_MENTIONS_PER_CALL]
             ids = [f"m{index}" for index in range(len(chunk))]
-            decisions = ["alias", "non_character", "ambiguous"] if owners else ["non_character", "ambiguous", "owner_absent"]
+            decisions = (
+                ["alias", "non_character", "ambiguous"] if owners else ["non_character", "ambiguous", "owner_absent"]
+            )
             item = {
                 "type": "object",
                 "properties": {
@@ -3280,9 +3486,11 @@ def discover_batch(
     ask=None,
 ) -> tuple[list[dict], list[dict]]:
     del ambiguous, prompt
-    ask = ask or ask_sync
+    ask = memoized_model_ask(ask or ask_sync)
     for review_round in range(2):
-        records, candidates = collect_classifications(project, start, batch, batch_units, batch_text, progress, ask)
+        records, candidates, rejected_rows = collect_classifications(
+            project, start, batch, batch_units, batch_text, progress, ask
+        )
         # The proposed-new review runs on the raw classification BEFORE materialization. A span it cannot resolve joins
         # the typed pending lane (never an owner, alias or fatal error); it is recorded below with literal evidence.
         deferred: list[dict] = []
@@ -3290,6 +3498,20 @@ def discover_batch(
             break
         if review_round == 1:
             raise CastDataIssue("proposed-new identity review did not converge")
+    # A response row with bad citation/cardinality data is preserved exactly once in the raw
+    # rejection archive and held pending per candidate. It must not consume a whole-chunk
+    # repair or make valid neighbours re-run classification/adjudication.
+    references = immutable_name_references(batch_units)
+    for rejected in rejected_rows:
+        entry = pending_identity_entry(
+            rejected["candidate"],
+            "invalid_classification",
+            rejected["reason"],
+            batch_units,
+            references,
+        )
+        entry["rejection_archive"] = rejected["archive"]
+        deferred.append(entry)
     defer_ambiguous_candidates(project, records, candidates, batch_units, deferred)
     demote_deferred(records, candidates, batch_units, deferred)
     resolve_provisional_chains_before_materialize(records, candidates, progress["registry"])
@@ -3360,13 +3582,15 @@ def collect_classifications(
     batch_text: str,
     progress: dict,
     ask,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], list[dict]]:
+    rejected_rows: list[dict] = []
+    decision_cache: dict[str, dict] = {}
     for adjudication_round in range(ADJUDICATION_MAX_ROUNDS):
         candidates = candidate_coverage_ledger(
             batch_units, progress["registry"], progress["aliases"], load_scoped_audit(project)
         )
         if not candidates:
-            return [], []
+            return [], [], rejected_rows
         pending: list[dict] = []
         # Binding mention-scoped decisions are already source-validated exact references.
         # Materialize them deterministically; asking the provider to reclassify them can
@@ -3401,20 +3625,53 @@ def collect_classifications(
             if audited_context:
                 chunk_prompt += "\n\n" + audited_context
             schema = discovery_schema(list(progress["registry"]), chunk, candidates, allow_new)
-            response = ask(chunk_prompt, max_tokens=1800, max_attempts=1, response_schema=schema)
+            offer_key, provenance = classification_offer_fingerprint(
+                chunk, candidates, progress["registry"], progress["aliases"], batch_units
+            )
+            cached = decision_cache.get(offer_key)
+            restored = restore_cached_model_records(cached["records"], provenance) if cached else None
+            response = (
+                json.dumps({"classifications": restored})
+                if restored is not None
+                else ask(chunk_prompt, max_tokens=1800, max_attempts=1, response_schema=schema)
+            )
             for attempt in range(EVIDENCE_REPAIR_ATTEMPTS + 1):
                 try:
-                    records.extend(
-                        validate_classification_chunk(
-                            json.loads(response),
-                            chunk,
-                            progress["registry"],
-                            progress["aliases"],
-                            candidates,
-                            batch_units,
-                            pending,
-                        )
+                    accepted, rejected = partition_classification_chunk(
+                        json.loads(response),
+                        chunk,
+                        progress["registry"],
+                        progress["aliases"],
+                        candidates,
+                        batch_units,
+                        pending,
                     )
+                    # Cache only fully accepted provider decisions. The cache is process-local and
+                    # has no authority: every hit is remapped by immutable scope and revalidated.
+                    if not rejected and restored is None:
+                        decision_cache[offer_key] = {
+                            "records": cache_model_records(accepted, provenance),
+                            "provenance": {
+                                key: value for key, value in provenance.items() if key != "candidate_id_to_scope"
+                            },
+                            "response_sha256": hashlib.sha256(response.encode("utf-8")).hexdigest(),
+                        }
+                    records.extend(accepted)
+                    if rejected:
+                        reasons = "; ".join(f"{item['candidate']['id']}: {item['reason']}" for item in rejected)
+                        archive = record_rejected_discovery(
+                            project,
+                            start,
+                            batch,
+                            batch_units,
+                            response,
+                            CastValidationError(
+                                f"chunk {chunk_index} has rejected candidate rows: {reasons}",
+                                code="cast_record_rejected",
+                            ),
+                            attempt,
+                        )
+                        rejected_rows.extend({**item, "archive": archive} for item in rejected)
                     break
                 except (ValueError, json.JSONDecodeError) as error:
                     record_rejected_discovery(
@@ -3453,7 +3710,7 @@ def collect_classifications(
             raise CastDataIssue(
                 f"scoped adjudication did not converge within {ADJUDICATION_MAX_ROUNDS} classification rounds"
             )
-    return records, candidates
+    return records, candidates, rejected_rows
 
 
 # ##################################################################
@@ -3508,17 +3765,24 @@ def record_rejected_discovery(
     response: str,
     error: Exception,
     attempt: int,
-) -> None:
+) -> dict:
     payload = {
         "start_chapter": start,
         "chapters": [path.name for path in batch],
         "attempt": attempt,
+        "code": getattr(error, "code", "cast_evidence_rejected"),
         "error": str(error),
         "evidence_units": units,
         "response": response,
     }
-    with (project / REJECTIONS_NAME).open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    path = project / REJECTIONS_NAME
+    line = json.dumps(payload, ensure_ascii=False)
+    line_number = sum(1 for _ in path.open(encoding="utf-8")) if path.is_file() else 0
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(line + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return {"line": line_number, "sha256": hashlib.sha256(line.encode("utf-8")).hexdigest(), "code": payload["code"]}
 
 
 # ##################################################################

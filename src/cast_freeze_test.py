@@ -17,13 +17,19 @@ from src.cast_freeze import (
     REJECTIONS_NAME,
     apply_alias_audit,
     asset_hashes,
+    cache_model_records,
     candidate_coverage_ledger,
+    classification_offer_fingerprint,
+    collect_classifications,
     context_safe_batch,
     discovery_schema,
     immutable_evidence_units,
     materialize_classifications,
+    memoized_model_ask,
+    partition_classification_chunk,
     record_rejected_discovery,
     refresh_alias_audit,
+    restore_cached_model_records,
     source_label_present,
     validate_classification_chunk,
     validate_preparation_coverage,
@@ -1286,6 +1292,143 @@ def test_adjudication_rejects_verdict_contradicting_person_answer(tmp_path: Path
 
 
 # ##################################################################
+# exact decision memo
+# identical source/options/schema calls reuse a syntactically valid result, while malformed
+# JSON never becomes a reusable model decision.
+def test_memoized_model_ask_reuses_only_valid_exact_request() -> None:
+    calls = 0
+
+    def ask(prompt: str, **kwargs) -> str:
+        nonlocal calls
+        calls += 1
+        return '{"ok":true}' if prompt == "valid" else "not-json"
+
+    cached = memoized_model_ask(ask)
+    schema = {"type": "object"}
+    assert cached("valid", max_tokens=10, response_schema=schema) == '{"ok":true}'
+    assert cached("valid", max_tokens=10, response_schema=schema) == '{"ok":true}'
+    assert cached("valid", max_tokens=11, response_schema=schema) == '{"ok":true}'
+    assert cached("bad", max_tokens=10, response_schema=schema) == "not-json"
+    assert cached("bad", max_tokens=10, response_schema=schema) == "not-json"
+    assert calls == 4
+
+
+# ##################################################################
+# per-record classification recovery
+# a citation failure is held once as typed pending/raw evidence while neighbouring valid rows
+# remain checkpointable; it must not repair/replay the whole chunk.
+def test_collect_classifications_holds_bad_citation_per_record_without_chunk_replay(tmp_path: Path) -> None:
+    chapter = tmp_path / "01.txt"
+    chapter.write_text("Ren greeted Zed. Zed thanked Ren.", encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    calls = 0
+
+    def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
+        nonlocal calls
+        calls += 1
+        rows = []
+        for index, option in enumerate(response_schema["properties"]["classifications"]["items"]["oneOf"]):
+            branch = option.get("oneOf", [option])[0]
+            candidate_id = branch["properties"]["candidate_id"]["enum"][0]
+            witness = (
+                next(line for line in prompt.splitlines() if line.startswith(candidate_id + " label="))
+                .split("[")[1]
+                .split("]")[0]
+            )
+            rows.append(
+                {
+                    "candidate_id": candidate_id,
+                    "status": "new",
+                    "identity": candidate_id,
+                    "evidence_unit_ids": [] if index == 0 else [witness],
+                }
+            )
+        return json.dumps({"classifications": rows})
+
+    records, candidates, rejected = collect_classifications(
+        tmp_path,
+        0,
+        [chapter],
+        units,
+        chapter.read_text(encoding="utf-8"),
+        {"registry": {}, "aliases": {}},
+        ask,
+    )
+    assert calls == 1
+    assert len(records) == len(candidates) >= 2
+    assert len(rejected) == 1
+    failed = rejected[0]["candidate"]["id"]
+    assert next(row for row in records if row["candidate_id"] == failed)["status"] == "ambiguous"
+    archived = [json.loads(line) for line in (tmp_path / REJECTIONS_NAME).read_text(encoding="utf-8").splitlines()]
+    assert len(archived) == 1 and archived[0]["code"] == "cast_record_rejected"
+    assert rejected[0]["archive"]["line"] == 0
+
+
+# ##################################################################
+# cross-chunk cardinality recovery
+# a genuine provider row for an adjacent known chunk is raw provenance, not a reason to
+# discard this chunk's valid rows; the omitted expected candidate is the sole pending row.
+def test_partition_classification_chunk_holds_only_omitted_expected_candidate() -> None:
+    units = [
+        {"id": "c00s00000", "chapter": "01.txt", "quote": "Ren arrived."},
+        {"id": "c00s00001", "chapter": "01.txt", "quote": "Zed arrived."},
+        {"id": "c00s00002", "chapter": "01.txt", "quote": "Mara arrived."},
+    ]
+    candidates = [
+        {"id": "p0000", "label": "Ren", "ref_ids": ["c00s00000n0000"]},
+        {"id": "p0001", "label": "Zed", "ref_ids": ["c00s00001n0000"]},
+        {"id": "p0002", "label": "Mara", "ref_ids": ["c00s00002n0000"]},
+    ]
+    records, rejected = partition_classification_chunk(
+        {
+            "classifications": [
+                {"candidate_id": "p0000", "status": "new", "identity": "p0000", "evidence_unit_ids": ["c00s00000"]},
+                {"candidate_id": "p0002", "status": "new", "identity": "p0002", "evidence_unit_ids": ["c00s00002"]},
+            ]
+        },
+        candidates[:2],
+        {},
+        {},
+        candidates,
+        units,
+        [],
+    )
+    assert [record["candidate_id"] for record in records] == ["p0000", "p0001"]
+    assert records[0]["status"] == "new" and records[1]["status"] == "ambiguous"
+    assert [(item["candidate"]["id"], item["reason"]) for item in rejected] == [
+        ("p0001", "classification omitted this candidate")
+    ]
+
+
+# ##################################################################
+# immutable-scope cache remapping
+# a cache hit may remap only ephemeral ledger IDs; changed offered facts invalidate it.
+def test_classification_cache_remaps_only_unchanged_immutable_scope() -> None:
+    units = [
+        {
+            "id": "c00s00000",
+            "chapter": "01.txt",
+            "chapter_sha256": "a" * 64,
+            "quote": "Ren arrived.",
+        }
+    ]
+    old = {"id": "p0000", "label": "Ren", "ref_ids": ["c00s00000n0000"], "known_owner": None}
+    new = {"id": "p0099", "label": "Ren", "ref_ids": ["c00s00000n0000"], "known_owner": None}
+    old_key, old_provenance = classification_offer_fingerprint([old], [old], {}, {}, units)
+    new_key, new_provenance = classification_offer_fingerprint([new], [new], {}, {}, units)
+    assert old_key == new_key
+    encoded = cache_model_records(
+        [{"candidate_id": "p0000", "status": "new", "identity": "p0000", "evidence_unit_ids": ["c00s00000"]}],
+        old_provenance,
+    )
+    assert restore_cached_model_records(encoded, new_provenance) == [
+        {"candidate_id": "p0099", "status": "new", "identity": "p0099", "evidence_unit_ids": ["c00s00000"]}
+    ]
+    changed_key, _ = classification_offer_fingerprint([new], [new], {"ren": {"name": "Ren"}}, {}, units)
+    assert changed_key != old_key
+
+
+# ##################################################################
 # test known-owner candidate route
 # a chain targeting a candidate whose label already has an established owner resolves to that canonical (never a candidate ID) and defers an unapproved mention to adjudication, identically across repeated runs.
 def test_known_owner_candidate_chain_resolves_to_canonical_and_adjudicates() -> None:
@@ -1503,9 +1646,7 @@ def test_new_identity_review_redirects_fragments_and_keeps_genuine_new(tmp_path:
             and record["raw_review"]["reason"]
         )
     scoped = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
-    assert ("Lou Arched", "non_character", "none") in {
-        (r["label"], r["decision"], r["canonical"]) for r in scoped
-    }
+    assert ("Lou Arched", "non_character", "none") in {(r["label"], r["decision"], r["canonical"]) for r in scoped}
     assert not any(r["decision"] == "alias" and r["canonical"] == "lu" for r in scoped)
     assert any("bounded scene" in call and "Canonical prior facts" in call for call in calls)
     assert {c["status"] for c in classifications} <= {"known", "new", "non_character"}
@@ -1791,10 +1932,9 @@ def test_existing_target_needs_own_mention_and_rejects_scene_participant() -> No
     registry = {"sora": {"name": "Sora"}}
     units = {"u1": {"id": "u1", "quote": "Han spoke to Sora."}, "u2": {"id": "u2", "quote": "Sora smiled."}}
     candidate = {"ref_ids": ["u1n0"]}
-    assert (
-        review_verdict_error("Han", "existing:sora", ["u1"], candidate, {}, registry, {}, units, units["u1"])
-        .startswith("new-identity review lacks independent owner proof for existing 'sora'")
-    )
+    assert review_verdict_error(
+        "Han", "existing:sora", ["u1"], candidate, {}, registry, {}, units, units["u1"]
+    ).startswith("new-identity review lacks independent owner proof for existing 'sora'")
     assert "own-label witness" in review_verdict_error(
         "Han", "existing:sora", ["u2"], candidate, {}, registry, {}, units, units["u1"]
     )
@@ -1957,7 +2097,14 @@ def test_many_conflicting_scopes_reviewed_once_over_compact_episodes(tmp_path: P
     )
     units = immutable_evidence_units([chapter])
     progress = {
-        "registry": {"lu": {"name": "Lu", "bio": "Sister of Taro.", "source_facts": "Lou is Lu's recorded academy name.", "look": ""}},
+        "registry": {
+            "lu": {
+                "name": "Lu",
+                "bio": "Sister of Taro.",
+                "source_facts": "Lou is Lu's recorded academy name.",
+                "look": "",
+            }
+        },
         "aliases": {},
     }
     anchor = units[0]["id"]

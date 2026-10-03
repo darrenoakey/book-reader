@@ -4642,6 +4642,385 @@ def ingest_context_quality_proposals(
 
 
 # ##################################################################
+# caretaker context resolution v2 adapter
+# The v2 file carries per-mention decisions. Source identity is fail-closed (book SHA, exact immutable main unit,
+# quote-relative span, every witness resolved globally by chapter hash), but a decision is applied only when the
+# existing guards prove it (scoped_alias_proof for an alias; no plausible owner at all for a non_character);
+# new_actor, hold and every unproven alias/non_character become typed pending rows that block final freeze.
+CONTEXT_RESOLUTION_V2_NAME = "cast_context_resolution_proposals_v2.json"
+CONTEXT_RESOLUTION_V2_CONTRACT = "cast_context_resolution_proposal_v2"
+CONTEXT_V2_STAGE = "cast_context"
+CONTEXT_V2_DECISIONS = frozenset({"alias", "new_actor", "non_character", "hold"})
+CONTEXT_V2_ROW_FIELDS = frozenset(
+    {
+        "chapter_file",
+        "chapter_sha256",
+        "main_unit_id",
+        "main_unit_quote",
+        "main_unit_quote_sha256",
+        "label",
+        "span_start",
+        "label_matches_span",
+        "witnesses",
+        "decision",
+        "canonical_target",
+        "target_registered",
+        "reason",
+    }
+)
+CONTEXT_V2_WITNESS_FIELDS = frozenset(
+    {"chapter_file", "chapter_sha256", "unit_id", "unit_quote", "unit_quote_sha256"}
+)
+
+
+def _context_v2_invalid(message: str) -> OperationalError:
+    return OperationalError(
+        "cast_integrity", f"caretaker context resolution v2: {message}"
+    )
+
+
+class _ChapterSource:
+    """Hash-addressed view of every source chapter: a witness may live in any chapter, not just the main mention's."""
+
+    def __init__(self, chapters: list[Path]) -> None:
+        self.by_hash: dict[str, list[Path]] = {}
+        for chapter in chapters:
+            self.by_hash.setdefault(file_digest(chapter), []).append(chapter)
+        self._units: dict[Path, tuple[list[dict], dict[str, dict]]] = {}
+
+    def resolve(self, name: object, sha: object, what: str) -> Path:
+        if not isinstance(name, str) or not isinstance(sha, str) or not name or not sha:
+            raise _context_v2_invalid(f"{what} chapter identity is invalid")
+        matches = [path for path in self.by_hash.get(sha, []) if path.name == name]
+        if len(matches) != 1:
+            raise _context_v2_invalid(
+                f"{what} chapter {name!r} is not the exact current source by hash"
+            )
+        return matches[0]
+
+    def units(self, path: Path) -> tuple[list[dict], dict[str, dict]]:
+        if path not in self._units:
+            # Unit ids are single-chapter (c00sNNNNN), exactly as the caretaker computed them.
+            ordered = immutable_evidence_units([path])
+            self._units[path] = (ordered, {unit["id"]: unit for unit in ordered})
+        return self._units[path]
+
+    def exact_unit(
+        self,
+        name: object,
+        sha: object,
+        unit_id: object,
+        quote: object,
+        quote_sha: object,
+        what: str,
+    ) -> dict:
+        path = self.resolve(name, sha, what)
+        if not all(
+            isinstance(item, str) and item for item in (unit_id, quote, quote_sha)
+        ):
+            raise _context_v2_invalid(f"{what} has invalid unit values")
+        unit = self.units(path)[1].get(unit_id)
+        if (
+            unit is None
+            or unit["quote"] != quote
+            or text_digest(quote) != quote_sha
+            or unit["chapter_sha256"] != sha
+        ):
+            raise _context_v2_invalid(f"{what} is not an exact immutable unit")
+        return unit
+
+
+def _context_pending(base: dict, code: str, why: str) -> dict:
+    return {**base, "code": code, "why": why}
+
+
+def adapt_context_resolution_v2(
+    payload: object,
+    source_sha: str,
+    chapters: list[Path],
+    registry: dict,
+    aliases: dict,
+    scoped_records: list[dict],
+) -> dict[str, list]:
+    """Validate a v2 caretaker file and split it into guard-proven scoped audit records and typed pending rows.
+
+    Source violations raise OperationalError (fail closed, nothing applied). A decision the guards cannot prove is
+    never an error: it is returned as pending with the reason and every validated source witness.
+    """
+    if (
+        not isinstance(payload, dict)
+        or payload.get("contract") != CONTEXT_RESOLUTION_V2_CONTRACT
+    ):
+        raise _context_v2_invalid("unsupported contract")
+    if (
+        payload.get("source_sha256") != source_sha
+        or payload.get("source_book_sha256") != source_sha
+    ):
+        raise _context_v2_invalid("file belongs to a different source")
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        raise _context_v2_invalid("rows must be a list")
+    source = _ChapterSource(chapters)
+    prior = mention_scoped_audit_index(scoped_records)
+    seen: set[tuple[str, str, str, int]] = set()
+    applied: list[dict] = []
+    pending: list[dict] = []
+    proven: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or not CONTEXT_V2_ROW_FIELDS <= set(row):
+            raise _context_v2_invalid("row has an invalid schema")
+        decision, label, span, target = (
+            row["decision"],
+            row["label"],
+            row["span_start"],
+            row["canonical_target"],
+        )
+        if (
+            decision not in CONTEXT_V2_DECISIONS
+            or not isinstance(label, str)
+            or not label
+            or type(span) is not int
+            or span < 0
+            or not isinstance(target, str)
+            or not isinstance(row["reason"], str)
+            or row["label_matches_span"] is not True
+        ):
+            raise _context_v2_invalid("row has invalid values")
+        unit = source.exact_unit(
+            row["chapter_file"],
+            row["chapter_sha256"],
+            row["main_unit_id"],
+            row["main_unit_quote"],
+            row["main_unit_quote_sha256"],
+            "main mention",
+        )
+        if unit["quote"][span : span + len(label)] != label:
+            raise _context_v2_invalid(
+                "main mention span is not the exact quote-relative label"
+            )
+        scope = mention_scope(unit, {"start": span}, label)
+        if scope in seen:
+            raise _context_v2_invalid("duplicate exact mention scope")
+        seen.add(scope)
+        witnesses = row["witnesses"]
+        if not isinstance(witnesses, list) or not witnesses:
+            raise _context_v2_invalid("row requires source witnesses")
+        checked: list[dict] = []
+        witness_keys: set[tuple[str, str]] = set()
+        for witness in witnesses:
+            if not isinstance(witness, dict) or not CONTEXT_V2_WITNESS_FIELDS <= set(
+                witness
+            ):
+                raise _context_v2_invalid("witness has an invalid schema")
+            exact = source.exact_unit(
+                witness["chapter_file"],
+                witness["chapter_sha256"],
+                witness["unit_id"],
+                witness["unit_quote"],
+                witness["unit_quote_sha256"],
+                "witness",
+            )
+            key = (exact["chapter_sha256"], exact["id"])
+            if key in witness_keys:
+                # The same exact unit may serve several roles (e.g. keyword and identity fact); it is one witness.
+                continue
+            witness_keys.add(key)
+            checked.append(
+                {
+                    field: witness[field]
+                    for field in sorted(witness)
+                    if field in CONTEXT_V2_WITNESS_FIELDS | {"role"}
+                }
+            )
+        evidence_names = {
+            row["chapter_file"]: row["chapter_sha256"],
+            **{w["chapter_file"]: w["chapter_sha256"] for w in checked},
+        }
+        base = {
+            "item": f"context:{scope[0][:16]}:{scope[1][:16]}:{span}:{label}",
+            "source": sorted(evidence_names),
+            "source_hash": dict(sorted(evidence_names.items())),
+            "scope": {
+                "chapter": row["chapter_file"],
+                "chapter_sha256": scope[0],
+                "unit_id": row["main_unit_id"],
+                "quote_sha256": scope[1],
+                "label": label,
+                "span_start": span,
+            },
+            "decision": decision,
+            "canonical_target": target,
+            "reason": row["reason"],
+            "witnesses": checked,
+        }
+
+        if decision in {"new_actor", "hold"}:
+            pending.append(
+                _context_pending(
+                    base,
+                    f"context_{decision}",
+                    "caretaker has not resolved this mention to an approved registered actor",
+                )
+            )
+            continue
+        units_in_chapter, units_by_id = source.units(
+            source.resolve(row["chapter_file"], row["chapter_sha256"], "main mention")
+        )
+        reference = next(
+            (
+                ref
+                for ref in immutable_name_references([unit]).values()
+                if ref["label"] == label and ref["start"] == span
+            ),
+            None,
+        )
+        if reference is None:
+            pending.append(
+                _context_pending(
+                    base,
+                    f"context_{decision}_unproven",
+                    "the span is not an exact immutable name reference",
+                )
+            )
+            continue
+        existing = prior.get(scope)
+        if decision == "alias":
+            if (
+                target not in registry
+                or target == "narrator"
+                or row["target_registered"] is not True
+            ):
+                pending.append(
+                    _context_pending(
+                        base,
+                        "context_alias_unproven",
+                        f"owner {target!r} is not an approved registered non-narrator actor",
+                    )
+                )
+                continue
+            order = [item["id"] for item in units_in_chapter]
+            proof, why = scoped_alias_proof(
+                label,
+                target,
+                unit,
+                scene_units_at(units_by_id, order, order.index(unit["id"])),
+                registry,
+                aliases,
+            )
+            if why:
+                pending.append(_context_pending(base, "context_alias_unproven", why))
+                continue
+            binding = {"decision": "alias", "canonical": target, "proof": proof}
+        else:
+            if target != "none" or row["target_registered"] is not False:
+                raise _context_v2_invalid("non_character row names an actor")
+            owners = adjudication_owners(label, registry, aliases)
+            if owners:
+                pending.append(
+                    _context_pending(
+                        base,
+                        "context_non_character_unproven",
+                        f"label {label!r} still has plausible owners {owners}",
+                    )
+                )
+                continue
+            binding = {"decision": "non_character", "canonical": "none"}
+        if existing and (existing["decision"], existing["canonical"]) == (
+            binding["decision"],
+            binding["canonical"],
+        ):
+            proven.append(base["item"])
+            continue
+        if existing and existing["decision"] in {"alias", "non_character"}:
+            pending.append(
+                _context_pending(
+                    base,
+                    "context_conflict",
+                    f"an existing scoped decision {existing['decision']}:{existing['canonical']} disagrees",
+                )
+            )
+            continue
+        proven.append(base["item"])
+        applied.append(
+            {
+                "chapter_sha256": scope[0],
+                "quote_sha256": scope[1],
+                "label": label,
+                "span_start": span,
+                "confidence": 1.0,
+                "reason": f"[caretaker context resolution v2] {row['reason']}"[:300],
+                "provenance": row.get("provenance")
+                if isinstance(row.get("provenance"), dict)
+                else {},
+                "witnesses": [
+                    {"chapter_sha256": w["chapter_sha256"], "unit_id": w["unit_id"]}
+                    for w in checked
+                ],
+                **binding,
+            }
+        )
+    return {"applied": applied, "pending": pending, "proven": proven}
+
+
+def ingest_context_resolution_v2(
+    project: Path,
+    source_sha: str,
+    chapters: list[Path],
+    registry: dict,
+    aliases: dict,
+    recovery: RecoveryLedger,
+) -> list[dict]:
+    """Apply guard-proven v2 decisions to the mention-scoped audit and record the rest as typed pending rows.
+
+    The input file is never modified. A pending mention that later becomes proven is resolved by an appended
+    history row. Returns the open context pending rows.
+    """
+    path = project / CONTEXT_RESOLUTION_V2_NAME
+    if not path.is_file():
+        return recovery.open_pending(CONTEXT_V2_STAGE)
+    records = load_scoped_audit(project)
+    payload = load_object(path, "caretaker context resolution v2")
+    result = adapt_context_resolution_v2(
+        payload, source_sha, chapters, registry, aliases, records
+    )
+    input_sha = payload_hash(payload)
+    for item in result["pending"]:
+        recovery.record(
+            CONTEXT_V2_STAGE,
+            item["item"],
+            item["code"],
+            item["why"],
+            severity="pending",
+            evidence={
+                key: value for key, value in item.items() if key not in {"item", "code"}
+            }
+            | {"input_sha256": input_sha},
+        )
+    if result["applied"]:
+        known = mention_scoped_audit_index(records)
+        for record in result["applied"]:
+            supersede_scoped_record(
+                records,
+                known,
+                (
+                    record["chapter_sha256"],
+                    record["quote_sha256"],
+                    record["label"],
+                    record["span_start"],
+                ),
+                record,
+            )
+        mention_scoped_audit_index(records)
+        atomic_json(project / SCOPED_AUDIT_NAME, {"records": records})
+    for row in recovery.open_pending(CONTEXT_V2_STAGE):
+        if row["item"] in result["proven"]:
+            recovery.resolve(
+                row, "caretaker_context_resolution_proven", {"input_sha256": input_sha}
+            )
+    return recovery.open_pending(CONTEXT_V2_STAGE)
+
+
+# ##################################################################
 # save pending proposal
 # persists the exact demoted identity proposal so a pending row's evidence is reproducible; the same exact proposal (same scope, mentions and evidence bytes) is stored once however often a replay or round re-presents it.
 def save_pending_proposal(project: Path, proposal: dict) -> str:
@@ -4996,6 +5375,7 @@ def prepare_cast(
     coverage = semantic_coverage(progress)
     recovery = RecoveryLedger(project)
     ingest_context_quality_proposals(project, source_sha, chapters, progress["registry"], recovery)
+    ingest_context_resolution_v2(project, source_sha, chapters, progress["registry"], progress["aliases"], recovery)
     earlier = {row_key(row) for row in recovery.open_quarantined("cast")}
     # Historical 0..cursor batches had structural hashes only. Reclassify that prefix under the semantic ledger before touching the next production batch.
     # A data problem quarantines only the offending chapter (semantic ledger only; the structural cursor never moves backwards).
@@ -5009,6 +5389,7 @@ def prepare_cast(
         # Audit records may be appended while this resumable preparation is paused; refresh is idempotent and leaves cursor and media untouched.
         inactive, ambiguous = refresh_alias_audit(project, source_text, progress)
         ingest_context_quality_proposals(project, source_sha, chapters, progress["registry"], recovery)
+        ingest_context_resolution_v2(project, source_sha, chapters, progress["registry"], progress["aliases"], recovery)
         atomic_json(progress_path, progress)
         start = int(progress["next_chapter"])
         for unit in recoverable_batches(
@@ -5033,7 +5414,7 @@ def prepare_cast(
     atomic_json(progress_path, progress)
     blocked = quarantined_chapter_names(progress)
     pending_rows = recovery.open_pending("cast")
-    quality_rows = active_quality_pending(recovery, progress["registry"])
+    quality_rows = [*active_quality_pending(recovery, progress["registry"]), *recovery.open_pending(CONTEXT_V2_STAGE)]
     if blocked or pending_rows or quality_rows:
         # Publication refuses (typed status, no manifest) until cast uncertainty and every
         # active country/garble/duplicate-actor quality flag have durable resolutions.

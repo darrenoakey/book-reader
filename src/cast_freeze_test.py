@@ -14,9 +14,14 @@ from PIL import Image
 from src.cast_freeze import (
     ANCHOR_IDS,
     CONTEXT_PROPOSALS_NAME,
+    CONTEXT_RESOLUTION_V2_CONTRACT,
+    CONTEXT_RESOLUTION_V2_NAME,
+    CONTEXT_V2_STAGE,
     MANIFEST_NAME,
     REJECTIONS_NAME,
+    SCOPED_AUDIT_NAME,
     active_quality_pending,
+    adapt_context_resolution_v2,
     apply_alias_audit,
     asset_hashes,
     cache_model_records,
@@ -26,7 +31,9 @@ from src.cast_freeze import (
     context_safe_batch,
     discovery_schema,
     immutable_evidence_units,
+    immutable_name_references,
     ingest_context_quality_proposals,
+    ingest_context_resolution_v2,
     materialize_classifications,
     memoized_model_ask,
     partition_classification_chunk,
@@ -1344,6 +1351,183 @@ def test_context_quality_proposal_requires_exact_scope_and_preserves_resolution_
     )
     with pytest.raises(OperationalError):
         ingest_context_quality_proposals(tmp_path, "source-sha", [chapter], {"ren": {"name": "Ren"}}, recovery)
+
+
+# ##################################################################
+# caretaker context resolution v2 adapter
+# Real temp chapters: source identity fails closed; a decision applies only when the existing guards prove it,
+# and everything else (new_actor, hold, unproven alias/non_character) is typed pending, never a whole-file failure.
+V2_SOURCE_SHA = "b" * 64
+
+
+def v2_fixture(tmp_path: Path) -> tuple[list[Path], dict]:
+    first = tmp_path / "01-part_01.txt"
+    second = tmp_path / "02-part_02.txt"
+    first.write_text(
+        "Ana ran across the yard. Ana Reed shouted at the sky. The Zephyr howled over the wall. "
+        "Zed appeared at the gate. Professor, he called in a tense voice. Mom, said Ana.",
+        encoding="utf-8",
+    )
+    second.write_text("Zed carried a lantern. Ana waited at the door.", encoding="utf-8")
+    return [first, second], {"ana": {"name": "Ana", "bio": "a scout"}}
+
+
+def v2_row(chapters: list[Path], chapter: int, label: str, decision: str, target: str, witness_chapter: int) -> dict:
+    path = chapters[chapter]
+    units = immutable_evidence_units([path])
+    unit = next(item for item in units if label in item["quote"])
+    other_units = immutable_evidence_units([chapters[witness_chapter]])
+    witness = other_units[0] if witness_chapter != chapter else units[max(units.index(unit) - 1, 0)]
+    # unit ids are computed on the single chapter file exactly as the caretaker did (c00 prefix)
+    assert unit["id"].startswith("c00") and witness["id"].startswith("c00")
+    return {
+        "chapter_file": path.name,
+        "chapter_sha256": unit["chapter_sha256"],
+        "main_unit_id": unit["id"],
+        "main_unit_quote": unit["quote"],
+        "main_unit_quote_sha256": hashlib.sha256(unit["quote"].encode()).hexdigest(),
+        "label": label,
+        "span_start": unit["quote"].index(label),
+        "label_matches_span": True,
+        "witnesses": [
+            {
+                "chapter_file": chapters[witness_chapter].name,
+                "chapter_sha256": witness["chapter_sha256"],
+                "unit_id": witness["id"],
+                "unit_quote": witness["quote"],
+                "unit_quote_sha256": hashlib.sha256(witness["quote"].encode()).hexdigest(),
+                "role": "identity_fact_witness",
+            }
+        ],
+        "decision": decision,
+        "canonical_target": target,
+        "target_registered": target in {"ana"},
+        "reason": f"caretaker {decision}",
+        "provenance": {"author": "caretaker"},
+    }
+
+
+def v2_payload(rows: list[dict], sha: str = V2_SOURCE_SHA) -> dict:
+    return {
+        "contract": CONTEXT_RESOLUTION_V2_CONTRACT,
+        "source_book_sha256": sha,
+        "source_sha256": sha,
+        "decisions": ["alias", "new_actor", "non_character", "hold"],
+        "rows": rows,
+        "unhandled_labels": [],
+        "actor_quality_flags": [{"registry_id": "ana", "proposal": "ignored"}],
+        "new_actor_drafts": [{"actor_id": "zed", "status": "DRAFT - not approved"}],
+        "summary": {},
+    }
+
+
+def test_context_resolution_v2_applies_only_proven_and_types_the_rest_pending(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    first_refs = {ref["label"] for ref in immutable_name_references(immutable_evidence_units([chapters[0]])).values()}
+    assert {"Ana Reed", "Zephyr", "Zed", "Professor", "Mom"} <= first_refs
+    rows = [
+        v2_row(chapters, 0, "Ana Reed", "alias", "ana", 1),  # cross-chapter witness, proven by scoped_alias_proof
+        v2_row(chapters, 0, "Zephyr", "non_character", "none", 1),  # no plausible owner exists
+        v2_row(chapters, 0, "Zed", "new_actor", "zed", 1),
+        v2_row(chapters, 0, "Professor", "hold", "none", 0),
+        v2_row(chapters, 0, "Mom", "alias", "ana", 0),  # no literal tie to Ana: unproven
+    ]
+    rows[-1]["witnesses"].append(dict(rows[0]["witnesses"][0]))
+    rows[-1]["witnesses"].append(dict(rows[0]["witnesses"][0]))  # a repeated exact unit is one witness
+    (tmp_path / CONTEXT_RESOLUTION_V2_NAME).write_text(json.dumps(v2_payload(rows)), encoding="utf-8")
+    before = (tmp_path / CONTEXT_RESOLUTION_V2_NAME).read_bytes()
+    recovery = RecoveryLedger(tmp_path)
+
+    open_rows = ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, recovery)
+
+    assert sorted(row["code"] for row in open_rows) == [
+        "context_alias_unproven",
+        "context_hold",
+        "context_new_actor",
+    ]
+    assert all(row["stage"] == CONTEXT_V2_STAGE and row["severity"] == "pending" for row in open_rows)
+    assert all(row["evidence"]["witnesses"] for row in open_rows)
+    assert all(len(row["evidence"]["witnesses"]) <= 2 for row in open_rows)
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text(encoding="utf-8"))["records"]
+    assert sorted((r["label"], r["decision"], r["canonical"]) for r in records) == [
+        ("Ana Reed", "alias", "ana"),
+        ("Zephyr", "non_character", "none"),
+    ]
+    assert next(r for r in records if r["label"] == "Ana Reed")["proof"]["literal"] == "shared_name_word"
+    # input is never modified, registry/aliases are never touched, and re-ingest is idempotent
+    assert (tmp_path / CONTEXT_RESOLUTION_V2_NAME).read_bytes() == before and registry == {
+        "ana": {"name": "Ana", "bio": "a scout"}
+    }
+    ledger_size = len(recovery.entries())
+    assert len(ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, recovery)) == 3
+    assert len(recovery.entries()) == ledger_size
+
+
+def test_context_resolution_v2_guards_block_unsafe_application_and_resolve_when_proven(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    rows = [v2_row(chapters, 0, "Ana Reed", "alias", "ana", 1)]
+    (tmp_path / CONTEXT_RESOLUTION_V2_NAME).write_text(json.dumps(v2_payload(rows)), encoding="utf-8")
+    recovery = RecoveryLedger(tmp_path)
+    # owner not registered yet: the alias stays pending and nothing is written to the audit
+    pending = ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, {}, {}, recovery)
+    assert [row["code"] for row in pending] == ["context_alias_unproven"]
+    assert not (tmp_path / SCOPED_AUDIT_NAME).exists()
+    # once the registry proves the owner, the alias applies and its pending row gets an appended resolution
+    assert ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, recovery) == []
+    entries = recovery.entries()
+    assert [e["severity"] for e in entries] == ["pending", "resolved"]
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text(encoding="utf-8"))["records"]
+    assert [(r["label"], r["decision"]) for r in records] == [("Ana Reed", "alias")]
+    # a non_character claim about a label an existing actor plausibly owns is never applied
+    guarded = [v2_row(chapters, 0, "Ana", "non_character", "none", 1)]
+    (tmp_path / CONTEXT_RESOLUTION_V2_NAME).write_text(json.dumps(v2_payload(guarded)), encoding="utf-8")
+    blocked = ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, recovery)
+    assert [row["code"] for row in blocked] == ["context_non_character_unproven"]
+    assert [r["label"] for r in json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]] == ["Ana Reed"]
+    # an unproven mention that is absent from the current file is never resolved by omission
+    (tmp_path / CONTEXT_RESOLUTION_V2_NAME).write_text(json.dumps(v2_payload([])), encoding="utf-8")
+    assert len(ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, recovery)) == 1
+
+
+def test_context_resolution_v2_source_violations_fail_closed(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    good = [v2_row(chapters, 0, "Zed", "hold", "none", 1)]
+
+    def adapt(payload: dict, sha: str = V2_SOURCE_SHA) -> dict:
+        return adapt_context_resolution_v2(payload, sha, chapters, registry, {"ana": "ana"}, [])
+
+    assert len(adapt(v2_payload(good))["pending"]) == 1
+    mutate = [
+        ("main span", lambda r: r.update(span_start=r["span_start"] + 1)),
+        ("main quote", lambda r: r.update(main_unit_quote=r["main_unit_quote"] + "!")),
+        ("main sha", lambda r: r.update(main_unit_quote_sha256="0" * 64)),
+        ("chapter sha", lambda r: r.update(chapter_sha256="0" * 64)),
+        ("main unit", lambda r: r.update(main_unit_id="c00s99999")),
+        ("witness sha", lambda r: r["witnesses"][0].update(chapter_sha256="0" * 64)),
+        ("witness name", lambda r: r["witnesses"][0].update(chapter_file="99-missing.txt")),
+        ("witness quote", lambda r: r["witnesses"][0].update(unit_quote="invented")),
+        ("no witnesses", lambda r: r.update(witnesses=[])),
+        ("decision", lambda r: r.update(decision="promote")),
+    ]
+    for _name, change in mutate:
+        row = json.loads(json.dumps(good[0]))
+        change(row)
+        with pytest.raises(OperationalError):
+            adapt(v2_payload([row]))
+    with pytest.raises(OperationalError):
+        adapt(v2_payload(good), "c" * 64)
+    with pytest.raises(OperationalError):
+        adapt({**v2_payload(good), "source_book_sha256": "c" * 64})
+    with pytest.raises(OperationalError):
+        adapt({**v2_payload(good), "contract": "other"})
+    with pytest.raises(OperationalError):
+        adapt(v2_payload([good[0], good[0]]))  # duplicate exact mention scope
+    # a changed chapter byte invalidates the whole file, and nothing is written
+    chapters[1].write_text("Zed carried a lantern. Ana waited at the door!", encoding="utf-8")
+    (tmp_path / CONTEXT_RESOLUTION_V2_NAME).write_text(json.dumps(v2_payload(good)), encoding="utf-8")
+    with pytest.raises(OperationalError):
+        ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, {}, RecoveryLedger(tmp_path))
+    assert not (tmp_path / SCOPED_AUDIT_NAME).exists()
 
 
 # ##################################################################

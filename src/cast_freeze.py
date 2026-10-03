@@ -306,7 +306,8 @@ def candidate_coverage_ledger(units: list[dict[str, str]], registry: dict[str, d
 def discovery_schema(known_ids: list[str], candidates: list[dict], identity_candidates: list[dict] | None = None, allow_new: bool = True) -> dict:
     if not candidates:
         raise ValueError("classification schema requires lexical candidates")
-    identity_ids = [candidate["id"] for candidate in (identity_candidates or candidates)]
+    # candidates with an established owner are never legal identity targets: their canonical ID is already legal
+    identity_ids = [candidate["id"] for candidate in (identity_candidates or candidates) if not candidate.get("known_owner")]
     unit_ids = sorted({ref_id.rsplit("n", 1)[0] for candidate in candidates for ref_id in candidate["ref_ids"]})
 
     def record_schema(candidate: dict) -> dict:
@@ -594,8 +595,12 @@ def validate_classification_chunk(value: object, candidates: list[dict], registr
         if record["status"] == "known" and record["identity"] == record["candidate_id"]:
             raise ValueError(f"known classification must target another identity: {record['candidate_id']}")
         target_candidate = next((candidate for candidate in all_candidates if candidate["id"] == record["identity"]), None)
-        if record["status"] == "known" and target_candidate is not None and target_candidate.get("known_owner"):
-            raise ValueError(f"known classification must use established canonical target instead of candidate: {record['identity']}")
+        if record["status"] == "known" and target_candidate is not None and target_candidate.get("known_owner") in registry:
+            # chain through a known-owner candidate resolves to its established canonical before any new-alias evidence guard; the mention still needs contextual approval below
+            record["identity"] = target_candidate["known_owner"]
+            target_candidate = None
+            if record["identity"] == record["candidate_id"]:
+                raise ValueError(f"known classification must target another identity: {record['candidate_id']}")
         if record["status"] == "known" and record["identity"] in registry:
             canonical = record["identity"]
             if scoped_alias_approved(candidate, canonical):
@@ -610,12 +615,19 @@ def validate_classification_chunk(value: object, candidates: list[dict], registr
             # a cached ambiguous decision is re-judged per mention whatever the primary says; it must not be silently replaced by a label-level answer
             pending.append({"candidate": candidate, "proposed": record["identity"] if record["identity"] in registry else None})
         if record["status"] == "known" and target_candidate is not None and not candidate.get("audited_target"):
-            candidate_units = {ref_id.rsplit("n", 1)[0] for ref_id in candidate["ref_ids"]}
-            target_units = {ref_id.rsplit("n", 1)[0] for ref_id in target_candidate["ref_ids"]}
-            full_name_component = normalized_id(candidate["label"]) in {normalized_id(word) for word in target_candidate["label"].split()}
-            evidence = set(record["evidence_unit_ids"])
-            if not full_name_component and (not candidate_units.intersection(evidence) or not target_units.intersection(evidence) or candidate_units.intersection(target_units).intersection(evidence) == evidence):
-                raise ValueError(f"known candidate link lacks distinct source identity evidence: {candidate['label']!r}")
+            # A lexical candidate may itself resolve to an established canonical only after
+            # its own bounded classification is composed.  Do not demand impossible
+            # same-quote evidence for that provisional hop: send this exact mention to
+            # scoped contextual adjudication, which may approve only a canonical owner.
+            if pending is not None:
+                pending.append({"candidate": candidate, "proposed": None})
+            else:
+                candidate_units = {ref_id.rsplit("n", 1)[0] for ref_id in candidate["ref_ids"]}
+                target_units = {ref_id.rsplit("n", 1)[0] for ref_id in target_candidate["ref_ids"]}
+                full_name_component = normalized_id(candidate["label"]) in {normalized_id(word) for word in target_candidate["label"].split()}
+                evidence = set(record["evidence_unit_ids"])
+                if not full_name_component and (not candidate_units.intersection(evidence) or not target_units.intersection(evidence) or candidate_units.intersection(target_units).intersection(evidence) == evidence):
+                    raise ValueError(f"known candidate link lacks distinct source identity evidence: {candidate['label']!r}")
     return records
 
 
@@ -781,9 +793,25 @@ def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[
                 kind = result["candidate_kind"]
                 if decision == "alias" and (canonical not in owners or result["confidence"] < ADJUDICATION_MIN_CONFIDENCE or person != "yes" or kind not in {"individual_name", "specific_role"}):
                     decision, canonical = "ambiguous", "none"
+                elif decision == "non_character" and person == "yes" and result["canonical"] in owners:
+                    relationship_schema = {"type": "object", "properties": {"relationship": {"type": "string", "enum": ["same_owner", "distinct", "not_identity", "unclear"]}, "witness_unit_ids": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "enum": [unit["id"] for unit in units]}}, "reason": {"type": "string", "minLength": 1, "maxLength": 300}}, "required": ["relationship", "witness_unit_ids", "reason"], "additionalProperties": False}
+                    relationship_prompt = f"For this one exact mention only, determine its relationship to proposed canonical {result['canonical']!r}: same_owner only with source scene continuity; distinct/not_identity/unclear otherwise. Do not infer from spelling. Cite witness IDs. Mention [{mentions[scope]['id']}]: {mentions[scope]['quote']!r}. Bounded scene: {bounded_scene(units_by_id, order, order.index(mentions[scope]['id']))}. Raw rationale: {reason!r}"
+                    relationship = json.loads(ask(relationship_prompt, max_tokens=500, max_attempts=1, response_schema=relationship_schema))
+                    if relationship["relationship"] == "same_owner":
+                        decision, canonical, reason = "alias", result["canonical"], f"[relationship review {relationship['witness_unit_ids']}] {relationship['reason']}"[:300]
+                    else:
+                        decision, canonical, reason = "ambiguous", "none", f"[relationship review={relationship['relationship']}] {relationship['reason']}"[:300]
                 elif decision == "non_character" and person != "no" and kind not in {"endearment", "prose_fragment"}:
-                    # a verdict that contradicts the model's own person answer is not evidence the label is a non-person; fail closed as ambiguous
-                    decision, reason = "ambiguous", f"[inconsistent non_character with refers_to_person={person}] {reason}"[:300]
+                    # One bounded native tiebreak distinguishes a bad coupled transport from a genuinely unresolved identity.
+                    # It sees only this immutable mention/scene and the raw rationale; it cannot create a global alias.
+                    review_schema = {"type": "object", "properties": {"semantic_type": {"type": "string", "enum": ["individual_identity", "actor_reference", "endearment", "prose_fragment", "nonliving", "unclear"]}, "witness_unit_ids": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "enum": [unit["id"] for unit in units]}}, "reason": {"type": "string", "minLength": 1, "maxLength": 300}}, "required": ["semantic_type", "witness_unit_ids", "reason"], "additionalProperties": False}
+                    review_prompt = f"Classify ONE exact source span using exactly one semantic_type and cite immutable witness IDs. individual_identity is a stable actor name; actor_reference is a known person's name/reference but not a new name; endearment/prose_fragment/nonliving are not stable actor identities. Do not output a decision, canonical ID, or person flag; the caller derives those mechanically. Raw inconsistent result: person={person!r}, kind={kind!r}, decision={decision!r}, reason={reason!r}. Mention [{mentions[scope]['id']}]: {mentions[scope]['quote']!r}. Bounded scene: {bounded_scene(units_by_id, order, order.index(mentions[scope]['id']))}"
+                    reviewed = json.loads(ask(review_prompt, max_tokens=500, max_attempts=1, response_schema=review_schema))
+                    review_type, review_reason = reviewed["semantic_type"], reviewed["reason"]
+                    if review_type in {"endearment", "prose_fragment", "nonliving"}:
+                        kind, decision, canonical, reason = review_type, "non_character", "none", f"[semantic-type review {reviewed['witness_unit_ids']}] {review_reason}"[:300]
+                    else:
+                        decision, canonical, reason = "ambiguous", "none", f"[inconsistent non_character with refers_to_person={person}; semantic-type review={review_type}] {review_reason}"[:300]
                 if decision != "alias":
                     canonical = "none"
                 record = {"chapter_sha256": scope[0], "quote_sha256": scope[1], "label": candidate["label"], "span_start": scope[3], "canonical": canonical, "decision": decision, "confidence": float(result["confidence"]), "reason": reason, "owners": list(owners), "raw_adjudication": {"decision": result["decision"], "canonical": result["canonical"], "refers_to_person": person, "candidate_kind": kind, "confidence": result["confidence"], "reason": result["reason"]}}
@@ -811,13 +839,21 @@ def discover_batch(project: Path, start: int, batch: list[Path], batch_units: li
         if not candidates:
             return [], []
         pending: list[dict] = []
-        records: list[dict] = []
+        # Binding mention-scoped decisions are already source-validated exact references.
+        # Materialize them deterministically; asking the provider to reclassify them can
+        # overwrite a valid Lou→Lu scope with an unrelated lexical candidate target.
+        bound = [candidate for candidate in candidates if candidate.get("scoped_audit", {}).get("decision") in {"alias", "non_character"} and not candidate.get("scoped_stale")]
+        records: list[dict] = [
+            {"candidate_id": candidate["id"], "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]], "status": "known" if candidate["scoped_audit"]["decision"] == "alias" else "non_character", "identity": candidate["scoped_audit"]["canonical"] if candidate["scoped_audit"]["decision"] == "alias" else "none"}
+            for candidate in bound
+        ]
+        unresolved = [candidate for candidate in candidates if candidate not in bound]
         allow_new = True
         variant_targets = source_audited_variant_targets(project, candidates, batch_text, progress["registry"])
         for candidate in candidates:
             candidate["audited_target"] = variant_targets.get(candidate["id"])
         audited_context = source_audited_variant_context(project, candidates)
-        for chunk_index, chunk in enumerate(classification_chunks(candidates)):
+        for chunk_index, chunk in enumerate(classification_chunks(unresolved)):
             chunk_prompt = discovery_prompt(batch, progress["registry"], progress["aliases"], chunk, candidates, allow_new)
             if audited_context:
                 chunk_prompt += "\n\n" + audited_context

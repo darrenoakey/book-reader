@@ -24,6 +24,7 @@ from src.cast_freeze import (
     record_rejected_discovery,
     refresh_alias_audit,
     source_label_present,
+    validate_classification_chunk,
     validate_preparation_coverage,
     verify_frozen_cast,
 )
@@ -922,6 +923,8 @@ def test_adjudication_rejects_verdict_contradicting_person_answer(tmp_path: Path
 
     def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
         prompts.append(prompt)
+        if response_schema and "mentions" not in response_schema["properties"]:
+            return json.dumps({"semantic_type": "prose_fragment", "witness_unit_ids": ["c00s00000"], "reason": "the capitalized continuation is prose"})
         person, decision, canonical = next(answers)
         return json.dumps({"mentions": [{"mention_id": "m0", "refers_to_person": person, "candidate_kind": "individual_name", "decision": decision, "canonical": canonical, "confidence": 0.95, "reason": "he is Ren's parent"}]})
 
@@ -930,6 +933,32 @@ def test_adjudication_rejects_verdict_contradicting_person_answer(tmp_path: Path
         candidate = {**candidate, "ref_ids": candidate["ref_ids"][:1]}
         adjudicate_pending_mentions(tmp_path, [{"candidate": candidate, "proposed": None}], units, registry, ask)
     records = json.loads((tmp_path / "mention-scoped-audit.json").read_text())["records"]
-    assert [(r["label"], r["decision"], r["canonical"]) for r in records] == [("Ren Dove", "ambiguous", "none"), ("Mom", "ambiguous", "none")]
+    assert [(r["label"], r["decision"], r["canonical"]) for r in records] == [("Ren Dove", "non_character", "none"), ("Mom", "ambiguous", "none")]
     assert records[0]["raw_adjudication"]["decision"] == "non_character" and records[0]["raw_adjudication"]["refers_to_person"] == "yes"
-    assert all("refers_to_person" in prompt and "candidate_kind" in prompt and "endearment" in prompt for prompt in prompts)
+    assert any("refers_to_person" in prompt and "candidate_kind" in prompt and "endearment" in prompt for prompt in prompts)
+    assert any("semantic_type" in prompt and "Do not output a decision" in prompt for prompt in prompts)
+
+
+# ##################################################################
+# test known-owner candidate route
+# a chain targeting a candidate whose label already has an established owner resolves to that canonical (never a candidate ID) and defers an unapproved mention to adjudication, identically across repeated runs.
+def test_known_owner_candidate_chain_resolves_to_canonical_and_adjudicates() -> None:
+    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Louu spoke. Lou answered. Louu left."}]
+    registry = {"louu": {"name": "Louu"}}
+    aliases = {"louu": "louu"}
+    candidates = candidate_coverage_ledger(units, registry, aliases)
+    owned = next(c for c in candidates if c["label"] == "Louu")
+    other = next(c for c in candidates if c["label"] == "Lou")
+    assert owned["known_owner"] == "louu"
+    targets = json.dumps(discovery_schema(["louu"], [other], candidates))
+    assert owned["id"] not in targets and '"louu"' in targets
+    for _ in range(3):
+        pending: list[dict] = []
+        record = {"candidate_id": other["id"], "status": "known", "identity": owned["id"], "evidence_unit_ids": ["c00s00000"]}
+        fixed = {"candidate_id": owned["id"], "status": "known", "identity": "louu", "evidence_unit_ids": ["c00s00000"]}
+        out = validate_classification_chunk({"classifications": [dict(record), fixed]}, [other, owned], registry, aliases, candidates, units, pending)
+        assert out[0]["identity"] == "louu"
+        assert [item["proposed"] for item in pending] == ["louu"] and pending[0]["candidate"] is other
+    genuine = {"candidate_id": other["id"], "status": "known", "identity": other["id"], "evidence_unit_ids": ["c00s00000"]}
+    with pytest.raises(ValueError):
+        validate_classification_chunk({"classifications": [genuine, fixed]}, [other, owned], registry, aliases, candidates, units, [])

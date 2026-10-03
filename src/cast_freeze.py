@@ -801,7 +801,7 @@ def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[
                 kind = result["candidate_kind"]
                 if decision == "alias" and (canonical not in owners or result["confidence"] < ADJUDICATION_MIN_CONFIDENCE or person != "yes" or kind not in {"individual_name", "specific_role"}):
                     decision, canonical = "ambiguous", "none"
-                elif decision == "non_character" and person == "yes" and result["canonical"] in owners:
+                elif decision in {"non_character", "ambiguous"} and person == "yes" and result["canonical"] in owners:
                     relationship_schema = {"type": "object", "properties": {"relationship": {"type": "string", "enum": ["same_owner", "distinct", "not_identity", "unclear"]}, "witness_unit_ids": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "enum": [unit["id"] for unit in units]}}, "reason": {"type": "string", "minLength": 1, "maxLength": 300}}, "required": ["relationship", "witness_unit_ids", "reason"], "additionalProperties": False}
                     relationship_prompt = f"For this one exact mention only, determine its relationship to proposed canonical {result['canonical']!r}: same_owner only with source scene continuity; distinct/not_identity/unclear otherwise. Do not infer from spelling. Cite witness IDs. Mention [{mentions[scope]['id']}]: {mentions[scope]['quote']!r}. Bounded scene: {bounded_scene(units_by_id, order, order.index(mentions[scope]['id']))}. Raw rationale: {reason!r}"
                     relationship = json.loads(ask(relationship_prompt, max_tokens=500, max_attempts=1, response_schema=relationship_schema))

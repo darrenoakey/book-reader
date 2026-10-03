@@ -28,6 +28,9 @@ from src.cast_freeze import (
     ROOT_APPROVAL_NAME,
     ROOT_APPROVAL_STAGE,
     SCOPED_AUDIT_NAME,
+    SOURCE_RETIREMENT_CONTRACT,
+    SOURCE_RETIREMENT_NAME,
+    SOURCE_RETIREMENT_STAGE,
     SOURCE_REVIEW,
     active_quality_pending,
     adapt_context_resolution_v2,
@@ -44,6 +47,7 @@ from src.cast_freeze import (
     ingest_context_quality_proposals,
     ingest_context_resolution_v2,
     ingest_root_approvals,
+    ingest_source_reviewed_retirements,
     materialize_classifications,
     memoized_model_ask,
     mention_scoped_audit_index,
@@ -52,6 +56,7 @@ from src.cast_freeze import (
     proposal_sha,
     record_rejected_discovery,
     refresh_alias_audit,
+    registry_digest,
     restore_cached_model_records,
     source_label_present,
     validate_classification_chunk,
@@ -3832,3 +3837,317 @@ def test_owner_retrieval_ranks_all_evidenced_actors_and_keeps_absent_owner_open(
     }
     assert adjudication_owners("Fang", registry) == ["foam_xiao"]
     assert adjudication_owners("Lynn", registry, proposed="filler_00") == []
+
+
+# ##################################################################
+# caretaker source-reviewed retirement of prepared prose actors
+# Real temp chapters and a real progress file: a prepared actor leaves the registry only through exact source evidence plus
+# its complete own non-character references; anchors/profiles/referenced actors are never dropped; history is append-only.
+RETIRE_SHA = "c" * 64
+
+
+def retire_fixture(tmp_path: Path) -> tuple[list[Path], dict, RecoveryLedger]:
+    first = tmp_path / "01-part_01.txt"
+    second = tmp_path / "02-part_02.txt"
+    first.write_text(
+        "Ana ran across the yard. Zephyr howled over the wall. Later Ana saw Zephyr again. Ana waited.",
+        encoding="utf-8",
+    )
+    second.write_text("Zephyr faded. Quill wrote a note. Ana left.", encoding="utf-8")
+    prepared = {"name": "Zephyr", "bio": "", "look": "", "origin": "prepared", "facts": {"voice": ["Zephyr howled."], "look": []}}
+    registry = {
+        "ana": {"name": "Ana", "bio": "a scout", "look": "", "origin": "existing", "facts": {"voice": [], "look": []}},
+        "narrator": {"name": "Narrator", "bio": "", "look": "", "origin": "existing", "facts": {"voice": [], "look": []}},
+        "zephyr": prepared,
+        "quill": {**prepared, "name": "Quill", "facts": {"voice": ["Quill wrote."], "look": []}},
+    }
+    aliases = {key: key for key in registry}
+    progress = {"registry": registry, "aliases": aliases}
+    (tmp_path / PROGRESS_NAME).write_text(json.dumps(progress), encoding="utf-8")
+    (tmp_path / "characters.json").write_text(json.dumps({"ana": {"name": "Ana"}, "narrator": {"name": "Narrator"}}), encoding="utf-8")
+    (tmp_path / "voices.json").write_text(json.dumps({"ana": {"description": "calm"}}), encoding="utf-8")
+    return [first, second], progress, RecoveryLedger(tmp_path)
+
+
+def own_refs_of(chapters: list[Path], word: str) -> list[dict]:
+    """Independent (regex) enumeration of every exact own mention of a name in the whole book."""
+    refs = []
+    for chapter in chapters:
+        for unit in immutable_evidence_units([chapter]):
+            for match in re.finditer(rf"\b{word}\b", unit["quote"]):
+                refs.append(
+                    {
+                        "chapter": chapter.name,
+                        "chapter_sha256": unit["chapter_sha256"],
+                        "unit_id": unit["id"],
+                        "quote_sha256": hashlib.sha256(unit["quote"].encode()).hexdigest(),
+                        "label": word,
+                        "span_start": match.start(),
+                    }
+                )
+    return refs
+
+
+def retire_entry(chapters: list[Path], actor_id: str = "zephyr", word: str = "Zephyr", **over) -> dict:
+    index = {"zephyr": (0, 1), "quill": (1, 1)}[actor_id]
+    entry = {
+        "action": "retire_actor",
+        "actor_id": actor_id,
+        "reviewer_role": "caretaker",
+        "factual_basis": f"the cited unit uses {word} as weather prose, never a living person",
+        "evidence": [v2_witness(chapters, *index)],
+        "own_refs": own_refs_of(chapters, word),
+    }
+    return {**entry, **over}
+
+
+def write_retirement(tmp_path: Path, progress: dict, entries: list[dict], **over) -> None:
+    payload = {
+        "contract": SOURCE_RETIREMENT_CONTRACT,
+        "version": 1,
+        "source_sha256": RETIRE_SHA,
+        "registry_sha256": registry_digest(progress["registry"]),
+        "retirements": entries,
+        **over,
+    }
+    (tmp_path / SOURCE_RETIREMENT_NAME).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def retire(tmp_path: Path, chapters: list[Path], progress: dict, recovery: RecoveryLedger) -> dict:
+    return ingest_source_reviewed_retirements(tmp_path, RETIRE_SHA, chapters, progress, recovery)
+
+
+def retire_state(tmp_path: Path) -> dict:
+    names = (PROGRESS_NAME, "characters.json", "voices.json", SCOPED_AUDIT_NAME, "recovery_ledger.jsonl")
+    return {name: (tmp_path / name).read_bytes() if (tmp_path / name).exists() else None for name in names}
+
+
+def blocked_rows(recovery: RecoveryLedger) -> list[dict]:
+    return recovery.open_pending(SOURCE_RETIREMENT_STAGE)
+
+
+def test_retirement_removes_only_the_named_prepared_actor_and_keeps_append_only_history(tmp_path: Path) -> None:
+    chapters, progress, recovery = retire_fixture(tmp_path)
+    refs = own_refs_of(chapters, "Zephyr")
+    assert len(refs) == 3
+    originals = {name: (tmp_path / name).read_bytes() for name in ("characters.json", "voices.json")}
+    ana, quill = json.loads(json.dumps(progress["registry"]["ana"])), json.loads(json.dumps(progress["registry"]["quill"]))
+    snapshot = json.loads(json.dumps(progress["registry"]["zephyr"]))
+    digest = registry_digest(progress["registry"])
+    write_retirement(tmp_path, progress, [retire_entry(chapters)])
+
+    outcome = retire(tmp_path, chapters, progress, recovery)
+
+    assert outcome == {"retired": ["zephyr"], "blocked": [], "already": False}
+    saved = json.loads((tmp_path / PROGRESS_NAME).read_text())
+    assert saved["registry"] == progress["registry"] and "zephyr" not in saved["registry"] and "zephyr" not in saved["aliases"]
+    assert saved["registry"]["ana"] == ana and saved["registry"]["quill"] == quill and "narrator" in saved["registry"]
+    assert all(target in saved["registry"] for target in saved["aliases"].values())
+    (record,) = saved["source_reviewed_retirements"]
+    assert record["retired_entry"] == snapshot and record["registry_sha256_before"] == digest
+    assert record["removed_aliases"] == ["zephyr"] and len(record["own_refs"]) == 3 and record["evidence"]
+    scoped = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert len(scoped) == 3 and {(r["decision"], r["canonical"], r["label"]) for r in scoped} == {("non_character", "none", "Zephyr")}
+    assert {(r["chapter_sha256"], r["quote_sha256"], r["span_start"]) for r in scoped} == {
+        (r["chapter_sha256"], r["quote_sha256"], r["span_start"]) for r in refs
+    }
+    assert {name: (tmp_path / name).read_bytes() for name in originals} == originals
+    # a file left in place is processed once: replay is a byte-identical no-op even though the registry moved on
+    before = retire_state(tmp_path)
+    assert retire(tmp_path, chapters, json.loads((tmp_path / PROGRESS_NAME).read_text()), recovery)["already"] is True
+    assert retire_state(tmp_path) == before
+    # a later distinct input appends; the earlier record is preserved verbatim
+    write_retirement(tmp_path, progress, [retire_entry(chapters, "quill", "Quill")])
+    assert retire(tmp_path, chapters, progress, recovery)["retired"] == ["quill"]
+    again = json.loads((tmp_path / PROGRESS_NAME).read_text())
+    assert [r["actor_id"] for r in again["source_reviewed_retirements"]] == ["zephyr", "quill"]
+    assert again["source_reviewed_retirements"][0] == record and len(again["source_retirement_inputs"]) == 2
+
+
+def test_retirement_whole_file_mismatches_fail_closed_before_any_write(tmp_path: Path) -> None:
+    chapters, progress, recovery = retire_fixture(tmp_path)
+    good = retire_entry(chapters)
+    cases = [
+        {"source_sha256": "d" * 64},
+        {"registry_sha256": "e" * 64},
+        {"contract": "cast_variant_root_approval"},
+        {"version": 2},
+        {"extra": 1},
+        {"retirements": [good, retire_entry(chapters)]},
+        {"retirements": [{**good, "action": "approve_root"}]},
+        {"retirements": [{**good, "extra": 1}]},
+        {"retirements": [{**good, "actor_id": "Not An Id"}]},
+        {"retirements": [{**good, "factual_basis": "human reviewed the source"}]},
+        {"retirements": "zephyr"},
+    ]
+    for over in cases:
+        write_retirement(tmp_path, progress, [good], **over)
+        before = retire_state(tmp_path)
+        with pytest.raises(OperationalError):
+            retire(tmp_path, chapters, progress, recovery)
+        assert retire_state(tmp_path) == before and "zephyr" in progress["registry"]
+    # a registry that moved after review is a whole-file mismatch, even when the actor itself is unchanged
+    write_retirement(tmp_path, progress, [good])
+    progress["registry"]["quill"]["facts"]["voice"].append("a later fact")
+    with pytest.raises(OperationalError):
+        retire(tmp_path, chapters, progress, recovery)
+    assert "source_reviewed_retirements" not in progress
+
+
+def test_retirement_never_retires_anchors_original_profiles_or_non_prepared_actors(tmp_path: Path) -> None:
+    chapters, progress, recovery = retire_fixture(tmp_path)
+    progress["registry"]["ren"] = {**progress["registry"]["zephyr"], "name": "Ren", "origin": "existing"}
+    progress["aliases"]["ren"] = "ren"
+    progress["registry"]["quill"]["origin"] = "approved_root"
+    (tmp_path / "characters.json").write_text(json.dumps({"ana": {"name": "Ana"}, "zephyr": {"name": "Zephyr"}}), encoding="utf-8")
+    entries = [
+        retire_entry(chapters, "zephyr"),
+        retire_entry(chapters, "quill", "Quill"),
+        {**retire_entry(chapters), "actor_id": "ana"},
+        {**retire_entry(chapters), "actor_id": "ren"},
+        {**retire_entry(chapters), "actor_id": "narrator"},
+    ]
+    write_retirement(tmp_path, progress, entries)
+    registry_before = json.loads(json.dumps(progress["registry"]))
+
+    outcome = retire(tmp_path, chapters, progress, recovery)
+
+    assert outcome["retired"] == [] and len(outcome["blocked"]) == 5
+    assert progress["registry"] == registry_before
+    reasons = {b["actor_id"]: " ".join(b["blockers"]) for b in outcome["blocked"]}
+    assert "original character/voice profile" in reasons["zephyr"] and "not a prepared prose actor" in reasons["quill"]
+    assert "not a prepared prose actor" in reasons["ana"] and "original anchor" in reasons["ren"] and "original anchor" in reasons["narrator"]
+    assert len(blocked_rows(recovery)) == 5 and {r["code"] for r in blocked_rows(recovery)} == {"source_retirement_blocked"}
+    assert not (tmp_path / SCOPED_AUDIT_NAME).exists()
+
+
+def test_retirement_never_drops_a_referenced_actor(tmp_path: Path) -> None:
+    chapters, progress, recovery = retire_fixture(tmp_path)
+    progress["aliases"]["the_gale"] = "zephyr"
+    write_retirement(tmp_path, progress, [retire_entry(chapters)])
+    outcome = retire(tmp_path, chapters, progress, recovery)
+    assert outcome["retired"] == [] and "still resolve to the actor" in outcome["blocked"][0]["blockers"][0]
+    assert progress["aliases"]["the_gale"] == "zephyr" and "zephyr" in progress["registry"]
+    del progress["aliases"]["the_gale"]
+    # a mention-scoped alias to the actor, an alias-audit record and an open context row are each references too
+    ref = own_refs_of(chapters, "Zephyr")[0]
+    scoped = {
+        "chapter_sha256": "f" * 64, "quote_sha256": "a" * 64, "label": "Gale", "span_start": 0, "canonical": "zephyr",
+        "decision": "alias", "confidence": 1.0, "reason": "x",
+    }
+    (tmp_path / SCOPED_AUDIT_NAME).write_text(json.dumps({"records": [scoped]}), encoding="utf-8")
+    (tmp_path / "cast_alias_audit.json").write_text(
+        json.dumps({"records": [{"alias": "Gale", "canonical": "Zephyr", "evidence": ["x"], "decision": "merge"}]}), encoding="utf-8"
+    )
+    recovery.record(CONTEXT_V2_STAGE, "context row", "context_new_actor", "m", severity="pending", evidence={"canonical_target": "zephyr", "source": ["01-part_01.txt"]})
+    write_retirement(tmp_path, progress, [retire_entry(chapters, factual_basis="second review: weather prose, no person")])
+    outcome = retire(tmp_path, chapters, progress, recovery)
+    text = " ".join(outcome["blocked"][0]["blockers"])
+    assert outcome["retired"] == [] and "scoped to the actor as an alias" in text and "alias audit" in text and "pending row" in text
+    # an own reference that already carries a scoped alias to another actor is also a hard conflict
+    (tmp_path / SCOPED_AUDIT_NAME).write_text(
+        json.dumps({"records": [{**scoped, "chapter_sha256": ref["chapter_sha256"], "quote_sha256": ref["quote_sha256"], "label": "Zephyr", "span_start": ref["span_start"], "canonical": "ana"}]}),
+        encoding="utf-8",
+    )
+    write_retirement(tmp_path, progress, [retire_entry(chapters, factual_basis="third review: weather prose, no person")])
+    assert "already has scoped alias decision" in " ".join(retire(tmp_path, chapters, progress, recovery)["blocked"][0]["blockers"])
+    assert "zephyr" in progress["registry"] and progress["source_reviewed_retirements"] == []
+
+
+def test_retirement_needs_exact_evidence_and_the_complete_own_non_character_refs(tmp_path: Path) -> None:
+    chapters, progress, recovery = retire_fixture(tmp_path)
+    forged = {**v2_witness(chapters, 0, 1), "unit_quote": "Zephyr forged."}
+    other_ref = own_refs_of(chapters, "Ana")[0]
+    entries = [
+        retire_entry(chapters, own_refs=own_refs_of(chapters, "Zephyr")[:-1]),
+        retire_entry(chapters, own_refs=[*own_refs_of(chapters, "Zephyr"), other_ref]),
+        retire_entry(chapters, own_refs=[]),
+        retire_entry(chapters, evidence=[forged]),
+        retire_entry(chapters, evidence=[v2_witness(chapters, 0, 0)]),
+        retire_entry(chapters, evidence=[]),
+        retire_entry(chapters, reviewer_role="human"),
+        retire_entry(chapters, factual_basis="  "),
+    ]
+    for entry in entries:
+        write_retirement(tmp_path, progress, [entry])
+        before = retire_state(tmp_path)
+        outcome = retire(tmp_path, chapters, progress, recovery)
+        assert outcome["retired"] == [] and len(outcome["blocked"]) == 1, entry
+        assert "zephyr" in progress["registry"] and not (tmp_path / SCOPED_AUDIT_NAME).exists()
+        saved = json.loads((tmp_path / PROGRESS_NAME).read_text())
+        assert "zephyr" in saved["registry"] and saved["source_reviewed_retirements"] == []
+        assert retire_state(tmp_path)["characters.json"] == before["characters.json"]
+    assert all(row["code"] == "source_retirement_blocked" and row["evidence"]["actor_id"] == "zephyr" for row in blocked_rows(recovery))
+
+
+def test_retirement_blocks_one_bad_entry_only_and_a_corrected_input_resolves_its_pending_row(tmp_path: Path) -> None:
+    chapters, progress, recovery = retire_fixture(tmp_path)
+    bad = retire_entry(chapters, own_refs=own_refs_of(chapters, "Zephyr")[:1])
+    write_retirement(tmp_path, progress, [bad, retire_entry(chapters, "quill", "Quill")])
+
+    outcome = retire(tmp_path, chapters, progress, recovery)
+
+    assert outcome["retired"] == ["quill"] and [b["actor_id"] for b in outcome["blocked"]] == ["zephyr"]
+    assert "zephyr" in progress["registry"] and "quill" not in progress["registry"]
+    (row,) = blocked_rows(recovery)
+    assert row["evidence"]["actor_id"] == "zephyr" and row["severity"] == "pending"
+    # the pending row is visible to the producer's quality gate and the same bad input is not re-applied or duplicated
+    assert retire(tmp_path, chapters, progress, recovery)["already"] is True and len(blocked_rows(recovery)) == 1
+    write_retirement(tmp_path, progress, [retire_entry(chapters)])
+    assert retire(tmp_path, chapters, progress, recovery)["retired"] == ["zephyr"]
+    assert blocked_rows(recovery) == [] and "zephyr" not in progress["registry"]
+    assert [r["actor_id"] for r in progress["source_reviewed_retirements"]] == ["quill", "zephyr"]
+
+
+def test_retirement_answers_the_actors_quality_flag_and_leaves_no_dangling_speaker(tmp_path: Path) -> None:
+    chapters, progress, recovery = retire_fixture(tmp_path)
+    scope = {"chapter": chapters[0].name, **{k: v for k, v in own_refs_of(chapters, "Zephyr")[0].items() if k in {"chapter_sha256", "unit_id", "label", "span_start"}}}
+    unit = immutable_evidence_units([chapters[0]])[1]
+    scope.update(quote=unit["quote"], quote_sha256=hashlib.sha256(unit["quote"].encode()).hexdigest(), span_start=unit["quote"].index("Zephyr"))
+    recovery.record(
+        "cast_quality", "quality:zephyr:p1", "quality_garble", "garbled name", severity="pending",
+        evidence={"registry_id": "zephyr", "proposal_id": "p1", "source": [chapters[0].name], "scope": scope},
+    )
+    assert [r["evidence"]["registry_id"] for r in active_quality_pending(recovery, progress["registry"])] == ["zephyr"]
+    write_retirement(tmp_path, progress, [retire_entry(chapters)])
+
+    assert retire(tmp_path, chapters, progress, recovery)["retired"] == ["zephyr"]
+
+    assert recovery.open_pending("cast_quality") == [] and active_quality_pending(recovery, progress["registry"]) == []
+    resolved = [r for r in recovery.entries() if r["severity"] == "resolved"]
+    assert [r["evidence"]["outcome"] for r in resolved] == ["actor_retired_source_reviewed"]
+    # every remaining alias still lands on an active actor: no speaker can fall to narrator or an inactive alias
+    assert progress["aliases"] and all(target in progress["registry"] for target in progress["aliases"].values())
+    assert "narrator" in progress["registry"] and progress["aliases"]["narrator"] == "narrator"
+
+
+def test_prepare_cast_reads_the_retirement_input_at_the_batch_boundary_and_fails_closed(tmp_path: Path) -> None:
+    from src.cast_freeze import prepare_cast
+
+    source = tmp_path / "book.txt"
+    source.write_text("source", encoding="utf-8")
+    project = get_output_dir(source)
+    try:
+        (project / "chapters").mkdir(parents=True)
+        (project / "chapters" / "00-intro.txt").write_text("Book by Tester, narrated by Narrator", encoding="utf-8")
+        (project / "chapters" / "01-plain.txt").write_text("it rained all day.", encoding="utf-8")
+        (project / "characters.json").write_text(
+            json.dumps({actor_id: {"name": actor_id, "bio": "", "look": ""} for actor_id in ANCHOR_IDS}), encoding="utf-8"
+        )
+        payload = {
+            "contract": SOURCE_RETIREMENT_CONTRACT,
+            "version": 1,
+            "source_sha256": "0" * 64,
+            "registry_sha256": "0" * 64,
+            "retirements": [],
+        }
+        (project / SOURCE_RETIREMENT_NAME).write_text(json.dumps(payload), encoding="utf-8")
+
+        def never(*args, **kwargs):  # the input is rejected before any model call
+            raise AssertionError("no model call before the retirement input is validated")
+
+        with pytest.raises(OperationalError, match="different source book"):
+            prepare_cast(source, ask=never)
+        assert not (project / MANIFEST_NAME).exists()
+    finally:
+        shutil.rmtree(project, ignore_errors=True)

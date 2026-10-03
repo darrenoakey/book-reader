@@ -6198,6 +6198,334 @@ def ingest_root_approvals(
 
 
 # ##################################################################
+# source-reviewed retirement of prepared prose actors
+# The ONLY way a prepared actor leaves the registry. Input is one caretaker file (docs/CAST_SOURCE_RETIREMENTS.md) that cites
+# the exact book sha and the exact current registry digest (whole-file mismatch fails closed, nothing written) and, per
+# actor, exact immutable source evidence plus the actor's complete set of own name references, each recorded as a
+# mention-scoped non_character decision. An entry that fails any gate becomes a typed pending row for that actor alone
+# (blocking freeze) and writes nothing. Original anchors/profiles are never retirable, and an actor anything else still
+# references (another alias, a scoped alias, an alias audit record, a context/root/draft row) is never dropped, so no
+# speaker can silently fall back to the narrator or to an inactive alias. History is append-only.
+SOURCE_RETIREMENT_NAME = "cast_source_reviewed_retirements.json"
+SOURCE_RETIREMENT_CONTRACT = "cast_source_reviewed_retirement"
+SOURCE_RETIREMENT_VERSION = 1
+SOURCE_RETIREMENT_STAGE = "cast_source_retirement"
+SOURCE_RETIREMENT_BLOCKED = "source_retirement_blocked"
+SOURCE_RETIRE_ACTION = "retire_actor"
+SOURCE_RETIREMENT_HISTORY = "source_reviewed_retirements"
+SOURCE_RETIREMENT_INPUTS = "source_retirement_inputs"
+SOURCE_RETIREMENT_FIELDS = frozenset({"action", "actor_id", "reviewer_role", "factual_basis", "evidence", "own_refs"})
+PREPARED_ORIGIN = "prepared"
+PENDING_ACTOR_KEYS = ("canonical_target", "actor_id", "canonical", "owner", "target")
+
+
+def registry_digest(registry: dict) -> str:
+    """The exact digest a retirement input must cite for the registry the caretaker reviewed (stable JSON of all of it)."""
+    return json_digest(registry)
+
+
+def _retirement_invalid(message: str) -> OperationalError:
+    return OperationalError("cast_integrity", f"caretaker source-reviewed retirement: {message}")
+
+
+def _source_own_refs(source: _ChapterSource, chapters: list[Path], label_ids: set[str]) -> dict[tuple, set[tuple[str, str]]]:
+    """Every exact immutable name reference of the whole book whose label is one of the actor's own name ids."""
+    expected: dict[tuple, set[tuple[str, str]]] = {}
+    for path in chapters:
+        try:
+            units, by_id = source.units(path)
+        except DataIssue as error:
+            raise _retirement_invalid(f"source chapter {path.name} cannot be read as exact evidence: {error}") from error
+        for reference in immutable_name_references(units).values():
+            if normalized_id(reference["label"]) in label_ids:
+                unit = by_id[reference["unit_id"]]
+                key = (unit["chapter_sha256"], text_digest(unit["quote"]), reference["label"], reference["start"])
+                expected.setdefault(key, set()).add((path.name, unit["id"]))
+    return expected
+
+
+def _row_references_actor(row: dict, actor_id: str) -> bool:
+    evidence = row["evidence"] if isinstance(row.get("evidence"), dict) else {}
+    owners = evidence.get("owners")
+    return (
+        any(evidence.get(key) == actor_id for key in PENDING_ACTOR_KEYS)
+        or (isinstance(owners, list) and actor_id in owners)
+        or str(row.get("item", "")).startswith(f"{VARIANT_DRAFT_ITEM}{actor_id}:")
+    )
+
+
+def _retirement_own_refs(entry: dict, expected: dict, blockers: list[str]) -> list[dict]:
+    raw = entry["own_refs"]
+    if not expected:
+        blockers.append("the actor has no exact own source reference, so nothing proves it is a non-character")
+        return []
+    if not isinstance(raw, list) or not raw:
+        blockers.append("own_refs must list every exact own source reference of the actor")
+        return []
+    scopes: dict[tuple, dict] = {}
+    for scope in raw:
+        if (
+            not isinstance(scope, dict)
+            or set(scope) != ROOT_SCOPE_FIELDS
+            or not all(isinstance(scope[f], str) and scope[f] for f in ROOT_SCOPE_FIELDS - {"span_start"})
+            or type(scope["span_start"]) is not int
+        ):
+            blockers.append("an own_refs entry has an invalid scope schema")
+            return []
+        key = _scope_tuple(scope)
+        if key in scopes or (scope["chapter"], scope["unit_id"]) not in expected.get(key, set()):
+            blockers.append(f"own ref {scope['label']!r}@{scope['span_start']} is repeated or not an exact own reference of the actor in the current source")
+            return []
+        scopes[key] = scope
+    missing = [f"{k[2]!r}@{k[3]}" for k in expected if k not in scopes]
+    if missing:
+        blockers.append(f"own_refs omit {len(missing)} exact own source reference(s): {', '.join(sorted(missing)[:5])}")
+        return []
+    return [scopes[key] for key in sorted(scopes)]
+
+
+def _retirement_blockers(entry: dict, ctx: dict) -> tuple[list[str], dict]:
+    """Every reason this one entry may not retire its actor, plus the validated evidence/own refs it would apply."""
+    registry, aliases, actor_id = ctx["registry"], ctx["aliases"], entry["actor_id"]
+    blockers: list[str] = []
+    held = registry.get(actor_id)
+    if actor_id in ANCHOR_IDS:
+        blockers.append(f"{actor_id!r} is an original anchor identity and is never retired")
+    if not isinstance(held, dict):
+        return [*blockers, f"{actor_id!r} is not an active registry actor"], {}
+    if held.get("origin") != PREPARED_ORIGIN:
+        blockers.append(f"{actor_id!r} is not a prepared prose actor (origin {held.get('origin')!r})")
+    if actor_id in ctx["characters"] or actor_id in ctx["voices"]:
+        blockers.append(f"{actor_id!r} has an original character/voice profile that is never retired")
+    name = str(held.get("name", actor_id))
+    label_ids = {actor_id, normalized_id(name)} - {""}
+    role, basis = entry["reviewer_role"], entry["factual_basis"]
+    if role not in TRUSTED_REVIEW_ROLES or not isinstance(basis, str) or not basis.strip():
+        blockers.append("a retirement needs a trusted reviewer role and a factual basis")
+    evidence: list[dict] = []
+    raw = entry["evidence"]
+    if not isinstance(raw, list) or not raw or any(not isinstance(w, dict) or set(w) != CONTEXT_V2_WITNESS_FIELDS for w in raw):
+        blockers.append("evidence must be a non-empty list of exact witness units")
+    else:
+        try:
+            evidence = _exact_cited_witnesses(ctx["source"], raw, "retirement evidence")
+        except (OperationalError, DataIssue) as error:
+            blockers.append(str(error))
+        else:
+            if evidence != raw:
+                blockers.append("evidence repeats a unit")
+            elif not any(_names_word(word, w["unit_quote"]) for w in evidence for word in (name, actor_id.replace("_", " "))):
+                blockers.append(f"no evidence unit literally names the actor {name!r}")
+    own_refs = _retirement_own_refs(entry, _source_own_refs(ctx["source"], ctx["chapters"], label_ids), blockers)
+    keys = sorted(key for key, target in aliases.items() if target == actor_id and key not in label_ids)
+    if keys:
+        blockers.append(f"alias(es) {keys} still resolve to the actor, so retiring would drop a referenced actor")
+    if aliases.get(actor_id, actor_id) != actor_id:
+        blockers.append(f"the actor id is itself an alias of {aliases[actor_id]!r}")
+    for record in ctx["scoped"]:
+        if record["decision"] == "alias" and record["canonical"] == actor_id:
+            blockers.append(f"mention {record['label']!r}@{record['span_start']} is scoped to the actor as an alias")
+            break
+    for record in ctx["audit"]:
+        if isinstance(record, dict) and record.get("decision") != "distinct" and actor_id in {
+            normalized_id(str(record.get("alias", ""))),
+            normalized_id(str(record.get("canonical", ""))),
+        }:
+            blockers.append("the alias audit references the actor")
+            break
+    for stage in (CONTEXT_V2_STAGE, ROOT_APPROVAL_STAGE, "cast"):
+        if any(_row_references_actor(row, actor_id) for row in ctx["recovery"].open_pending(stage)):
+            blockers.append(f"an open {stage} pending row still references the actor")
+    known = mention_scoped_audit_index(ctx["scoped"])
+    for scope in own_refs:
+        prior = known.get(_scope_tuple(scope))
+        if prior and prior["decision"] == "alias":
+            blockers.append(f"own ref {scope['label']!r}@{scope['span_start']} already has scoped alias decision {prior['canonical']!r}")
+    return list(dict.fromkeys(blockers)), {"evidence": evidence, "own_refs": own_refs, "entry": held, "label_ids": label_ids}
+
+
+def _non_character_record(entry: dict, entry_sha: str, scope: dict, evidence: list[dict]) -> dict:
+    return {
+        "chapter_sha256": scope["chapter_sha256"],
+        "quote_sha256": scope["quote_sha256"],
+        "label": scope["label"],
+        "span_start": scope["span_start"],
+        "canonical": "none",
+        "decision": "non_character",
+        "confidence": 1.0,
+        "reason": f"[source-reviewed retirement of {entry['actor_id']}; {entry['reviewer_role']}] {entry['factual_basis']}"[:300],
+        "provenance": {"author": entry["reviewer_role"]},
+        "witnesses": [{"chapter_sha256": w["chapter_sha256"], "unit_id": w["unit_id"]} for w in evidence],
+        "source_reviewed_retirement": {"actor_id": entry["actor_id"], "entry_sha256": entry_sha},
+    }
+
+
+def _record_retirement_blocked(recovery: RecoveryLedger, actor_id: str, entry_sha: str, blockers: list[str], source_sha: str) -> None:
+    current = f"{SOURCE_RETIREMENT_STAGE_ITEM}{actor_id}:{entry_sha[:16]}:{payload_hash(blockers)[:12]}"
+    if any(row["item"].startswith(current) for row in recovery.open_pending(SOURCE_RETIREMENT_STAGE)):
+        return
+    # a generation suffix lets a blocker set that recurs after being superseded open a fresh row
+    generation = sum(
+        1
+        for e in recovery.entries()
+        if e["stage"] == SOURCE_RETIREMENT_STAGE and e["severity"] == "pending" and e["item"].startswith(current)
+    )
+    recovery.record(
+        SOURCE_RETIREMENT_STAGE,
+        f"{current}:{generation}",
+        SOURCE_RETIREMENT_BLOCKED,
+        f"source-reviewed retirement of {actor_id} is blocked: " + "; ".join(blockers),
+        severity="pending",
+        evidence={
+            "source": ["book"],
+            "source_hash": {"book": source_sha},
+            "actor_id": actor_id,
+            "entry_sha256": entry_sha,
+            "blockers": blockers,
+        },
+    )
+
+
+SOURCE_RETIREMENT_STAGE_ITEM = "source_retirement:"
+
+
+def ingest_source_reviewed_retirements(
+    project: Path, source_sha: str, chapters: list[Path], progress: dict, recovery: RecoveryLedger
+) -> dict:
+    """Retire every prepared prose actor the caretaker input names and that passes every gate; return what happened.
+
+    The whole file (contract, book sha, exact current registry digest, entry schema) fails closed before any write. A gate
+    failure only blocks that one actor (typed pending row, nothing written for it). An input file is processed once
+    (its hash is recorded append-only), so a file left in place never replays against a registry it no longer matches.
+    """
+    outcome: dict = {"retired": [], "blocked": [], "already": False}
+    path = project / SOURCE_RETIREMENT_NAME
+    if not path.is_file():
+        return outcome
+    payload = load_object(path, "caretaker source-reviewed retirements")
+    if (
+        set(payload) != {"contract", "version", "source_sha256", "registry_sha256", "retirements"}
+        or payload["contract"] != SOURCE_RETIREMENT_CONTRACT
+        or payload["version"] != SOURCE_RETIREMENT_VERSION
+        or not isinstance(payload["registry_sha256"], str)
+        or not isinstance(payload["retirements"], list)
+    ):
+        raise _retirement_invalid("unsupported contract or schema")
+    if payload["source_sha256"] != source_sha:
+        raise _retirement_invalid("file belongs to a different source book")
+    history, inputs = progress.get(SOURCE_RETIREMENT_HISTORY, []), progress.get(SOURCE_RETIREMENT_INPUTS, [])
+    if not isinstance(history, list) or not isinstance(inputs, list):
+        raise _retirement_invalid("progress retirement history is invalid")
+    input_sha = payload_hash(payload)
+    if input_sha in inputs:
+        outcome["already"] = True
+        return outcome
+    registry, aliases = progress["registry"], progress["aliases"]
+    before = registry_digest(registry)
+    if payload["registry_sha256"] != before:
+        raise _retirement_invalid("file was reviewed against a different registry than the current one")
+    seen: set[str] = set()
+    for entry in payload["retirements"]:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != SOURCE_RETIREMENT_FIELDS
+            or entry["action"] != SOURCE_RETIRE_ACTION
+            or not isinstance(entry["actor_id"], str)
+            or not IDENTIFIER.match(entry["actor_id"])
+            or entry["actor_id"] in seen
+            or HUMAN_REVIEW_CLAIM.search(json.dumps(entry))
+        ):
+            raise _retirement_invalid(
+                f"entry has an invalid schema, repeats an actor or claims a human review (only {SOURCE_RETIRE_ACTION!r} exists)"
+            )
+        seen.add(entry["actor_id"])
+    ctx = {
+        "registry": registry,
+        "aliases": aliases,
+        "chapters": chapters,
+        "source": _ChapterSource(chapters),
+        "characters": load_object(project / "characters.json", "characters profile"),
+        "voices": load_object(project / "voices.json", "voice profiles"),
+        "scoped": load_scoped_audit(project),
+        "recovery": recovery,
+        "audit": _alias_audit_records(project),
+    }
+    ready: list[tuple[dict, str, dict]] = []
+    for entry in payload["retirements"]:
+        entry_sha = payload_hash(entry)
+        blockers, plan = _retirement_blockers(entry, ctx)
+        actor_id = entry["actor_id"]
+        current = f"{SOURCE_RETIREMENT_STAGE_ITEM}{actor_id}:{entry_sha[:16]}:{payload_hash(blockers)[:12]}"
+        for row in recovery.open_pending(SOURCE_RETIREMENT_STAGE):
+            if row["item"].startswith(f"{SOURCE_RETIREMENT_STAGE_ITEM}{actor_id}:") and (not blockers or not row["item"].startswith(current)):
+                recovery.resolve(row, "source_retirement_superseded", {"entry_sha256": entry_sha})
+        if blockers:
+            _record_retirement_blocked(recovery, actor_id, entry_sha, blockers, source_sha)
+            outcome["blocked"].append({"actor_id": actor_id, "entry_sha256": entry_sha, "blockers": blockers})
+        else:
+            ready.append((entry, entry_sha, plan))
+    # 1. scoped audit: one non_character decision per own reference (idempotent; a superseded decision stays as history)
+    records, wrote = ctx["scoped"], False
+    for entry, entry_sha, plan in ready:
+        for scope in plan["own_refs"]:
+            prior = mention_scoped_audit_index(records).get(_scope_tuple(scope))
+            if prior and prior["decision"] == "non_character":
+                continue
+            supersede_scoped_record(records, mention_scoped_audit_index(records), _scope_tuple(scope), _non_character_record(entry, entry_sha, scope, plan["evidence"]))
+            wrote = True
+    if wrote:
+        mention_scoped_audit_index(records)
+        atomic_json(project / SCOPED_AUDIT_NAME, {"records": records})
+    # 2. registry/aliases and append-only history, durable in the progress file together with the processed input hash
+    for entry, entry_sha, plan in ready:
+        actor_id = entry["actor_id"]
+        removed = sorted(key for key, target in aliases.items() if target == actor_id)
+        history.append(
+            {
+                "actor_id": actor_id,
+                "entry_sha256": entry_sha,
+                "input_sha256": input_sha,
+                "source_sha256": source_sha,
+                "registry_sha256_before": before,
+                "reviewer_role": entry["reviewer_role"],
+                "factual_basis": entry["factual_basis"],
+                "evidence": plan["evidence"],
+                "own_refs": plan["own_refs"],
+                "retired_entry": copy.deepcopy(plan["entry"]),
+                "removed_aliases": removed,
+            }
+        )
+        del registry[actor_id]
+        for key in removed:
+            del aliases[key]
+        outcome["retired"].append(actor_id)
+    progress[SOURCE_RETIREMENT_HISTORY] = history
+    progress[SOURCE_RETIREMENT_INPUTS] = [*inputs, input_sha]
+    atomic_json(project / PROGRESS_NAME, progress)
+    # 3. durable resolution of the quality flags the retirement answers (rows are appended, never rewritten)
+    for entry, entry_sha, _ in ready:
+        for row in recovery.open_pending("cast_quality"):
+            evidence = row["evidence"] if isinstance(row.get("evidence"), dict) else {}
+            if str(row.get("code", "")).startswith("quality_") and evidence.get("registry_id") == entry["actor_id"]:
+                recovery.resolve(row, "actor_retired_source_reviewed", {"actor_id": entry["actor_id"], "entry_sha256": entry_sha})
+    return outcome
+
+
+def _alias_audit_records(project: Path) -> list:
+    path = project / AUDIT_NAME
+    if not path.is_file():
+        return []
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise OperationalError("cast_integrity", "alias audit is unreadable") from error
+    records = report if isinstance(report, list) else report.get("records") if isinstance(report, dict) else None
+    if not isinstance(records, list):
+        raise OperationalError("cast_integrity", "alias audit requires a records array")
+    return records
+
+
+# ##################################################################
 # exact scope
 # a recorded row is retried only while every chapter it names still exists with its exact recorded bytes hash; anything else is stale and stays open.
 def exact_scope(row: dict, by_name: dict[str, Path]) -> bool:
@@ -6539,6 +6867,7 @@ def prepare_cast(
     ingest_context_quality_proposals(project, source_sha, chapters, progress["registry"], recovery)
     ingest_context_resolution_v2(project, source_sha, chapters, progress["registry"], progress["aliases"], recovery)
     ingest_root_approvals(project, source_sha, chapters, progress, recovery)
+    ingest_source_reviewed_retirements(project, source_sha, chapters, progress, recovery)
     earlier = {row_key(row) for row in recovery.open_quarantined("cast")}
     # Historical 0..cursor batches had structural hashes only. Reclassify that prefix under the semantic ledger before touching the next production batch.
     # A data problem quarantines only the offending chapter (semantic ledger only; the structural cursor never moves backwards).
@@ -6554,6 +6883,7 @@ def prepare_cast(
         ingest_context_quality_proposals(project, source_sha, chapters, progress["registry"], recovery)
         ingest_context_resolution_v2(project, source_sha, chapters, progress["registry"], progress["aliases"], recovery)
         ingest_root_approvals(project, source_sha, chapters, progress, recovery)
+        ingest_source_reviewed_retirements(project, source_sha, chapters, progress, recovery)
         atomic_json(progress_path, progress)
         start = int(progress["next_chapter"])
         for unit in recoverable_batches(
@@ -6582,6 +6912,7 @@ def prepare_cast(
         *active_quality_pending(recovery, progress["registry"]),
         *recovery.open_pending(CONTEXT_V2_STAGE),
         *recovery.open_pending(ROOT_APPROVAL_STAGE),
+        *recovery.open_pending(SOURCE_RETIREMENT_STAGE),
     ]
     if blocked or pending_rows or quality_rows:
         # Publication refuses (typed status, no manifest) until cast uncertainty and every

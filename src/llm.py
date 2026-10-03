@@ -211,13 +211,27 @@ def request_for(
         if response_schema is not None:
             request["format"] = response_schema
         return f"{backend.url}/api/chat", json.dumps(request).encode("utf-8")
-    request = {"model": backend.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+    request = {
+        "model": backend.model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        # TensorFold's OpenAI-compatible Qwen endpoint otherwise enables reasoning by template default;
+        # account it explicitly instead of exhausting structured-output budgets before content.
+        "chat_template_kwargs": {"enable_thinking": backend.think},
+    }
     if response_schema is not None:
         request["response_format"] = {
             "type": "json_schema",
             "json_schema": {"name": "response", "strict": True, "schema": response_schema},
         }
-    return f"{backend.url}/v1/chat/completions", json.dumps(request).encode("utf-8")
+    openai_base = backend.url.rstrip("/")
+    endpoint = (
+        f"{openai_base}/chat/completions"
+        if openai_base.endswith("/v1")
+        else f"{openai_base}/v1/chat/completions"
+    )
+    return endpoint, json.dumps(request).encode("utf-8")
 
 
 # ##################################################################

@@ -162,6 +162,16 @@ def test_request_payload_uses_selected_backend() -> None:
 
 
 # ##################################################################
+# test OpenAI thinking template
+# OpenAI-compatible Qwen routes receive an explicit template setting so structured output does not spend its budget on hidden reasoning.
+def test_openai_payload_disables_thinking_by_default() -> None:
+    openai = Backend("http://10.0.0.42:11436/v1", "10.0.0.42", "qwen3.6:35b-a3b", "openai", 262144, False)
+    url, payload = request_for(openai, [{"role": "user", "content": "hello"}], 0.0, 64, None)
+    assert url == "http://10.0.0.42:11436/v1/chat/completions"
+    assert json.loads(payload)["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+# ##################################################################
 # test strip think
 # reasoning blocks a thinking model emits must be removed.
 def test_strip_think() -> None:

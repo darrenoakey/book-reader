@@ -64,6 +64,8 @@ CATEGORIES = (
 FACT_FIELDS = ("subject", "category", "value", "quote", "paragraph_id")
 CALIBRATION_MIN_SAMPLES = 3
 CALIBRATION_MIN_LARGE_TOKENS = 10_000
+# the provider's chat template / BOS adds a constant number of tokens to every prompt (measured +16: 236→252, 3030→3046, 10122→10138); anything above this cap is drift, not template overhead.
+MAX_FIXED_OVERHEAD_TOKENS = 64
 SYSTEM_PROMPT = (
     "You extract character biography facts from a book excerpt. Return only JSON matching the schema. "
     "Every fact must be literally supported: `quote` is an exact, unmodified, contiguous substring of the paragraph "
@@ -403,8 +405,21 @@ def padded(tokens: int, tolerance_percent: float) -> int:
 
 
 def build_plan(
-    source: str, chapters: Sequence[Path], config: ProofConfig, count: Counter
+    source: str,
+    chapters: Sequence[Path],
+    config: ProofConfig,
+    count: Counter,
+    fixed_overhead: int = 0,
 ) -> ExtractionPlan:
+    if (
+        not isinstance(fixed_overhead, int)
+        or isinstance(fixed_overhead, bool)
+        or not 0 <= fixed_overhead <= MAX_FIXED_OVERHEAD_TOKENS
+    ):
+        raise ContractError(
+            f"fixed overhead must be an integer in 0..{MAX_FIXED_OVERHEAD_TOKENS}",
+            "overhead_invalid",
+        )
     chunks, coverage = pack_source(source, config.chunk_chars, chapters)
     system_tokens = count(SYSTEM_PROMPT)
     planned = []
@@ -412,7 +427,12 @@ def build_plan(
         user = render_user(chunk)
         tokens = system_tokens + count(user)
         planned.append(
-            PlannedChunk(chunk, user, tokens, padded(tokens, config.tolerance_percent))
+            PlannedChunk(
+                chunk,
+                user,
+                tokens,
+                padded(tokens + fixed_overhead, config.tolerance_percent),
+            )
         )
     over = [
         item.chunk.id for item in planned if item.padded_tokens > config.input_budget
@@ -429,6 +449,7 @@ def build_plan(
         "output_tokens": config.output_tokens,
         "reserve_tokens": config.reserve_tokens,
         "tolerance_percent": config.tolerance_percent,
+        "fixed_overhead_tokens": fixed_overhead,
         "input_budget": config.input_budget,
         "tokenizer_capture_sha256": config.tokenizer_sha256,
         "schema_sha256": sha256_text(canonical_json(SCHEMA)),
@@ -454,7 +475,7 @@ def build_plan(
 
 # ##################################################################
 # calibration
-# a measured record pairing local counts with the server's prompt_eval_count for real prompts. The run is allowed only if the server never counts more than the padded local count, the samples include a large prompt, and the record names this model and tokenizer.
+# a measured record pairing local counts with the server's prompt_eval_count for real prompts. The server count must equal the local count plus ONE constant, non-negative, bounded chat-template/BOS overhead (returned as fixed_overhead_tokens and budgeted explicitly by the plan); a varying difference is drift and is refused. Non-zero overhead must be shown across at least two prompt sizes, the samples include a large prompt, and the record names this model and tokenizer.
 def validate_calibration(record: dict, config: ProofConfig) -> dict:
     if (
         not isinstance(record, dict)
@@ -470,11 +491,16 @@ def validate_calibration(record: dict, config: ProofConfig) -> dict:
             f"calibration needs at least {CALIBRATION_MIN_SAMPLES} samples",
             "calibration_insufficient",
         )
-    worst = 0.0
+    deltas = set()
     for sample in samples:
-        local, server = sample.get("local_tokens"), sample.get("prompt_eval_count")
+        local, server = (
+            sample.get("local_tokens") if isinstance(sample, dict) else None,
+            sample.get("prompt_eval_count") if isinstance(sample, dict) else None,
+        )
         if (
             not (isinstance(local, int) and isinstance(server, int))
+            or isinstance(local, bool)
+            or isinstance(server, bool)
             or local < 1
             or server < 1
         ):
@@ -482,17 +508,33 @@ def validate_calibration(record: dict, config: ProofConfig) -> dict:
                 "calibration samples need positive integer local_tokens and prompt_eval_count",
                 "calibration_invalid",
             )
-        worst = max(worst, (server - local) / local * 100)
-    if worst > config.tolerance_percent:
+        deltas.add(server - local)
+    if len(deltas) != 1:
         raise ContractError(
-            f"server counts exceed local by {worst:.3f}% > {config.tolerance_percent}%",
+            f"server-minus-local differs between samples ({sorted(deltas)}); not a constant template overhead",
             "calibration_drift",
+        )
+    overhead = deltas.pop()
+    if overhead < 0:
+        raise ContractError(
+            f"server counts fewer tokens than local ({overhead}); overhead cannot be negative",
+            "calibration_overhead_negative",
+        )
+    if overhead > MAX_FIXED_OVERHEAD_TOKENS:
+        raise ContractError(
+            f"fixed overhead {overhead} exceeds the {MAX_FIXED_OVERHEAD_TOKENS}-token cap; this is drift, not template overhead",
+            "calibration_drift",
+        )
+    if overhead and len({sample["local_tokens"] for sample in samples}) < 2:
+        raise ContractError(
+            "a non-zero overhead needs samples of at least two different prompt sizes to prove it constant",
+            "calibration_insufficient",
         )
     if max(sample["local_tokens"] for sample in samples) < CALIBRATION_MIN_LARGE_TOKENS:
         raise ContractError(
             "calibration lacks a large-prompt sample", "calibration_insufficient"
         )
-    return {"samples": len(samples), "worst_drift_percent": round(worst, 4)}
+    return {"samples": len(samples), "fixed_overhead_tokens": overhead}
 
 
 # ##################################################################
@@ -708,7 +750,12 @@ def run_extraction(
 ) -> dict:
     check_output_dir(out_dir, chapters)
     if transport is not None:
-        validate_calibration(calibration or {}, config)
+        measured = validate_calibration(calibration or {}, config)
+        if measured["fixed_overhead_tokens"] != plan.artifact["fixed_overhead_tokens"]:
+            raise ContractError(
+                f"plan budgeted {plan.artifact['fixed_overhead_tokens']} overhead tokens but calibration measured {measured['fixed_overhead_tokens']}",
+                "calibration_overhead_mismatch",
+            )
     started = clock()
     write_atomic(
         out_dir / "plan.json", json.dumps(plan.artifact, indent=2, sort_keys=True)
@@ -882,6 +929,13 @@ def main(argv: list[str] | None = None) -> int:
         item.add_argument("--out", type=Path, required=True)
     run = sub.choices["run"]
     run.add_argument("--calibration", type=Path, required=True)
+    for name in ("plan", "validate"):
+        sub.choices[name].add_argument(
+            "--calibration",
+            type=Path,
+            default=None,
+            help="optional calibration record; its fixed template overhead is budgeted into the plan (run always requires it)",
+        )
     run.add_argument(
         "--execute",
         action="store_true",
@@ -896,8 +950,26 @@ def main(argv: list[str] | None = None) -> int:
         config = load_proof_config(args.config)
         chapters = project_chapters(args.project.resolve())
         check_output_dir(args.out, chapters)
+        if args.command == "run" and not args.execute:
+            raise ContractError("run requires --execute", "execute_required")
+        calibration = None
+        overhead = 0
+        if args.calibration is not None:
+            try:
+                calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise ContractError(
+                    "calibration record is not readable JSON", "calibration_invalid"
+                ) from error
+            overhead = validate_calibration(calibration, config)[
+                "fixed_overhead_tokens"
+            ]
         plan = build_plan(
-            read_source(args.source), chapters, config, build_counter(config)
+            read_source(args.source),
+            chapters,
+            config,
+            build_counter(config),
+            overhead,
         )
         if args.command == "plan":
             write_atomic(
@@ -911,6 +983,7 @@ def main(argv: list[str] | None = None) -> int:
                         for key in (
                             "plan_sha256",
                             "input_budget",
+                            "fixed_overhead_tokens",
                             "calibration_required",
                             "coverage",
                         )
@@ -928,10 +1001,6 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
-        if not args.execute:
-            raise ContractError("run requires --execute", "execute_required")
-        calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
-        validate_calibration(calibration, config)
         pid_file, exit_file = args.out / "run.pid", args.out / "run.exit"
         write_atomic(pid_file, str(os.getpid()))
         summary = run_extraction(

@@ -7,11 +7,13 @@ import pytest
 
 from src.wide_bio import (
     CATEGORIES,
+    MAX_FIXED_OVERHEAD_TOKENS,
     ContractError,
     build_counter,
     build_plan,
     load_proof_config,
     main,
+    padded,
     project_chapters,
     run_extraction,
     validate_calibration,
@@ -462,3 +464,153 @@ def test_cli_plan_validate_and_run_gate(world, capsys: pytest.CaptureFixture) ->
     cal.write_text("{}", encoding="utf-8")
     assert main(["run", *base, "--calibration", str(cal)]) == 2
     assert "execute_required" in capsys.readouterr().err
+
+
+def overhead_record(config, pairs) -> dict:
+    return {
+        "model": config.backend.model,
+        "tokenizer_capture_sha256": config.tokenizer_sha256,
+        "samples": [
+            {"local_tokens": local, "prompt_eval_count": server}
+            for local, server in pairs
+        ],
+    }
+
+
+REAL_PAIRS = ((236, 252), (3030, 3046), (10122, 10138))
+
+
+def test_calibration_accepts_constant_template_overhead(world) -> None:
+    config, _, _ = one_chunk(world)
+    measured = validate_calibration(overhead_record(config, REAL_PAIRS), config)
+    assert measured == {"samples": 3, "fixed_overhead_tokens": 16}
+    assert (
+        validate_calibration(calibration(config, config.tokenizer_sha256), config)[
+            "fixed_overhead_tokens"
+        ]
+        == 0
+    )
+
+
+def test_calibration_rejects_variable_negative_and_excessive_overhead(world) -> None:
+    config, _, _ = one_chunk(world)
+    cap = MAX_FIXED_OVERHEAD_TOKENS
+    cases = (
+        # proportional drift: 0.5% of each prompt is not a constant
+        (((236, 237), (3030, 3045), (10122, 10173)), "calibration_drift"),
+        # one sample off by a single token
+        (((236, 252), (3030, 3046), (10122, 10139)), "calibration_drift"),
+        (((236, 252), (3030, 3029), (10122, 10138)), "calibration_drift"),
+        (((236, 235), (3030, 3029), (10122, 10121)), "calibration_overhead_negative"),
+        (
+            ((236, 236 + cap + 1), (3030, 3030 + cap + 1), (10122, 10122 + cap + 1)),
+            "calibration_drift",
+        ),
+        (((20000, 20016),) * 3, "calibration_insufficient"),
+    )
+    for pairs, code in cases:
+        with pytest.raises(ContractError) as error:
+            validate_calibration(overhead_record(config, pairs), config)
+        assert error.value.code == code, pairs
+    edge = tuple((n, n + cap) for n in (236, 3030, 10122))
+    assert (
+        validate_calibration(overhead_record(config, edge), config)[
+            "fixed_overhead_tokens"
+        ]
+        == cap
+    )
+    with pytest.raises(ContractError) as error:
+        validate_calibration(
+            overhead_record(config, ((236, 252), (3030, 3046), (5000, 5016))), config
+        )
+    assert error.value.code == "calibration_insufficient"
+
+
+def test_plan_budgets_fixed_overhead_and_records_it(world) -> None:
+    _, config_path, _, project, source = world
+    config = load_proof_config(config_path)
+    args = (
+        source.read_text(encoding="utf-8"),
+        project_chapters(project),
+        config,
+        build_counter(config),
+    )
+    base = build_plan(*args)
+    shifted = build_plan(*args, 16)
+    assert base.artifact["fixed_overhead_tokens"] == 0
+    assert shifted.artifact["fixed_overhead_tokens"] == 16
+    assert base.artifact["plan_sha256"] != shifted.artifact["plan_sha256"]
+    for before, after in zip(base.chunks, shifted.chunks):
+        assert after.input_tokens == before.input_tokens
+        assert after.padded_tokens > before.padded_tokens
+    assert [c["padded_tokens"] for c in shifted.artifact["chunks"]] == [
+        item.padded_tokens for item in shifted.chunks
+    ]
+    for bad in (-1, MAX_FIXED_OVERHEAD_TOKENS + 1, 1.5, True):
+        with pytest.raises(ContractError) as error:
+            build_plan(*args, bad)
+        assert error.value.code == "overhead_invalid"
+
+
+def test_overhead_pushes_chunk_over_input_budget(world) -> None:
+    _, config_path, _, project, source = world
+    config = load_proof_config(config_path)
+    args = (source.read_text(encoding="utf-8"), project_chapters(project), config)
+    half = max(
+        n
+        for n in range(config.input_budget)
+        if padded(2 * n, config.tolerance_percent) <= config.input_budget
+    )
+    build_plan(*args, lambda text: half, 0)
+    with pytest.raises(ContractError) as error:
+        build_plan(*args, lambda text: half, 16)
+    assert error.value.code == "input_budget_exceeded"
+
+
+def test_run_refuses_plan_built_without_calibrated_overhead(world) -> None:
+    root, *_ = world
+    config, plan, chapters = one_chunk(world)
+    record = overhead_record(config, REAL_PAIRS)
+    calls = []
+
+    def transport(url: str, payload: bytes, timeout: float) -> dict:
+        calls.append(url)
+        return {}
+
+    with pytest.raises(ContractError) as error:
+        run_extraction(chapters, config, plan, root / "mismatch", transport, record)
+    assert error.value.code == "calibration_overhead_mismatch"
+    assert calls == []
+
+
+def test_cli_run_builds_plan_with_calibrated_overhead(world, capsys) -> None:
+    root, config_path, _, project, source = world
+    config = load_proof_config(config_path)
+    cal = root / "real-cal.json"
+    cal.write_text(json.dumps(overhead_record(config, REAL_PAIRS)), encoding="utf-8")
+    base = [
+        str(project),
+        "--source",
+        str(source),
+        "--config",
+        str(config_path),
+    ]
+    out = root / "cli-cal"
+    assert main(["plan", *base, "--out", str(out), "--calibration", str(cal)]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["fixed_overhead_tokens"] == 16
+    assert json.loads((out / "plan.json").read_text())["fixed_overhead_tokens"] == 16
+    bad = root / "bad-cal.json"
+    bad.write_text(
+        json.dumps(overhead_record(config, ((236, 237), (3030, 3045), (10122, 10173)))),
+        encoding="utf-8",
+    )
+    runout = root / "cli-run"
+    assert (
+        main(
+            ["run", *base, "--out", str(runout), "--calibration", str(bad), "--execute"]
+        )
+        == 2
+    )
+    assert "calibration_drift" in capsys.readouterr().err
+    assert not (runout / "plan.json").exists()

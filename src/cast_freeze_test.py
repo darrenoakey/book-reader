@@ -962,3 +962,19 @@ def test_known_owner_candidate_chain_resolves_to_canonical_and_adjudicates() -> 
     genuine = {"candidate_id": other["id"], "status": "known", "identity": other["id"], "evidence_unit_ids": ["c00s00000"]}
     with pytest.raises(ValueError):
         validate_classification_chunk({"classifications": [genuine, fixed]}, [other, owned], registry, aliases, candidates, units, [])
+
+
+# ##################################################################
+# title vocative boundary
+# preserves exact title and narrative subject references without fabricating a title-name actor from missing dialogue punctuation.
+def test_title_vocative_followed_by_attribution_verb_is_not_full_name(tmp_path: Path) -> None:
+    from src.cast_freeze import candidate_coverage_ledger, immutable_evidence_units, immutable_name_references
+
+    chapter = tmp_path / "28-part_28.txt"
+    chapter.write_text("Professor Taro intervened, my beetle needs crystals.", encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    labels = {candidate["label"] for candidate in candidate_coverage_ledger(units, {}, {})}
+    references = immutable_name_references(units).values()
+    assert "Professor" in labels
+    assert any(reference["label"] == "Taro" for reference in references)
+    assert "Professor Taro" not in labels

@@ -53,6 +53,8 @@ ANCHOR_IDS = {
 IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
 NON_NAME_COMPOUND_PREFIXES = frozenset({"A", "An", "The", "All", "Each", "Every", "Some", "Any", "No", "Not", "Only", "As", "If", "When", "While", "After", "Before", "Because", "Although", "Though", "Since", "Unless", "And", "But", "Or", "Nor", "So", "Yet", "Then", "Also", "However", "Therefore", "In", "On", "At", "By", "From", "With", "Without", "For", "To", "Of", "Into", "Out", "Up", "Down", "Over", "Under", "Around", "Through", "Across", "During", "Beyond", "Within", "Against", "Between", "Among", "About"})
 NON_ENTITY_LABELS = frozenset({"Someone", "Anyone", "Everyone", "Nobody", "Nothing", "Something", "He", "She", "Him", "Her", "His", "Hers", "They", "Them", "Their", "Theirs", "It", "Its", "We", "Us", "Our", "Ours", "I", "Me", "My", "Mine", "You", "Your", "Yours"})
+TITLE_WORDS = frozenset({"Professor", "Master", "Doctor", "Captain", "Commander"})
+NARRATIVE_ATTRIBUTION_VERBS = frozenset({"added", "announced", "asked", "called", "continued", "intervened", "murmured", "ordered", "replied", "said", "shouted", "spoke", "whispered"})
 
 
 # ##################################################################
@@ -134,6 +136,12 @@ def immutable_name_references(units: list[dict[str, str]]) -> dict[str, dict[str
                 continue
             end = start
             while end < len(tokens) and end < start + 4:
+                # A title followed by a capitalized narrative subject and then an
+                # attribution verb is a malformed punctuation boundary, not a full name
+                # (e.g. "Professor Taro intervened").  Retain the title and subject as
+                # independent source references for semantic classification.
+                if end == start + 1 and token.group() in TITLE_WORDS and end + 1 < len(tokens) and tokens[end + 1].group().casefold() in NARRATIVE_ATTRIBUTION_VERBS:
+                    break
                 current = tokens[end]
                 possessive = current.group().endswith("'s")
                 current_label = current.group()[:-2] if possessive else current.group()

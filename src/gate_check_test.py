@@ -1,3 +1,4 @@
+import ast
 import socket
 import subprocess
 import threading
@@ -5,7 +6,16 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from src.gate_check import MOVIE_TESTS, changed_paths, select_tests, wait_for_json
+from src.gate_check import (
+    IMPACT,
+    MOVIE_PATHS,
+    RECOVERY_TESTS,
+    changed_paths,
+    select_tests,
+    wait_for_json,
+)
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 # ##################################################################
@@ -25,17 +35,19 @@ def test_select_tests() -> None:
         "src/movie_resolution_test.py",
         "src/dep_install_test.py",
         "src/gate_check_test.py",
+        "src/pipeline_test.py",
+        "src/step_runner_test.py",
     )
     assert "src/movie_images_test.py" not in entry
     schema = select_tests(["src/hourly_spans.py", "src/hourly_spans_test.py", "src/llm.py"])
     assert schema == (
         "src/hourly_spans_test.py",
-        "src/llm_test.py",
         "src/script_generate_test.py",
+        "src/llm_test.py",
     )
     assert "src/movie_images_test.py" not in schema
     assert "src/movie_assemble_test.py" not in schema
-    assert select_tests(["src/server.py"]) == MOVIE_TESTS
+    assert select_tests(["src/server.py"]) == ("src/server_test.py",)
     assert select_tests(["run", "src/dep_install.py", "src/dep_install_test.py"]) == (
         "src/hour_runner_test.py::test_hour_verify_only_cli_uses_venv",
         "src/hour_continue_test.py",
@@ -44,7 +56,10 @@ def test_select_tests() -> None:
         "src/gate_check_test.py",
     )
     assert select_tests(["src/hour_continue.py", "src/hour_continue_test.py"]) == ("src/hour_continue_test.py",)
-    assert select_tests(["src/audio_synth.py", "src/audio_synth_test.py"]) == ("src/audio_synth_test.py",)
+    assert select_tests(["src/audio_synth.py", "src/audio_synth_test.py"]) == (
+        "src/audio_synth_test.py",
+        "src/data_recovery_test.py",
+    )
     assert select_tests(["src/arbiter_tts.py", "src/arbiter_tts_test.py"]) == (
         "src/arbiter_tts_test.py",
         "src/movie_images_test.py",
@@ -130,3 +145,128 @@ def test_wait_for_json_fails_closed_port() -> None:
     rc, _message = wait_for_json(f"http://127.0.0.1:{port}/api/projects", 0.6)
     assert rc == 1
     assert time.monotonic() - started < 2
+
+
+# ##################################################################
+# import graph
+# Parse the real source files so the selector is checked against actual
+# imports rather than a second hand-maintained list.
+def _imports(path: Path) -> set[str]:
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("src."):
+                found.add(module.split(".")[1])
+            elif module == "src" or (node.level == 1 and not module):
+                found.update(alias.name for alias in node.names)
+            elif node.level == 1:
+                found.add(module.split(".")[0])
+        elif isinstance(node, ast.Import):
+            found.update(a.name.split(".")[1] for a in node.names if a.name.startswith("src."))
+    return found
+
+
+def _consumers(target: str) -> set[str]:
+    modules = {path.stem: _imports(path) for path in (ROOT / "src").glob("*.py")}
+    reached: set[str] = set()
+    pending = [target]
+    while pending:
+        current = pending.pop()
+        for name, deps in modules.items():
+            if current in deps and name not in reached:
+                reached.add(name)
+                pending.append(name)
+    return reached
+
+
+# ##################################################################
+# test recovery consumers map to real suites
+# Every module that transitively imports data_recovery, and every test that does,
+# must be executed when data_recovery changes, using the real import graph.
+def test_data_recovery_selects_all_transitive_consumers() -> None:
+    suites = {f"src/{name}.py" for name in _consumers("data_recovery") if name.endswith("_test")}
+    selected = select_tests(["src/data_recovery.py"])
+    assert selected is not None
+    assert set(selected) == set(RECOVERY_TESTS) == suites
+    assert select_tests(["src/data_recovery_test.py"]) == ("src/data_recovery_test.py",)
+
+
+# ##################################################################
+# test consumers select their own suite and the recovery contract suite
+# A consumer change must run its own test and, when the recovery suite imports
+# the consumer, that suite too. Neither may fall back to the repository scanner.
+def test_recovery_consumers_select_own_and_contract_suites() -> None:
+    contract_imports = _imports(ROOT / "src" / "data_recovery_test.py")
+    for name in sorted(_consumers("data_recovery")):
+        if name.endswith("_test"):
+            continue
+        selected = select_tests([f"src/{name}.py"])
+        assert selected is not None, name
+        assert f"src/{name}_test.py" in selected, name
+        if name in contract_imports:
+            assert "src/data_recovery_test.py" in selected, name
+        for test in selected:
+            assert (ROOT / test.split("::")[0]).exists(), test
+
+
+# ##################################################################
+# test selector tables are internally consistent
+# Every mapped path and test exists on disk and is inside the gated surface, so
+# an entry cannot silently select nothing or fall outside the allowed set.
+def test_impact_tables_reference_real_files() -> None:
+    for path, tests in IMPACT.items():
+        assert path in MOVIE_PATHS, path
+        assert (ROOT / path).exists(), path
+        for test in tests:
+            assert (ROOT / test.split("::")[0]).exists(), test
+
+
+# ##################################################################
+# test branch test files and unknown paths
+# Newly added co-located tests select themselves; unknown code stays fail-closed.
+def test_branch_tests_select_themselves_and_unknown_fails_closed() -> None:
+    for path in (
+        "jeff_book_test.py",
+        "src/conftest_test.py",
+        "src/server_test.py",
+        "src/kokoro_voices_test.py",
+        "src/tts_engine_test.py",
+        "src/voice_acoustic_test.py",
+        "src/voice_clone_test.py",
+        "src/breeze_voices_test.py",
+        "src/demo_outputs_test.py",
+        "src/pipeline_test.py",
+        "src/step_runner_test.py",
+    ):
+        assert select_tests([path]) == (path,), path
+    assert select_tests(["jeff_book.py"]) == ("jeff_book_test.py",)
+    assert select_tests(["src/conftest.py"]) is None
+    assert select_tests(["src/data_recovery.py", "src/not_a_real_module.py"]) is None
+
+
+# ##################################################################
+# test future recovery consumers cannot be missed
+# Any source file that references data_recovery at all (import in any form or
+# a dynamic/string reference) must be a graph consumer whose own suite is selected
+# by a standalone data_recovery change. A module that mentions it without being
+# in the graph, or a consumer whose suite is unmapped, fails here so the map
+# must be extended with the new edge.
+def test_every_data_recovery_reference_is_selected() -> None:
+    selected = select_tests(["src/data_recovery.py"])
+    assert selected is not None
+    consumers = _consumers("data_recovery")
+    for path in sorted((ROOT / "src").glob("*.py")):
+        if path.stem in {"data_recovery", "gate_check", "gate_check_test"}:
+            continue
+        if "data_recovery" in path.read_text():
+            assert path.stem in consumers, f"{path.name} references data_recovery outside the import graph"
+    for name in sorted(consumers):
+        suite = name if name.endswith("_test") else f"{name}_test"
+        if (ROOT / "src" / f"{suite}.py").exists():
+            assert f"src/{suite}.py" in selected, f"data_recovery change misses {suite}"
+    # hourly_spans imports only llm, so it is not a recovery consumer; its suite
+    # runs through the script_generate edge instead of the recovery set.
+    assert "hourly_spans" not in consumers
+    assert "src/hourly_spans_test.py" in select_tests(["src/hourly_spans.py"])
+    assert "src/script_generate_test.py" in selected

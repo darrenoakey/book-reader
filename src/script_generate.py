@@ -7,6 +7,7 @@ import tempfile
 import unicodedata
 from pathlib import Path
 
+from src.data_recovery import OperationalError, RecoveryLedger, is_data_error
 from src.hourly_spans import classify_spans
 from src.llm import ask
 
@@ -132,9 +133,7 @@ class ScriptGenerationError(Exception):
 
 
 def build_prompt(chunk: str, speakers_list: str) -> str:
-    return _PROMPT_TEMPLATE.replace("@@SPEAKERS@@", speakers_list).replace(
-        "@@CHUNK@@", chunk
-    )
+    return _PROMPT_TEMPLATE.replace("@@SPEAKERS@@", speakers_list).replace("@@CHUNK@@", chunk)
 
 
 def _entry_pair(entry: object) -> tuple[str, str]:
@@ -157,11 +156,7 @@ def parse_jsonl_strict(text: str) -> list[dict]:
             entry = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ScriptGenerationError(f"unparseable line: {line[:80]!r}") from exc
-        if (
-            isinstance(entry, dict)
-            and "text" in entry
-            and ("speaker_id" in entry or "speaker" in entry)
-        ):
+        if isinstance(entry, dict) and "text" in entry and ("speaker_id" in entry or "speaker" in entry):
             entry = {entry.get("speaker_id", entry.get("speaker")): entry["text"]}
         _entry_pair(entry)
         result.append(entry)
@@ -186,9 +181,7 @@ def validate_chunk(parsed: list[dict], chunk: str, speaker_ids: list[str]) -> No
         total += _letters(text)
     source = _letters(chunk)
     if source and not (MIN_COVERAGE * source <= total <= MAX_COVERAGE * source):
-        raise ScriptGenerationError(
-            f"coverage {total}/{source} letters outside accepted range"
-        )
+        raise ScriptGenerationError(f"coverage {total}/{source} letters outside accepted range")
 
 
 def normalized_words(text: str) -> list[str]:
@@ -213,10 +206,15 @@ def validate_script_lines(
             raise ScriptGenerationError("script has unknown speaker or empty text")
         script_words.extend(normalized_words(text))
     if script_words != source_words:
-        mismatch = next((i for i, pair in enumerate(zip(source_words, script_words)) if pair[0] != pair[1]), min(len(source_words), len(script_words)))
+        mismatch = next(
+            (i for i, pair in enumerate(zip(source_words, script_words)) if pair[0] != pair[1]),
+            min(len(source_words), len(script_words)),
+        )
         expected = source_words[mismatch] if mismatch < len(source_words) else "<end>"
         actual = script_words[mismatch] if mismatch < len(script_words) else "<end>"
-        raise ScriptGenerationError(f"script source coverage differs at word {mismatch}: expected {expected!r}, got {actual!r}")
+        raise ScriptGenerationError(
+            f"script source coverage differs at word {mismatch}: expected {expected!r}, got {actual!r}"
+        )
 
 
 # ##################################################################
@@ -249,11 +247,7 @@ def meta_path_for(script_path: Path) -> Path:
 
 def _read_lines(script_path: Path) -> list[dict] | None:
     try:
-        return [
-            json.loads(x)
-            for x in script_path.read_text(encoding="utf-8").splitlines()
-            if x.strip()
-        ]
+        return [json.loads(x) for x in script_path.read_text(encoding="utf-8").splitlines() if x.strip()]
     except (OSError, ValueError):
         return None
 
@@ -286,13 +280,9 @@ def _atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
-def write_canonical_script(
-    script_path: Path, lines: list[dict], fingerprint: str
-) -> None:
+def write_canonical_script(script_path: Path, lines: list[dict], fingerprint: str) -> None:
     """Atomically publish script then meta; a script without matching meta is never treated as cached."""
-    payload = "".join(
-        json.dumps(line, ensure_ascii=False) + "\n" for line in lines
-    ).encode("utf-8")
+    payload = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines).encode("utf-8")
     meta = {
         "fingerprint": fingerprint,
         "sha256": hashlib.sha256(payload).hexdigest(),
@@ -327,14 +317,10 @@ async def _process_chunk(chunk: str, speaker_ids: list[str], label: str) -> list
             return parsed
         except ScriptGenerationError as exc:
             last_error = str(exc)
-    raise ScriptGenerationError(
-        f"{label}: no valid script after {MAX_ATTEMPTS} attempts ({last_error})"
-    )
+    raise ScriptGenerationError(f"{label}: no valid script after {MAX_ATTEMPTS} attempts ({last_error})")
 
 
-async def generate_chapter_script(
-    chapter_text: str, chapter_title: str, speaker_ids: list[str]
-) -> list[dict]:
+async def generate_chapter_script(chapter_text: str, chapter_title: str, speaker_ids: list[str]) -> list[dict]:
     # The model chooses only a speaker ID. immutable_spans retains each source
     # sentence byte-for-byte, so a smaller backup model cannot omit or rewrite
     # narration while the existing canonical JSONL/cache contract is unchanged.
@@ -346,9 +332,7 @@ async def generate_chapter_script(
 # ##################################################################
 # generate script for chapter file
 # process a single chapter file to jsonl
-async def generate_script_for_file(
-    chapter_path: Path, script_dir: Path, speaker_ids: list[str]
-) -> Path:
+async def generate_script_for_file(chapter_path: Path, script_dir: Path, speaker_ids: list[str]) -> Path:
     script_name = chapter_path.stem + ".jsonl"
     script_path = script_dir / script_name
     chapter_text = chapter_path.read_text(encoding="utf-8")
@@ -379,8 +363,13 @@ async def generate_script_for_file(
 def get_speaker_ids(output_dir: Path) -> list[str]:
     voices_path = output_dir / "voices.json"
     if not voices_path.exists():
-        raise ValueError("voices.json not found")
-    voices = json.loads(voices_path.read_text(encoding="utf-8"))
+        raise OperationalError("voices_missing", "voices.json not found")
+    try:
+        voices = json.loads(voices_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise OperationalError("voices_unreadable", f"voices.json is unreadable: {voices_path}") from error
+    if not isinstance(voices, dict) or not voices:
+        raise OperationalError("voices_invalid", f"voices.json is not a non-empty object: {voices_path}")
     return list(voices.keys())
 
 
@@ -394,9 +383,7 @@ async def generate_single_script(output_dir: Path, chapter_num: int) -> Path:
     script_dir.mkdir(parents=True, exist_ok=True)
     chapter_files = sorted(chapters_dir.glob("*.txt"))
     if chapter_num < 0 or chapter_num >= len(chapter_files):
-        raise ValueError(
-            f"Chapter {chapter_num} not found (have {len(chapter_files)} chapters)"
-        )
+        raise ValueError(f"Chapter {chapter_num} not found (have {len(chapter_files)} chapters)")
     chapter_path = chapter_files[chapter_num]
     script_name = chapter_path.stem + ".jsonl"
     script_path = script_dir / script_name
@@ -422,14 +409,21 @@ async def generate_all_scripts(output_dir: Path) -> list[Path]:
     script_dir.mkdir(parents=True, exist_ok=True)
     chapter_files = sorted(chapters_dir.glob("*.txt"))
     print(f"Generating {len(chapter_files)} chapter scripts in parallel...")
-    return list(
-        await asyncio.gather(
-            *(
-                generate_script_for_file(p, script_dir, speaker_ids)
-                for p in chapter_files
-            )
-        )
-    )
+    ledger = RecoveryLedger(output_dir)
+
+    async def one(index: int, path: Path) -> Path | None:
+        # A data problem quarantines this chapter only (no script is published for it, nothing is
+        # fabricated); infrastructure/store failures propagate fail-closed.
+        try:
+            return await generate_script_for_file(path, script_dir, speaker_ids)
+        except Exception as error:
+            if not is_data_error(error) and not isinstance(error, ScriptGenerationError):
+                raise
+            ledger.record_error("scripts", path.name, error, checkpoint={"chapter_index": index, "chapter": path.name})
+            return None
+
+    results = await asyncio.gather(*(one(i, p) for i, p in enumerate(chapter_files)))
+    return [path for path in results if path is not None]
 
 
 # ##################################################################

@@ -5,6 +5,13 @@ import tempfile
 from pathlib import Path
 
 from src import tts_engine
+from src.data_recovery import (
+    DataIssue,
+    OperationalError,
+    RecoveryLedger,
+    bounded,
+    is_data_error,
+)
 
 SAMPLE_RATE = 24000
 
@@ -108,13 +115,15 @@ def split_long_text(text: str, max_words: int = 35) -> list[str]:
     return chunks
 
 
-def synthesize_chapter(script_path: Path, audio_dir: Path, voices_dir: Path, speaker_set: set[str]) -> Path:
+def synthesize_chapter(
+    script_path: Path, audio_dir: Path, voices_dir: Path, speaker_set: set[str], ledger: RecoveryLedger | None = None
+) -> Path:
     chapter_wav = audio_dir / f"{script_path.stem}.wav"
     # Idempotent: a finished chapter wav is authoritative — never resynthesize
     # or overwrite it. Its timeline was written when it was created.
     if chapter_wav.exists():
         return chapter_wav
-    chapter_wav, line_paths, jobs, line_meta = plan_chapter(script_path, audio_dir, voices_dir, speaker_set)
+    chapter_wav, line_paths, jobs, line_meta = plan_chapter(script_path, audio_dir, voices_dir, speaker_set, ledger)
     if jobs:
         tts_engine.synthesize_jobs(jobs, audio_dir.parent)
     concat_wavs(line_paths, chapter_wav)
@@ -127,12 +136,17 @@ def synthesize_chapter(script_path: Path, audio_dir: Path, voices_dir: Path, spe
 # build the list of line paths and per-line jobs for one chapter; nothing
 # submitted here, so the caller can group jobs across chapters by speaker
 def plan_chapter(
-    script_path: Path, audio_dir: Path, voices_dir: Path, speaker_set: set[str]
+    script_path: Path, audio_dir: Path, voices_dir: Path, speaker_set: set[str], ledger: RecoveryLedger | None = None
 ) -> tuple[Path, list[Path], list[dict], list[dict]]:
     chapter_name = script_path.stem
     chapter_wav = audio_dir / f"{chapter_name}.wav"
     frozen_meta_path = script_path.with_name(script_path.name + ".hour.meta.json")
-    frozen_meta = json.loads(frozen_meta_path.read_text(encoding="utf-8")) if frozen_meta_path.is_file() else {}
+    try:
+        frozen_meta = json.loads(frozen_meta_path.read_text(encoding="utf-8")) if frozen_meta_path.is_file() else {}
+    except (OSError, ValueError) as error:
+        raise OperationalError(
+            "frozen_script_meta_unreadable", f"frozen script meta is unreadable: {frozen_meta_path}"
+        ) from error
     remapped_lines = set(frozen_meta.get("remapped_line_indexes", []))
     is_remapped_frozen = bool(remapped_lines and frozen_meta.get("legacy_script"))
     work_dir = audio_dir / (f".lines_{chapter_name}.frozen" if is_remapped_frozen else f".lines_{chapter_name}")
@@ -143,22 +157,62 @@ def plan_chapter(
     jobs: list[dict] = []
     sub_idx = 0
     raw_index = 0
+    ledger = ledger or RecoveryLedger(audio_dir.parent)
+
+    def quarantine(line_number: int, code: str, message: str, raw: str) -> None:
+        ledger.record(
+            "audio",
+            f"{script_path.name}:{line_number}",
+            code,
+            message,
+            severity="quarantine",
+            evidence={"script": script_path.name, "line": line_number, "raw": bounded(raw)},
+            checkpoint={"chapter": chapter_name, "valid_lines_before": raw_index},
+        )
+
     with open(script_path, "r", encoding="utf-8") as f:
-        for raw in f:
+        for line_number, raw in enumerate(f, 1):
             raw = raw.strip()
             if not raw:
                 continue
-            entry = json.loads(raw)
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                quarantine(line_number, "script_line_unparseable", "script line is not valid JSON; skipped", raw)
+                continue
+            if not isinstance(entry, dict) or len(entry) != 1:
+                quarantine(
+                    line_number,
+                    "script_line_malformed",
+                    "script line is not a single speaker->text object; skipped",
+                    raw,
+                )
+                continue
             speaker = next(iter(entry.keys()))
             text = entry[speaker]
+            if not isinstance(text, str) or not text.strip():
+                quarantine(
+                    line_number, "script_line_text_unusable", "script line text is empty or not text; skipped", raw
+                )
+                continue
             if speaker not in speaker_set:
-                if "narrator" not in speaker_set:
-                    raise ValueError(f"speaker {speaker!r} not in voices and no narrator fallback")
-                speaker = "narrator"
+                # Pending: never rewritten to narrator (that would silently skip an actor); other lines still synthesize.
+                quarantine(
+                    line_number,
+                    "script_speaker_unknown",
+                    f"speaker {speaker!r} not in voices; line left pending, not voiced",
+                    raw,
+                )
+                continue
             for piece in split_long_text(text):
                 line_path = work_dir / f"{sub_idx:05d}.wav"
                 legacy_path = legacy_work_dir / f"{sub_idx:05d}.wav"
-                if is_remapped_frozen and raw_index not in remapped_lines and legacy_path.is_file() and not line_path.exists():
+                if (
+                    is_remapped_frozen
+                    and raw_index not in remapped_lines
+                    and legacy_path.is_file()
+                    and not line_path.exists()
+                ):
                     os.link(legacy_path, line_path)
                 line_paths.append(line_path)
                 line_meta.append({"index": sub_idx, "speaker": speaker, "text": piece, "path": line_path})
@@ -172,6 +226,10 @@ def plan_chapter(
                         }
                     )
             raw_index += 1
+    if not line_paths:
+        raise DataIssue(
+            "script_no_usable_lines", f"script has no usable lines: {script_path.name}", {"script": script_path.name}
+        )
     return chapter_wav, line_paths, jobs, line_meta
 
 
@@ -185,11 +243,12 @@ def synthesize_all_chapters(output_dir: Path, max_chapters: int = 0) -> list[Pat
     audio_dir = output_dir / "audio"
     voices_dir = output_dir / "voices"
     if not script_dir.exists():
-        raise ValueError("script directory not found")
+        raise OperationalError("script_dir_missing", "script directory not found")
     if not tts_engine.voices_ready(output_dir):
-        raise ValueError("character voices not prepared — run the voices step first")
+        raise OperationalError("voices_not_ready", "character voices not prepared — run the voices step first")
     speaker_set = tts_engine.speaker_set(output_dir)
     audio_dir.mkdir(parents=True, exist_ok=True)
+    ledger = RecoveryLedger(output_dir)
     script_files = sorted(script_dir.glob("*.jsonl"))
     if max_chapters > 0:
         script_files = script_files[:max_chapters]
@@ -204,12 +263,15 @@ def synthesize_all_chapters(output_dir: Path, max_chapters: int = 0) -> list[Pat
         if chapter_wav.exists() and chapter_wav.with_suffix(".timeline.json").exists():
             created.append(chapter_wav)
             continue
-        chapter_wav, line_paths, jobs, line_meta = plan_chapter(
-            script_path,
-            audio_dir,
-            voices_dir,
-            speaker_set,
-        )
+        try:
+            chapter_wav, line_paths, jobs, line_meta = plan_chapter(
+                script_path, audio_dir, voices_dir, speaker_set, ledger
+            )
+        except Exception as error:
+            if not is_data_error(error):
+                raise
+            ledger.record_error("audio", script_path.name, error, checkpoint={"chapter": script_path.stem})
+            continue
         plans.append((script_path, chapter_wav, line_paths, line_meta))
         all_jobs.extend(jobs)
 

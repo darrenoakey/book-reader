@@ -2,16 +2,32 @@ import asyncio
 import json
 from pathlib import Path
 
+from src.data_recovery import (
+    DataIssue,
+    OperationalError,
+    RecoveryLedger,
+    bounded,
+    is_data_error,
+)
 from src.llm import ask
+
+STAGE = "characters"
+CHAPTER_WINDOW = 15000
+DEFAULT_NARRATOR = {"name": "Narrator", "bio": "A clear, neutral audiobook narrator."}
 
 
 # ##################################################################
 # parse json response
 # extract json from claude response handling markdown code blocks and preamble
 def parse_json_response(text: str) -> dict:
+    parsed = _extract_json(text)
+    return {"characters": {}} if parsed is None else parsed
+
+
+def _extract_json(text: str) -> object | None:
     text = text.strip()
     if not text:
-        return {"characters": {}}
+        return None
     if "```" in text:
         start = text.find("```")
         end = text.rfind("```")
@@ -30,11 +46,27 @@ def parse_json_response(text: str) -> dict:
             if end_brace != -1:
                 text = text[: end_brace + 1]
     if not text or not text.startswith("{"):
-        return {"characters": {}}
+        return None
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
-        return {"characters": {}}
+    except (json.JSONDecodeError, RecursionError):
+        return None
+
+
+# ##################################################################
+# parse json response strict
+# same extraction as parse_json_response but a response that holds no JSON object is a typed DataIssue instead of a silent empty result
+def parse_json_response_strict(text: str) -> dict:
+    if not isinstance(text, str) or not text.strip():
+        raise DataIssue("model_response_empty", "model returned an empty response")
+    parsed = _extract_json(text)
+    if parsed is None:
+        raise DataIssue(
+            "model_json_unparseable", "model response contains no parseable JSON object", {"response": bounded(text)}
+        )
+    if not isinstance(parsed, dict):
+        raise DataIssue("model_json_not_object", "model JSON is not an object", {"response": bounded(text)})
+    return parsed
 
 
 # ##################################################################
@@ -49,6 +81,17 @@ async def query_haiku(prompt: str) -> str:
 # extract character information from a single chapter
 async def analyze_chapter(chapter_path: Path, chapter_num: int, established_characters: str = "") -> dict:
     text = chapter_path.read_text(encoding="utf-8")
+    if not text.strip():
+        raise DataIssue("chapter_empty", f"chapter has no text: {chapter_path.name}")
+    # No silent truncation: an overlarge chapter is analysed in consecutive windows and merged.
+    windows = [text[i : i + CHAPTER_WINDOW] for i in range(0, len(text), CHAPTER_WINDOW)] or [""]
+    if len(windows) == 1:
+        return await _analyze_text(text, chapter_num, established_characters)
+    results = [await _analyze_text(window, chapter_num, established_characters) for window in windows]
+    return {"characters": merge_character_info(results)}
+
+
+async def _analyze_text(text: str, chapter_num: int, established_characters: str) -> dict:
     prompt = f"""Analyze this chapter and identify characters who speak or have internal monologue.
 
 For each speaking character, extract TWO SEPARATE descriptions: how they SOUND (voice) and how they LOOK (look).
@@ -86,31 +129,65 @@ Rules:
 - Include ONLY characters who actually speak (quoted dialogue) or have internal monologue
 - Do NOT include characters who are merely mentioned
 - Character IDs: lowercase with underscores (e.g., "jean_tannen")
-- Established canonical identities (reuse these exact IDs whenever the person is the same): {established_characters or '(none yet)'}
+- Established canonical identities (reuse these exact IDs whenever the person is the same): {established_characters or "(none yet)"}
 - voice must focus on VOICE generation; look must focus on what a viewer SEES
 - EXCLUDE from both: plot roles, story function, relationships to other characters, emotional descriptions
 - NO cross-character references (don't mention other characters in the descriptions)
 
 Chapter {chapter_num} text:
-{text[:15000]}"""
+{text}"""
 
     response = await query_haiku(prompt)
-    return parse_json_response(response)
+    parsed = parse_json_response_strict(response)
+    if not isinstance(parsed.get("characters", {}), dict):
+        raise DataIssue(
+            "model_characters_not_object", "model 'characters' is not an object", {"response": bounded(response)}
+        )
+    return parsed
 
 
 # ##################################################################
 # merge character info
 # combine character info from multiple chapters
-def merge_character_info(all_chars: list[dict]) -> dict:
+def merge_character_info(all_chars: list[dict], ledger: RecoveryLedger | None = None) -> dict:
     merged = {}
-    for chapter_chars in all_chars:
-        for char_id, info in chapter_chars.get("characters", {}).items():
+    for chapter_index, chapter_chars in enumerate(all_chars):
+        entries = chapter_chars.get("characters", {}) if isinstance(chapter_chars, dict) else None
+        if not isinstance(entries, dict):
+            _warn(
+                ledger,
+                f"chapter-result-{chapter_index}",
+                "chapter_result_malformed",
+                "chapter analysis result is not an object with a characters object",
+                {"value": bounded(chapter_chars)},
+            )
+            continue
+        for char_id, info in entries.items():
+            item = f"chapter-result-{chapter_index}:{bounded(char_id, 80)}"
+            if not isinstance(char_id, str) or not char_id.strip() or not isinstance(info, dict):
+                _warn(
+                    ledger,
+                    item,
+                    "character_entry_malformed",
+                    "character entry has an empty/non-text id or a non-object body",
+                    {"id": bounded(char_id), "entry": bounded(info)},
+                )
+                continue
             # "details" is the legacy single-field shape; "voice"+"look" is the
             # current two-field shape (sound vs appearance kept separate so the
             # movie side never has to mine voice notes for visual facts).
             voice = info.get("voice", info.get("details", info.get("bio", "")))
             look = info.get("look", "")
             name = info.get("name", char_id)
+            if not all(isinstance(v, str) for v in (voice, look, name)):
+                _warn(
+                    ledger,
+                    item,
+                    "character_field_not_text",
+                    "character voice/look/name must be text; entry quarantined, nothing invented",
+                    {"entry": bounded(info)},
+                )
+                continue
             if char_id not in merged:
                 merged[char_id] = {"name": name, "bio": voice, "look": look}
             else:
@@ -119,6 +196,11 @@ def merge_character_info(all_chars: list[dict]) -> dict:
                 if look and look not in merged[char_id].get("look", ""):
                     merged[char_id]["look"] = (merged[char_id].get("look", "") + " " + look).strip()
     return merged
+
+
+def _warn(ledger: RecoveryLedger | None, item: str, code: str, message: str, evidence: dict | None = None) -> None:
+    if ledger is not None:
+        ledger.record(STAGE, item, code, message, severity="quarantine", evidence=evidence)
 
 
 # ##################################################################
@@ -156,7 +238,7 @@ def has_obvious_duplicates(characters: dict) -> bool:
 # ##################################################################
 # deduplicate characters
 # use sonnet to identify and merge duplicate character entries in one call
-async def deduplicate_characters(characters: dict) -> dict:
+async def deduplicate_characters(characters: dict, ledger: RecoveryLedger | None = None) -> dict:
     if len(characters) <= 1:
         return characters
     char_ids = list(characters.keys())
@@ -194,21 +276,68 @@ Return ONLY valid JSON:
 Each group = same person. IDs not in any group stay as singles."""
 
     response = (await ask(prompt)).strip()
-    result = parse_json_response(response)
-    groups = result.get("groups", [])
+    try:
+        result = parse_json_response_strict(response)
+        groups = result.get("groups", [])
+        if not isinstance(groups, list):
+            raise DataIssue("dedup_groups_not_list", "dedup 'groups' is not a list", {"response": bounded(response)})
+    except (DataIssue, ValueError, TypeError, AttributeError) as error:
+        # No merge is ever guessed: unmerged characters are kept and the issue is recorded.
+        _warn(
+            ledger,
+            "deduplicate",
+            getattr(error, "code", "dedup_response_malformed"),
+            str(error),
+            {"response": bounded(response)},
+        )
+        return characters
+    return apply_dedup_groups(characters, groups, ledger)
+
+
+# ##################################################################
+# apply dedup groups
+# merges only well-formed, unambiguous groups of known ids; malformed, unknown or overlapping groups are quarantined and never guessed at
+def apply_dedup_groups(characters: dict, groups: list, ledger: RecoveryLedger | None = None) -> dict:
     if not groups:
         return characters
     id_to_canonical = {}
-    for group in groups:
-        if not group:
+    claimed: dict[str, int] = {}
+    for group_index, group in enumerate(groups):
+        if not isinstance(group, list) or not all(isinstance(g, str) for g in group):
+            _warn(
+                ledger,
+                f"dedup-group-{group_index}",
+                "dedup_group_malformed",
+                "dedup group is not a list of text ids; skipped",
+                {"group": bounded(group)},
+            )
             continue
-        valid_ids = [g for g in group if g in characters]
-        if not valid_ids:
+        valid_ids = [g for g in dict.fromkeys(group) if g in characters]
+        unknown = [g for g in group if g not in characters]
+        if unknown:
+            _warn(
+                ledger,
+                f"dedup-group-{group_index}",
+                "dedup_unknown_ids",
+                "dedup group names ids that are not characters; they are ignored",
+                {"unknown": [bounded(u, 80) for u in unknown]},
+            )
+        if len(valid_ids) < 2:
             continue
+        if any(g in claimed for g in valid_ids):
+            _warn(
+                ledger,
+                f"dedup-group-{group_index}",
+                "dedup_group_ambiguous",
+                "dedup group overlaps an earlier group (ambiguous identity); not merged",
+                {"group": [bounded(g, 80) for g in valid_ids]},
+            )
+            continue
+        for g in valid_ids:
+            claimed[g] = group_index
         canonical = max(valid_ids, key=len)
-        for char_id in group:
-            if char_id in characters:
-                id_to_canonical[char_id] = canonical
+        for char_id in valid_ids:
+            id_to_canonical[char_id] = canonical
     deduplicated = {}
     for char_id, info in characters.items():
         canonical_id = id_to_canonical.get(char_id, char_id)
@@ -226,34 +355,36 @@ Each group = same person. IDs not in any group stay as singles."""
                 ).strip()
             if len(info["name"]) > len(deduplicated[canonical_id]["name"]):
                 deduplicated[canonical_id]["name"] = info["name"]
-    deduplicated = post_process_dedup(deduplicated)
+    deduplicated = post_process_dedup(deduplicated, ledger)
     return deduplicated
 
 
 # ##################################################################
 # post process dedup
 # fix common issues the llm misses
-def post_process_dedup(characters: dict) -> dict:
+def post_process_dedup(characters: dict, ledger: RecoveryLedger | None = None) -> dict:
+    # No book-specific or global alias table exists: identity merges come only from validated groups.
     result = dict(characters)
-    known_aliases = {
-        "tavrin_callas": "jean_tannen",
-        "lukas_fehrwight": "locke_lamora",
-        "capa_raza": "the_gray_king",
-    }
-    for alias, canonical in known_aliases.items():
-        if alias in result and canonical in result:
-            result[canonical]["bio"] += " " + result[alias]["bio"]
-            del result[alias]
     invalid_merged = ["calo_and_galdo", "the_sanza_twins", "sanza_twins", "berangias_twins"]
     for invalid in invalid_merged:
-        result.pop(invalid, None)
+        if invalid in result:
+            _warn(
+                ledger,
+                f"combined-entry:{invalid}",
+                "combined_character_entry_removed",
+                "combined multi-person entry removed; individual entries are kept",
+                {"entry": bounded(result[invalid])},
+            )
+            del result[invalid]
     return result
 
 
 # ##################################################################
 # create narrator entry
 # generate narrator character based on book metadata and tone
-async def create_narrator_entry(title: str, author: str, sample_text: str) -> dict:
+async def create_narrator_entry(
+    title: str, author: str, sample_text: str, ledger: RecoveryLedger | None = None
+) -> dict:
     prompt = f"""Based on this book's title, author, and sample text, describe the ideal narrator.
 
 Book: "{title}" by {author}
@@ -273,7 +404,22 @@ Return ONLY valid JSON:
 }}"""
 
     response = await query_haiku(prompt)
-    return parse_json_response(response)
+    try:
+        entry = parse_json_response_strict(response)
+        if not isinstance(entry.get("name"), str) or not isinstance(entry.get("bio"), str) or not entry["bio"].strip():
+            raise DataIssue(
+                "narrator_entry_malformed", "narrator entry lacks text name/bio", {"response": bounded(response)}
+            )
+        return {"name": entry["name"], "bio": entry["bio"]}
+    except (DataIssue, ValueError, TypeError, AttributeError) as error:
+        _warn(
+            ledger,
+            "narrator",
+            getattr(error, "code", "narrator_entry_malformed"),
+            str(error),
+            {"response": bounded(response)},
+        )
+        return dict(DEFAULT_NARRATOR)
 
 
 # ##################################################################
@@ -286,23 +432,41 @@ async def analyze_characters(output_dir: Path, title: str, author: str) -> Path:
         return characters_path
     chapter_files = sorted(chapters_dir.glob("*.txt"))
     if not chapter_files:
-        raise ValueError("No chapter files found")
+        raise OperationalError("no_chapters", f"no chapter files found in {chapters_dir}")
     sample_text = ""
     targets: list[tuple[int, Path]] = []
     for i, chapter_path in enumerate(chapter_files):
         if chapter_path.name == "00-intro.txt":
             continue
         if not sample_text:
-            sample_text = chapter_path.read_text(encoding="utf-8")[:3000]
+            try:
+                sample_text = chapter_path.read_text(encoding="utf-8")[:3000]
+            except UnicodeDecodeError as error:
+                RecoveryLedger(output_dir).record_error(
+                    STAGE, chapter_path.name, error, severity="warning", evidence={"role": "narrator sample"}
+                )
         targets.append((i, chapter_path))
     print(f"Analyzing {len(targets)} chapters in parallel...")
-    all_chars = await asyncio.gather(*(analyze_chapter(p, i) for i, p in targets))
-    merged = merge_character_info(all_chars)
+    ledger = RecoveryLedger(output_dir)
+
+    async def one(index: int, path: Path) -> dict | None:
+        # Only data problems quarantine the chapter; infrastructure errors propagate fail-closed.
+        try:
+            return await analyze_chapter(path, index)
+        except Exception as error:
+            if not is_data_error(error):
+                raise
+            ledger.record_error(STAGE, path.name, error, checkpoint={"chapter_index": index, "chapter": path.name})
+            return None
+
+    results = await asyncio.gather(*(one(i, p) for i, p in targets))
+    all_chars = [r for r in results if r is not None]
+    merged = merge_character_info(all_chars, ledger)
     print(f"Raw merge: {len(merged)} characters")
     print("Deduplicating with Sonnet...")
-    deduplicated = await deduplicate_characters(merged)
+    deduplicated = await deduplicate_characters(merged, ledger)
     print(f"After dedup: {len(deduplicated)} characters")
-    narrator_info = await create_narrator_entry(title, author, sample_text)
+    narrator_info = await create_narrator_entry(title, author, sample_text, ledger)
     deduplicated["narrator"] = narrator_info
     merged = deduplicated
     characters_path.write_text(json.dumps(merged, indent=2), encoding="utf-8")

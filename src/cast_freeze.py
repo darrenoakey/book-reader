@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import copy
 import difflib
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
 from src.breeze_voices import prepare_breeze_voices
+from src.data_recovery import (
+    DataIssue,
+    OperationalError,
+    RecoveryLedger,
+    bounded,
+    safe_evidence,
+)
 from src.epub_extract import get_output_dir
 from src.hour_runner import atomic_json, source_chapters, source_fingerprint
 from src.hourly_spans import immutable_spans
@@ -29,7 +38,33 @@ MAX_BATCH_CHARACTERS = 24
 EVIDENCE_REPAIR_ATTEMPTS = 2
 SEMANTIC_COVERAGE_VERSION = 1
 CLASSIFICATION_CHUNK_SIZE = 16
-GENERIC_PRONOUN_ALIASES = frozenset({"i", "me", "my", "mine", "we", "us", "our", "ours", "you", "your", "yours", "he", "him", "his", "she", "her", "hers", "it", "its", "they", "them", "their", "theirs"})
+GENERIC_PRONOUN_ALIASES = frozenset(
+    {
+        "i",
+        "me",
+        "my",
+        "mine",
+        "we",
+        "us",
+        "our",
+        "ours",
+        "you",
+        "your",
+        "yours",
+        "he",
+        "him",
+        "his",
+        "she",
+        "her",
+        "hers",
+        "it",
+        "its",
+        "they",
+        "them",
+        "their",
+        "theirs",
+    }
+)
 VOICE_PROFILE_BATCH_SIZE = 4
 # The router may use the primary's 32,768-token context on any request, not
 # only the backup's 40,960-token context. Two characters/token is deliberately
@@ -53,10 +88,156 @@ ANCHOR_IDS = {
     "narrator",
 }
 IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
-NON_NAME_COMPOUND_PREFIXES = frozenset({"A", "An", "The", "All", "Each", "Every", "Some", "Any", "No", "Not", "Only", "As", "If", "When", "While", "After", "Before", "Because", "Although", "Though", "Since", "Unless", "And", "But", "Or", "Nor", "So", "Yet", "Then", "Also", "However", "Therefore", "In", "On", "At", "By", "From", "With", "Without", "For", "To", "Of", "Into", "Out", "Up", "Down", "Over", "Under", "Around", "Through", "Across", "During", "Beyond", "Within", "Against", "Between", "Among", "About"})
-NON_ENTITY_LABELS = frozenset({"Someone", "Anyone", "Everyone", "Nobody", "Nothing", "Something", "He", "She", "Him", "Her", "His", "Hers", "They", "Them", "Their", "Theirs", "It", "Its", "We", "Us", "Our", "Ours", "I", "Me", "My", "Mine", "You", "Your", "Yours"})
+NON_NAME_COMPOUND_PREFIXES = frozenset(
+    {
+        "A",
+        "An",
+        "The",
+        "All",
+        "Each",
+        "Every",
+        "Some",
+        "Any",
+        "No",
+        "Not",
+        "Only",
+        "As",
+        "If",
+        "When",
+        "While",
+        "After",
+        "Before",
+        "Because",
+        "Although",
+        "Though",
+        "Since",
+        "Unless",
+        "And",
+        "But",
+        "Or",
+        "Nor",
+        "So",
+        "Yet",
+        "Then",
+        "Also",
+        "However",
+        "Therefore",
+        "In",
+        "On",
+        "At",
+        "By",
+        "From",
+        "With",
+        "Without",
+        "For",
+        "To",
+        "Of",
+        "Into",
+        "Out",
+        "Up",
+        "Down",
+        "Over",
+        "Under",
+        "Around",
+        "Through",
+        "Across",
+        "During",
+        "Beyond",
+        "Within",
+        "Against",
+        "Between",
+        "Among",
+        "About",
+    }
+)
+NON_ENTITY_LABELS = frozenset(
+    {
+        "Someone",
+        "Anyone",
+        "Everyone",
+        "Nobody",
+        "Nothing",
+        "Something",
+        "He",
+        "She",
+        "Him",
+        "Her",
+        "His",
+        "Hers",
+        "They",
+        "Them",
+        "Their",
+        "Theirs",
+        "It",
+        "Its",
+        "We",
+        "Us",
+        "Our",
+        "Ours",
+        "I",
+        "Me",
+        "My",
+        "Mine",
+        "You",
+        "Your",
+        "Yours",
+    }
+)
 TITLE_WORDS = frozenset({"Professor", "Master", "Doctor", "Captain", "Commander"})
-NARRATIVE_ATTRIBUTION_VERBS = frozenset({"added", "announced", "asked", "called", "continued", "intervened", "murmured", "ordered", "replied", "said", "shouted", "spoke", "whispered"})
+NARRATIVE_ATTRIBUTION_VERBS = frozenset(
+    {
+        "added",
+        "announced",
+        "asked",
+        "called",
+        "continued",
+        "intervened",
+        "murmured",
+        "ordered",
+        "replied",
+        "said",
+        "shouted",
+        "spoke",
+        "whispered",
+    }
+)
+
+
+class CastDataIssue(DataIssue):
+    """Recoverable cast-evidence problem (model or source content); quarantined per batch/chapter, never fatal."""
+
+    def __init__(self, message: str, evidence: dict | None = None, code: str = "cast_evidence_rejected"):
+        super().__init__(code, message, evidence)
+
+
+class CastValidationError(CastDataIssue, ValueError):
+    """Content or model-response validation failure at a targeted parse boundary (a DataIssue that is also a ValueError)."""
+
+
+def model_object(raw: object, what: str, required: tuple[str, ...] = ()) -> dict:
+    """Parse one native model reply into an object with the required keys; any shape problem is a typed DataIssue."""
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError, RecursionError) as error:
+        raise CastValidationError(f"{what} is not valid JSON", {"reason": bounded(str(error))}) from error
+    if not isinstance(value, dict) or not set(required) <= set(value):
+        raise CastValidationError(f"{what} is not an object with the required fields")
+    return value
+
+
+class UnicodeNameWord:
+    """Unicode-aware equivalent of ^[A-Z][a-z]*(?:-[A-Za-z]+)?$ so non-ASCII names are scanned, never silently dropped."""
+
+    def fullmatch(self, value: str) -> bool:
+        head, sep, tail = value.partition("-")
+        if (
+            not head
+            or not head[0].isupper()
+            or not head[0].isalpha()
+            or any(not (c.isalpha() and c.islower()) for c in head[1:])
+        ):
+            return False
+        return not sep or (tail != "" and tail.isalpha())
 
 
 # ##################################################################
@@ -91,25 +272,54 @@ def normalized_id(name: str) -> str:
 # reject malformed caches before they can become an authoritative frozen registry.
 def load_object(path: Path, label: str) -> dict:
     if not path.is_file():
-        raise RuntimeError(f"required {label} is missing: {path}")
+        raise OperationalError("store_missing", f"required {label} is missing: {path}")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"required {label} is unreadable: {path}") from error
+    except (OSError, ValueError) as error:
+        raise OperationalError("store_unreadable", f"required {label} is unreadable: {path}") from error
     if not isinstance(value, dict):
-        raise TypeError(f"required {label} is not an object: {path}")
+        raise OperationalError("store_invalid", f"required {label} is not an object: {path}")
     return value
 
 
 # ##################################################################
 # immutable evidence units
 # assigns each source sentence a stable batch-local identifier so a model selects evidence without ever reproducing source prose.
+def undecodable_issue(chapter: Path, error: UnicodeDecodeError) -> CastDataIssue:
+    """Typed issue carrying the exact byte-level evidence of an invalid-UTF-8 chapter."""
+    raw = chapter.read_bytes()
+    return CastDataIssue(
+        f"source chapter {chapter.name} is not valid UTF-8",
+        {
+            "chapter": chapter.name,
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+            "byte_length": len(raw),
+            "error_start": error.start,
+            "error_end": error.end,
+            "invalid_bytes_hex": raw[error.start : error.end].hex(),
+            "reason": bounded(str(error)),
+        },
+        "source_not_utf8",
+    )
+
+
 def immutable_evidence_units(chapters: list[Path]) -> list[dict[str, str]]:
     units: list[dict[str, str]] = []
     for chapter_index, chapter in enumerate(chapters):
-        chapter_text = chapter.read_text(encoding="utf-8")
+        try:
+            chapter_text = chapter.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise undecodable_issue(chapter, error) from error
         chapter_hash = hashlib.sha256(chapter_text.encode("utf-8")).hexdigest()
-        for sentence_index, quote in enumerate(immutable_spans(chapter_text)):
+        try:
+            spans = immutable_spans(chapter_text)
+        except ValueError as error:
+            raise CastValidationError(
+                f"source chapter {chapter.name} has no immutable spans",
+                {"chapter": chapter.name, "chars": len(chapter_text)},
+                "source_empty_chapter",
+            ) from error
+        for sentence_index, quote in enumerate(spans):
             units.append(
                 {
                     "id": f"c{chapter_index:02d}s{sentence_index:05d}",
@@ -119,7 +329,11 @@ def immutable_evidence_units(chapters: list[Path]) -> list[dict[str, str]]:
                 }
             )
     if not units:
-        raise ValueError("source batch has no immutable evidence units")
+        raise CastValidationError(
+            "source batch has no immutable evidence units",
+            {"chapters": [chapter.name for chapter in chapters]},
+            "source_empty_chapter",
+        )
     return units
 
 
@@ -128,8 +342,8 @@ def immutable_evidence_units(chapters: list[Path]) -> list[dict[str, str]]:
 # enumerates only exact contiguous capitalized lexical spans; source text is never copied or offset-calculated by a model.
 def immutable_name_references(units: list[dict[str, str]]) -> dict[str, dict[str, str]]:
     references: dict[str, dict[str, str]] = {}
-    word = re.compile(r"[A-Za-z][A-Za-z'-]*")
-    name_word = re.compile(r"[A-Z][a-z]*(?:-[A-Za-z]+)?$")
+    word = re.compile(r"[^\W\d_](?:[^\W\d_]|['-])*")
+    name_word = UnicodeNameWord()
     for unit in units:
         tokens = list(word.finditer(unit["quote"]))
         index = 0
@@ -142,18 +356,33 @@ def immutable_name_references(units: list[dict[str, str]]) -> dict[str, dict[str
                 # attribution verb is a malformed punctuation boundary, not a full name
                 # (e.g. "Professor Taro intervened").  Retain the title and subject as
                 # independent source references for semantic classification.
-                if end == start + 1 and token.group() in TITLE_WORDS and end + 1 < len(tokens) and tokens[end + 1].group().casefold() in NARRATIVE_ATTRIBUTION_VERBS:
+                if (
+                    end == start + 1
+                    and token.group() in TITLE_WORDS
+                    and end + 1 < len(tokens)
+                    and tokens[end + 1].group().casefold() in NARRATIVE_ATTRIBUTION_VERBS
+                ):
                     break
                 current = tokens[end]
                 possessive = current.group().endswith("'s")
                 current_label = current.group()[:-2] if possessive else current.group()
-                if (end > start and unit["quote"][tokens[end - 1].end() : current.start()].strip()) or not name_word.fullmatch(current_label):
+                if (
+                    end > start and unit["quote"][tokens[end - 1].end() : current.start()].strip()
+                ) or not name_word.fullmatch(current_label):
                     break
                 label_end = current.end() - 2 if possessive else current.end()
                 label = unit["quote"][token.start() : label_end]
                 if end > start and token.group() in NON_NAME_COMPOUND_PREFIXES:
                     break
-                references[f"{unit['id']}n{index:03d}"] = {"unit_id": unit["id"], "label": label, "start": token.start(), "suffix": start > 0 and not unit["quote"][tokens[start - 1].end() : token.start()].strip() and bool(name_word.fullmatch(tokens[start - 1].group())) and tokens[start - 1].group() not in NON_NAME_COMPOUND_PREFIXES}
+                references[f"{unit['id']}n{index:03d}"] = {
+                    "unit_id": unit["id"],
+                    "label": label,
+                    "start": token.start(),
+                    "suffix": start > 0
+                    and not unit["quote"][tokens[start - 1].end() : token.start()].strip()
+                    and bool(name_word.fullmatch(tokens[start - 1].group()))
+                    and tokens[start - 1].group() not in NON_NAME_COMPOUND_PREFIXES,
+                }
                 index += 1
                 if possessive:
                     break
@@ -180,11 +409,29 @@ def mention_scoped_audit_index(records: object) -> dict[tuple[str, str, str, int
         raise TypeError("mention-scoped audit records must be a list")
     index: dict[tuple[str, str, str, int], dict] = {}
     for record in records:
-        if not isinstance(record, dict) or any(not isinstance(record.get(field), str) or not record[field] for field in SCOPED_AUDIT_FIELDS if field != "confidence") or not isinstance(record.get("confidence"), (int, float)) or type(record.get("span_start")) is not int or record["span_start"] < 0:
+        if (
+            not isinstance(record, dict)
+            or any(
+                not isinstance(record.get(field), str) or not record[field]
+                for field in SCOPED_AUDIT_FIELDS
+                if field != "confidence"
+            )
+            or not isinstance(record.get("confidence"), (int, float))
+            or type(record.get("span_start")) is not int
+            or record["span_start"] < 0
+        ):
             raise ValueError("mention-scoped audit record is incomplete")
-        if "owners" in record and (not isinstance(record["owners"], list) or not all(isinstance(owner, str) for owner in record["owners"])):
+        if "owners" in record and (
+            not isinstance(record["owners"], list) or not all(isinstance(owner, str) for owner in record["owners"])
+        ):
             raise ValueError("mention-scoped audit record has invalid offered owners")
-        if "history" in record and (not isinstance(record["history"], list) or not all(isinstance(item, dict) and isinstance(item.get("decision"), str) and isinstance(item.get("reason"), str) for item in record["history"])):
+        if "history" in record and (
+            not isinstance(record["history"], list)
+            or not all(
+                isinstance(item, dict) and isinstance(item.get("decision"), str) and isinstance(item.get("reason"), str)
+                for item in record["history"]
+            )
+        ):
             raise ValueError("mention-scoped audit record has invalid history")
         scope = (record["chapter_sha256"], record["quote_sha256"], record["label"], record["span_start"])
         if scope in index and index[scope] != record:
@@ -200,10 +447,16 @@ ADJUDICATION_SNIPPET_CHARS = 80
 
 def label_components(text: str) -> set[str]:
     """Normalized name words of a label, without articles/prepositions that are not part of a name."""
-    return {normalized_id(word) for word in re.split(r"[\s_]+", text) if len(word) > 1 and word.casefold() not in NON_NAME_COMPOUND_WORDS}
+    return {
+        normalized_id(word)
+        for word in re.split(r"[\s_]+", text)
+        if len(word) > 1 and word.casefold() not in NON_NAME_COMPOUND_WORDS
+    }
 
 
-def adjudication_owners(label: str, registry: dict, aliases: dict | None = None, proposed: str | None = None) -> list[str]:
+def adjudication_owners(
+    label: str, registry: dict, aliases: dict | None = None, proposed: str | None = None
+) -> list[str]:
     """Candidate canonical owners for one label, led by the primary's contextual proposal, then exact name-word
     matches, any shared name component (Ren Dove -> ren), the audited alias owner, and, only when none of those exist, a bounded
     roster of the whole canonical cast (Mom -> mother) ordered so owners whose own profile/facts mention the label come first."""
@@ -222,7 +475,11 @@ def adjudication_owners(label: str, registry: dict, aliases: dict | None = None,
     add((aliases or {}).get(label_id))
     if not owners:
         needle = label.casefold()
-        mentioning = [actor_id for actor_id, info in sorted(registry.items()) if needle in json.dumps(info, ensure_ascii=False).casefold()]
+        mentioning = [
+            actor_id
+            for actor_id, info in sorted(registry.items())
+            if needle in json.dumps(info, ensure_ascii=False).casefold()
+        ]
         for actor_id in [*mentioning, *sorted(registry)]:
             add(actor_id)
         del owners[ADJUDICATION_ROSTER_MAX:]
@@ -255,7 +512,12 @@ def scoped_alias_approved(candidate: dict, canonical: str) -> bool:
 # ##################################################################
 # candidate coverage ledger
 # groups exact lexical labels while retaining immutable witness IDs, so every possible named span receives a durable explicit decision.
-def candidate_coverage_ledger(units: list[dict[str, str]], registry: dict[str, dict], aliases: dict[str, str], scoped_audit: list[dict] | None = None) -> list[dict]:
+def candidate_coverage_ledger(
+    units: list[dict[str, str]],
+    registry: dict[str, dict],
+    aliases: dict[str, str],
+    scoped_audit: list[dict] | None = None,
+) -> list[dict]:
     scoped = mention_scoped_audit_index(scoped_audit or [])
     grouped: dict[str, dict] = {}
     units_by_id = {unit["id"]: unit for unit in units}
@@ -269,7 +531,9 @@ def candidate_coverage_ledger(units: list[dict[str, str]], registry: dict[str, d
         record = scoped.get(mention_scope(unit, reference)) if scoped else None
         if record:
             key = f"{key}@{record['decision']}:{record['canonical']}"
-        candidate = grouped.setdefault(key, {"label": label, "ref_ids": [], "has_standalone": False, "scoped": record, "records": []})
+        candidate = grouped.setdefault(
+            key, {"label": label, "ref_ids": [], "has_standalone": False, "scoped": record, "records": []}
+        )
         candidate["ref_ids"].append(ref_id)
         if record:
             candidate["records"].append(record)
@@ -277,35 +541,62 @@ def candidate_coverage_ledger(units: list[dict[str, str]], registry: dict[str, d
     for candidate in grouped.values():
         label_id = normalized_id(candidate["label"])
         direct = aliases.get(label_id)
-        names = [actor_id for actor_id, entry in registry.items() if label_id in {normalized_id(actor_id), normalized_id(str(entry.get("name", actor_id)))}]
+        names = [
+            actor_id
+            for actor_id, entry in registry.items()
+            if label_id in {normalized_id(actor_id), normalized_id(str(entry.get("name", actor_id)))}
+        ]
         candidate["known_owner"] = direct or (names[0] if len(names) == 1 else None)
         candidate["nonentity"] = False
         candidate["stale"] = False
         if candidate["scoped"]:
             ledger_owners = adjudication_owners(candidate["label"], registry, aliases)
             candidate["stale"] = any(readjudication_due(item, ledger_owners) for item in candidate["records"])
-            candidate["known_owner"] = candidate["scoped"]["canonical"] if candidate["scoped"]["decision"] == "alias" else None
+            candidate["known_owner"] = (
+                candidate["scoped"]["canonical"] if candidate["scoped"]["decision"] == "alias" else None
+            )
             if candidate["scoped"]["decision"] != "alias":
                 candidate["nonentity"] = candidate["scoped"]["decision"] == "non_character"
         for ref_id in candidate["ref_ids"]:
             unit = units_by_id[references[ref_id]["unit_id"]]
             label = re.escape(candidate["label"])
-            if re.search(rf"(?i)\b(?:impact of|attack of) {label}(?:\s+and\s+[A-Z][a-z]+)?\b", unit["quote"]) or re.search(rf"(?i)\b{label}\s+(?:air|team|group|clan|family|house)\b", unit["quote"]):
+            if re.search(
+                rf"(?i)\b(?:impact of|attack of) {label}(?:\s+and\s+[A-Z][a-z]+)?\b", unit["quote"]
+            ) or re.search(rf"(?i)\b{label}\s+(?:air|team|group|clan|family|house)\b", unit["quote"]):
                 candidate["nonentity"] = True
                 break
     lowercase_source = "\n".join(unit["quote"] for unit in units)
+
     def has_lowercase_occurrence(label: str) -> bool:
         return bool(re.search(rf"(?<!\w){re.escape(label.casefold())}(?!\w)", lowercase_source))
+
     qualified_components = {
         normalized_id(word)
         for value in grouped.values()
         if " " in value["label"] and any(not has_lowercase_occurrence(word) for word in value["label"].split())
         for word in value["label"].split()
     }
-    retained = [(key, value) for key, value in grouped.items() if (" " in value["label"] or value["has_standalone"]) and (" " in value["label"] or normalized_id(value["label"]) in qualified_components or not has_lowercase_occurrence(value["label"]))]
+    retained = [
+        (key, value)
+        for key, value in grouped.items()
+        if (" " in value["label"] or value["has_standalone"])
+        and (
+            " " in value["label"]
+            or normalized_id(value["label"]) in qualified_components
+            or not has_lowercase_occurrence(value["label"])
+        )
+    ]
     retained.sort(key=lambda item: (-len(item[1]["label"].split()), item[0]))
     return [
-        {"id": f"p{index:04d}", "label": value["label"], "ref_ids": value["ref_ids"], "known_owner": value["known_owner"], "nonentity": value["nonentity"], **({"scoped_audit": value["scoped"]} if value["scoped"] else {}), **({"scoped_stale": True} if value["stale"] else {})}
+        {
+            "id": f"p{index:04d}",
+            "label": value["label"],
+            "ref_ids": value["ref_ids"],
+            "known_owner": value["known_owner"],
+            "nonentity": value["nonentity"],
+            **({"scoped_audit": value["scoped"]} if value["scoped"] else {}),
+            **({"scoped_stale": True} if value["stale"] else {}),
+        }
         for index, (_, value) in enumerate(retained)
     ]
 
@@ -313,42 +604,126 @@ def candidate_coverage_ledger(units: list[dict[str, str]], registry: dict[str, d
 # ##################################################################
 # classification schema
 # forces one bounded native decision for every local candidate; all labels, IDs and witness bytes remain program-derived.
-def discovery_schema(known_ids: list[str], candidates: list[dict], identity_candidates: list[dict] | None = None, allow_new: bool = True) -> dict:
+def discovery_schema(
+    known_ids: list[str], candidates: list[dict], identity_candidates: list[dict] | None = None, allow_new: bool = True
+) -> dict:
     if not candidates:
-        raise ValueError("classification schema requires lexical candidates")
+        raise CastValidationError("classification schema requires lexical candidates")
     # candidates with an established owner are never legal identity targets: their canonical ID is already legal
-    identity_ids = [candidate["id"] for candidate in (identity_candidates or candidates) if not candidate.get("known_owner")]
+    identity_ids = [
+        candidate["id"] for candidate in (identity_candidates or candidates) if not candidate.get("known_owner")
+    ]
     unit_ids = sorted({ref_id.rsplit("n", 1)[0] for candidate in candidates for ref_id in candidate["ref_ids"]})
 
     def record_schema(candidate: dict) -> dict:
-        evidence = {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "enum": unit_ids}}
+        evidence = {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "uniqueItems": True,
+            "items": {"type": "string", "enum": unit_ids},
+        }
         fixed_owner = candidate.get("known_owner")
         scoped = candidate.get("scoped_audit")
         audited_target = candidate.get("audited_target")
-        base = {"type": "object", "properties": {"candidate_id": {"type": "string", "enum": [candidate["id"]]}, "evidence_unit_ids": evidence}, "required": ["candidate_id", "status", "identity", "evidence_unit_ids"], "additionalProperties": False}
+        base = {
+            "type": "object",
+            "properties": {
+                "candidate_id": {"type": "string", "enum": [candidate["id"]]},
+                "evidence_unit_ids": evidence,
+            },
+            "required": ["candidate_id", "status", "identity", "evidence_unit_ids"],
+            "additionalProperties": False,
+        }
         if scope_final(candidate) and scoped["decision"] != "alias":
-            return {**base, "properties": {**base["properties"], "status": {"type": "string", "enum": [scoped["decision"]]}, "identity": {"type": "string", "enum": ["none"]}}}
+            return {
+                **base,
+                "properties": {
+                    **base["properties"],
+                    "status": {"type": "string", "enum": [scoped["decision"]]},
+                    "identity": {"type": "string", "enum": ["none"]},
+                },
+            }
         if fixed_owner:
-            return {**base, "properties": {**base["properties"], "status": {"type": "string", "enum": ["known"]}, "identity": {"type": "string", "enum": [fixed_owner]}}}
+            return {
+                **base,
+                "properties": {
+                    **base["properties"],
+                    "status": {"type": "string", "enum": ["known"]},
+                    "identity": {"type": "string", "enum": [fixed_owner]},
+                },
+            }
         if audited_target:
-            return {**base, "properties": {**base["properties"], "status": {"type": "string", "enum": ["known"]}, "identity": {"type": "string", "enum": [audited_target]}}}
+            return {
+                **base,
+                "properties": {
+                    **base["properties"],
+                    "status": {"type": "string", "enum": ["known"]},
+                    "identity": {"type": "string", "enum": [audited_target]},
+                },
+            }
         known_targets = sorted(set(known_ids + [identity for identity in identity_ids if identity != candidate["id"]]))
         branches = [
-            {**base, "properties": {**base["properties"], "status": {"type": "string", "enum": ["known"]}, "identity": {"type": "string", "enum": known_targets}}},
-            {**base, "properties": {**base["properties"], "status": {"type": "string", "enum": ["non_character", "ambiguous"]}, "identity": {"type": "string", "enum": ["none"]}}},
+            {
+                **base,
+                "properties": {
+                    **base["properties"],
+                    "status": {"type": "string", "enum": ["known"]},
+                    "identity": {"type": "string", "enum": known_targets},
+                },
+            },
+            {
+                **base,
+                "properties": {
+                    **base["properties"],
+                    "status": {"type": "string", "enum": ["non_character", "ambiguous"]},
+                    "identity": {"type": "string", "enum": ["none"]},
+                },
+            },
         ]
         if allow_new:
-            branches.insert(0, {**base, "properties": {**base["properties"], "status": {"type": "string", "enum": ["new"]}, "identity": {"type": "string", "enum": [candidate["id"]]}}})
+            branches.insert(
+                0,
+                {
+                    **base,
+                    "properties": {
+                        **base["properties"],
+                        "status": {"type": "string", "enum": ["new"]},
+                        "identity": {"type": "string", "enum": [candidate["id"]]},
+                    },
+                },
+            )
         return {"oneOf": branches}
 
-    return {"type": "object", "properties": {"classifications": {"type": "array", "minItems": len(candidates), "maxItems": len(candidates), "uniqueItems": True, "items": {"oneOf": [record_schema(candidate) for candidate in candidates]}}}, "required": ["classifications"], "additionalProperties": False}
+    return {
+        "type": "object",
+        "properties": {
+            "classifications": {
+                "type": "array",
+                "minItems": len(candidates),
+                "maxItems": len(candidates),
+                "uniqueItems": True,
+                "items": {"oneOf": [record_schema(candidate) for candidate in candidates]},
+            }
+        },
+        "required": ["classifications"],
+        "additionalProperties": False,
+    }
 
 
 # ##################################################################
 # classification prompt
 # sends compact candidate-owned witnesses rather than an open-ended prose scan and requires exhaustive classifications in schema order.
-def discovery_prompt(chapters: list[Path], registry: dict, aliases: dict[str, str], candidates: list[dict] | None = None, all_candidates: list[dict] | None = None, allow_new: bool = True) -> str:
-    units = immutable_evidence_units(chapters)
+def discovery_prompt(
+    chapters: list[Path],
+    registry: dict,
+    aliases: dict[str, str],
+    candidates: list[dict] | None = None,
+    all_candidates: list[dict] | None = None,
+    allow_new: bool = True,
+    units: list[dict[str, str]] | None = None,
+) -> str:
+    units = units if units is not None else immutable_evidence_units(chapters)
     candidates = candidates or candidate_coverage_ledger(units, registry, aliases)
     all_candidates = all_candidates or candidates
     if not candidates:
@@ -361,25 +736,34 @@ def discovery_prompt(chapters: list[Path], registry: dict, aliases: dict[str, st
         witness_ids = [candidate["ref_ids"][0].rsplit("n", 1)[0]]
         contexts = " | ".join(f"[{unit_id}] {by_id[unit_id]}" for unit_id in witness_ids)
         fixed = f" FIXED_KNOWN_OWNER={candidate['known_owner']}" if candidate.get("known_owner") else ""
-        audited_target = f" FIXED_AUDITED_TARGET={candidate['audited_target']}" if candidate.get("audited_target") else ""
+        audited_target = (
+            f" FIXED_AUDITED_TARGET={candidate['audited_target']}" if candidate.get("audited_target") else ""
+        )
         rows.append(f"{candidate['id']} label={candidate['label']!r}{fixed}{audited_target} witnesses: {contexts}")
     global_ids = "; ".join(f"{candidate['id']}={candidate['label']!r}" for candidate in all_candidates)
     full_narrative = "\n".join(f"[{unit['id']}] {unit['quote']}" for unit in units)
-    return f"""Classify EVERY candidate exactly once using only the response schema. Candidate labels and source witnesses are immutable local evidence; never copy a name, quote, offset, or invented ID into JSON.
+    return (
+        f"""Classify EVERY candidate exactly once using only the response schema. Candidate labels and source witnesses are immutable local evidence; never copy a name, quote, offset, or invented ID into JSON.
 
 status=new means this candidate is a distinct named living person/creature and identity MUST equal its own candidate_id. A named weapon, equipment item, attack, skill, species, group, or action is non_character even when capitalized; require source behavior/description proving a living entity before new. When both a source-qualified full name and a shorter component occur, make the full name the new identity and map the shorter label only when source evidence proves it is that identity. status=known means it is the same identity as an approved canonical ID or another new candidate in the global ledger; identity MUST name that target. An alias of a new full-name owner MUST be status=known targeting that owner, never status=new with a different identity. status=non_character means the lexical capitalisation is not a person/creature. status=ambiguous means source evidence cannot safely decide; identity MUST be none. For known mappings select source units proving identity; co-occurrence in one sentence alone is NOT proof. Classify the exact label/span only: a neighboring capitalized name followed by a speech/action verb may be narrative attribution, not part of this label. For a title vocative, use direct response and bounded scene continuity to identify the addressed existing owner; never fabricate a title-plus-attribution full name. Do not merge spelling variants on similarity. A kinship/role label (Mom, Dad) or a partly matching full name may be proposed status=known to an approved canonical ID when its witness context supports that person; a separate per-mention validation then decides it, so prefer a contextual known proposal over ambiguous when the cast plausibly holds the owner. Bare Xiao is ambiguous unless a source witness identifies it. Indefinite sentence words Someone, Anyone, Everyone, Nobody, Nothing, and Something are non_character, never unresolved people. A bare surname or title fragment such as Crest is non_character unless it is an approved alias or its own selected witness explicitly identifies the same person; sharing a longer name is not identity proof. House, clan, family, place, group, team, species, and organization labels are non_character even when they mention or surround a known person; classify the exact label, never merge a house or clan into its member. Existing identities may only use their canonical name or a pre-approved alias below. A new identity may have zero aliases. Every evidence_unit_ids list must include a witness for its candidate. For an alias-to-new-identity link, include distinct witnesses for both spellings; a shared co-occurrence sentence alone is invalid.
 
-Known canonical IDs: {roster or '(none)'}. Every ledger row carrying FIXED_KNOWN_OWNER MUST be status=known with exactly that identity; never create a new actor for it.
-Approved aliases: {audited or '(none)'}
+Known canonical IDs: {roster or "(none)"}. Every ledger row carrying FIXED_KNOWN_OWNER MUST be status=known with exactly that identity; never create a new actor for it.
+Approved aliases: {audited or "(none)"}
 Global candidate identities (for cross-chunk links only): {global_ids}
 
-CANDIDATE LEDGER:\n""" + "\n".join(rows) + "\n\nFULL BOUNDED SOURCE NARRATIVE (use it to resolve source-proven variant groups; never copy its text into JSON):\n" + full_narrative
+CANDIDATE LEDGER:\n"""
+        + "\n".join(rows)
+        + "\n\nFULL BOUNDED SOURCE NARRATIVE (use it to resolve source-proven variant groups; never copy its text into JSON):\n"
+        + full_narrative
+    )
 
 
 # ##################################################################
 # approved known label
 # accepts audited aliases and a unique literal component of an established full name only when the selected source witness contains that full name.
-def approved_known_label(label: str, canonical: str, evidence_unit_ids: list[str], units: list[dict[str, str]], registry: dict, aliases: dict) -> bool:
+def approved_known_label(
+    label: str, canonical: str, evidence_unit_ids: list[str], units: list[dict[str, str]], registry: dict, aliases: dict
+) -> bool:
     label_id = normalized_id(label)
     entry = registry[canonical]
     full_name = str(entry.get("name", canonical))
@@ -387,7 +771,11 @@ def approved_known_label(label: str, canonical: str, evidence_unit_ids: list[str
         return True
     if " " in label.strip() or not label_id:
         return False
-    owners = [actor_id for actor_id, info in registry.items() if label_id in {normalized_id(word) for word in str(info.get("name", actor_id)).split()}]
+    owners = [
+        actor_id
+        for actor_id, info in registry.items()
+        if label_id in {normalized_id(word) for word in str(info.get("name", actor_id)).split()}
+    ]
     selected = [unit for unit in units if unit["id"] in evidence_unit_ids]
     return owners == [canonical] and any(source_label_present(full_name, [unit]) for unit in selected)
 
@@ -395,35 +783,55 @@ def approved_known_label(label: str, canonical: str, evidence_unit_ids: list[str
 # ##################################################################
 # materialize classifications
 # validates exhaustive schema transport and creates discoveries only from source-derived candidate labels and links.
-def materialize_classifications(value: object, units: list[dict[str, str]], candidates: list[dict], registry: dict, aliases: dict) -> tuple[list[dict], list[dict]]:
-    if not isinstance(value, dict) or set(value) != {"classifications"} or not isinstance(value["classifications"], list):
-        raise ValueError("classification response is not the exact object schema")
+def materialize_classifications(
+    value: object, units: list[dict[str, str]], candidates: list[dict], registry: dict, aliases: dict
+) -> tuple[list[dict], list[dict]]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"classifications"}
+        or not isinstance(value["classifications"], list)
+    ):
+        raise CastValidationError("classification response is not the exact object schema")
     candidate_by_id = {candidate["id"]: candidate for candidate in candidates}
     unit_ids = {unit["id"] for unit in units}
     classifications = value["classifications"]
     if len(classifications) != len(candidates):
-        raise ValueError("classification response omitted or duplicated lexical candidates")
+        raise CastValidationError("classification response omitted or duplicated lexical candidates")
     seen: set[str] = set()
     validated: dict[str, dict] = {}
     for item in classifications:
         if not isinstance(item, dict) or set(item) != {"candidate_id", "status", "identity", "evidence_unit_ids"}:
-            raise ValueError("classification record has invalid fields")
-        candidate_id, status, identity, evidence = item.get("candidate_id"), item.get("status"), item.get("identity"), item.get("evidence_unit_ids")
-        if candidate_id not in candidate_by_id or candidate_id in seen or status not in {"known", "new", "non_character", "ambiguous"} or not isinstance(identity, str) or not isinstance(evidence, list) or not evidence or len(set(evidence)) != len(evidence) or not set(evidence) <= unit_ids:
-            raise ValueError("classification record has invalid candidate or source evidence")
+            raise CastValidationError("classification record has invalid fields")
+        candidate_id, status, identity, evidence = (
+            item.get("candidate_id"),
+            item.get("status"),
+            item.get("identity"),
+            item.get("evidence_unit_ids"),
+        )
+        if (
+            candidate_id not in candidate_by_id
+            or candidate_id in seen
+            or status not in {"known", "new", "non_character", "ambiguous"}
+            or not isinstance(identity, str)
+            or not isinstance(evidence, list)
+            or not evidence
+            or len(set(evidence)) != len(evidence)
+            or not set(evidence) <= unit_ids
+        ):
+            raise CastValidationError("classification record has invalid candidate or source evidence")
         candidate_units = {ref_id.rsplit("n", 1)[0] for ref_id in candidate_by_id[candidate_id]["ref_ids"]}
         if not candidate_units.intersection(evidence):
-            raise ValueError(f"classification lacks a source witness for {candidate_id}")
+            raise CastValidationError(f"classification lacks a source witness for {candidate_id}")
         if status in {"non_character", "ambiguous"} and identity != "none":
-            raise ValueError(f"non-identity classification has a target for {candidate_id}")
+            raise CastValidationError(f"non-identity classification has a target for {candidate_id}")
         if status == "new" and identity != candidate_id:
-            raise ValueError(f"new classification must own its candidate ID: {candidate_id}")
+            raise CastValidationError(f"new classification must own its candidate ID: {candidate_id}")
         if status == "known" and identity not in registry and identity not in candidate_by_id:
-            raise ValueError(f"known classification has unknown identity target: {identity}")
+            raise CastValidationError(f"known classification has unknown identity target: {identity}")
         seen.add(candidate_id)
         validated[candidate_id] = item
     if seen != set(candidate_by_id):
-        raise ValueError("classification response did not cover the complete candidate ledger")
+        raise CastValidationError("classification response did not cover the complete candidate ledger")
     discoveries: list[dict] = []
     for candidate in candidates:
         item = validated[candidate["id"]]
@@ -432,34 +840,56 @@ def materialize_classifications(value: object, units: list[dict[str, str]], cand
         label = candidate["label"]
         actor_id = normalized_id(label)
         if not IDENTIFIER.fullmatch(actor_id):
-            raise ValueError(f"candidate cannot form a canonical ID: {label!r}")
+            raise CastDataIssue(
+                f"candidate cannot form a canonical ID: {label!r}", {"label": bounded(label), "code": "non_ascii_id"}
+            )
         if actor_id in registry or aliases.get(actor_id) not in {None, actor_id}:
-            raise ValueError(f"new candidate conflicts with established identity: {label!r}")
-        unit_order = [unit["id"] for unit in units]
-        context_ids: list[str] = []
-        for evidence_id in [*item["evidence_unit_ids"], *(ref_id.rsplit("n", 1)[0] for ref_id in candidate["ref_ids"])]:
-            position = unit_order.index(evidence_id)
-            for nearby_id in unit_order[max(0, position - 1) : position + 3]:
-                if nearby_id not in context_ids:
-                    context_ids.append(nearby_id)
-        source_quotes = [next(unit["quote"] for unit in units if unit["id"] == evidence_id) for evidence_id in context_ids]
+            raise CastDataIssue(
+                f"new candidate conflicts with established identity: {label!r}",
+                {"label": bounded(label), "code": "id_collision"},
+            )
+        source_quotes = source_context_quotes(
+            units, [*item["evidence_unit_ids"], *(ref_id.rsplit("n", 1)[0] for ref_id in candidate["ref_ids"])]
+        )
         source_facts = " ".join(source_quotes)
-        discoveries.append({"canonical_id": "new", "id": actor_id, "name": label, "aliases": [], "voice_facts": source_facts, "look_facts": source_facts, "evidence": source_quotes})
+        discoveries.append(
+            {
+                "canonical_id": "new",
+                "id": actor_id,
+                "name": label,
+                "aliases": [],
+                "voice_facts": source_facts,
+                "look_facts": source_facts,
+                "evidence": source_quotes,
+            }
+        )
+    unresolved = [candidate for candidate in candidates if validated[candidate["id"]]["status"] == "ambiguous"]
+    if unresolved:
+        # Pending mention-scoped references are preserved verbatim as evidence; no identity is chosen or merged.
+        raise CastDataIssue(
+            f"semantic classification remains unresolved for {unresolved[0]['label']!r}",
+            {
+                "unresolved": [
+                    {"label": c["label"], "candidate_id": c["id"], "ref_ids": list(c.get("ref_ids", []))}
+                    for c in unresolved
+                ]
+            },
+        )
     for candidate in candidates:
         item = validated[candidate["id"]]
-        if item["status"] == "ambiguous":
-            raise RuntimeError(f"semantic classification remains unresolved for {candidate['label']!r}")
         if item["status"] != "known":
             continue
         target = item["identity"]
         label_id = normalized_id(candidate["label"])
         if target in registry:
-            if not scoped_alias_approved(candidate, target) and not approved_known_label(candidate["label"], target, item["evidence_unit_ids"], units, registry, aliases):
-                raise ValueError(f"known classification reassigns an unapproved alias: {candidate['label']!r}")
+            if not scoped_alias_approved(candidate, target) and not approved_known_label(
+                candidate["label"], target, item["evidence_unit_ids"], units, registry, aliases
+            ):
+                raise CastValidationError(f"known classification reassigns an unapproved alias: {candidate['label']!r}")
         else:
             owner = validated[target]
             if owner["status"] != "new":
-                raise ValueError(f"candidate identity target is not a new identity: {target}")
+                raise CastValidationError(f"candidate identity target is not a new identity: {target}")
             owner_label = candidate_by_id[target]["label"]
             owner_id = normalized_id(owner_label)
             if owner_id == label_id:
@@ -467,11 +897,29 @@ def materialize_classifications(value: object, units: list[dict[str, str]], cand
             candidate_units = {ref_id.rsplit("n", 1)[0] for ref_id in candidate["ref_ids"]}
             target_units = {ref_id.rsplit("n", 1)[0] for ref_id in candidate_by_id[target]["ref_ids"]}
             link_units = set(item["evidence_unit_ids"])
-            full_name_component = normalized_id(candidate["label"]) in {normalized_id(word) for word in candidate_by_id[target]["label"].split()}
-            if not candidate.get("audited_target") and not full_name_component and (not candidate_units.intersection(link_units) or not target_units.intersection(link_units) or candidate_units.intersection(target_units).intersection(link_units) == link_units):
-                raise ValueError(f"candidate link lacks distinct source identity evidence: {candidate['label']!r}")
-            alias_unit_ids = list(dict.fromkeys([*item["evidence_unit_ids"], *(ref_id.rsplit("n", 1)[0] for ref_id in candidate["ref_ids"])]))
-            alias_quotes = [next(unit["quote"] for unit in units if unit["id"] == evidence_id) for evidence_id in alias_unit_ids]
+            full_name_component = normalized_id(candidate["label"]) in {
+                normalized_id(word) for word in candidate_by_id[target]["label"].split()
+            }
+            if (
+                not candidate.get("audited_target")
+                and not full_name_component
+                and (
+                    not candidate_units.intersection(link_units)
+                    or not target_units.intersection(link_units)
+                    or candidate_units.intersection(target_units).intersection(link_units) == link_units
+                )
+            ):
+                raise CastValidationError(
+                    f"candidate link lacks distinct source identity evidence: {candidate['label']!r}"
+                )
+            alias_unit_ids = list(
+                dict.fromkeys(
+                    [*item["evidence_unit_ids"], *(ref_id.rsplit("n", 1)[0] for ref_id in candidate["ref_ids"])]
+                )
+            )
+            alias_quotes = [
+                next(unit["quote"] for unit in units if unit["id"] == evidence_id) for evidence_id in alias_unit_ids
+            ]
             for discovery in discoveries:
                 if discovery["id"] == owner_id:
                     discovery["aliases"].append(candidate["label"])
@@ -486,10 +934,15 @@ def materialize_classifications(value: object, units: list[dict[str, str]], cand
 # ##################################################################
 # source-audited variant targets
 # converts only read-only audit groups whose full owner is present in the current ledger into schema targets, preserving source-audited rather than guessed identity links.
-def source_audited_variant_targets(project: Path, candidates: list[dict], source_text: str, registry: dict) -> dict[str, str]:
+def source_audited_variant_targets(
+    project: Path, candidates: list[dict], source_text: str, registry: dict
+) -> dict[str, str]:
     labels = {candidate["label"]: candidate["id"] for candidate in candidates}
     targets: dict[str, str] = {}
-    for filename, key in (("qa-klein-team-alias-proposal.json", "decisions"), ("qa-batch61-62-semantic-audit.json", "batch61_62_expected_new_named")):
+    for filename, key in (
+        ("qa-klein-team-alias-proposal.json", "decisions"),
+        ("qa-batch61-62-semantic-audit.json", "batch61_62_expected_new_named"),
+    ):
         path = project / filename
         if not path.is_file():
             continue
@@ -502,18 +955,34 @@ def source_audited_variant_targets(project: Path, candidates: list[dict], source
                 continue
             aliases = record.get("alias") if key == "decisions" else record.get("name")
             if isinstance(aliases, str):
-                aliases = [part.strip() for part in re.sub(r"[()]", "", aliases).replace("also written", ",").split(",")]
+                aliases = [
+                    part.strip() for part in re.sub(r"[()]", "", aliases).replace("also written", ",").split(",")
+                ]
             if not isinstance(aliases, list) or not all(isinstance(alias, str) for alias in aliases):
                 continue
-            owner_label = next((alias for alias in aliases if alias in labels and " " in alias), next((alias for alias in aliases if alias in labels), None))
+            owner_label = next(
+                (alias for alias in aliases if alias in labels and " " in alias),
+                next((alias for alias in aliases if alias in labels), None),
+            )
             if owner_label is None:
                 continue
             evidence = record.get("evidence")
-            if not isinstance(evidence, list) or not evidence or not all(isinstance(item, dict) and isinstance(item.get("excerpt"), str) and item["excerpt"] in source_text for item in evidence):
+            if (
+                not isinstance(evidence, list)
+                or not evidence
+                or not all(
+                    isinstance(item, dict) and isinstance(item.get("excerpt"), str) and item["excerpt"] in source_text
+                    for item in evidence
+                )
+            ):
                 raise RuntimeError("source-audited variant evidence is absent from immutable source")
             owner_candidate = next(candidate for candidate in candidates if candidate["id"] == labels[owner_label])
             audited_canonical = record.get("canonical")
-            owner = audited_canonical if isinstance(audited_canonical, str) and audited_canonical in registry else owner_candidate.get("known_owner") or owner_candidate["id"]
+            owner = (
+                audited_canonical
+                if isinstance(audited_canonical, str) and audited_canonical in registry
+                else owner_candidate.get("known_owner") or owner_candidate["id"]
+            )
             for alias in aliases:
                 if alias in labels and labels[alias] != owner_candidate["id"]:
                     targets[labels[alias]] = owner
@@ -546,7 +1015,9 @@ def source_audited_variant_context(project: Path, candidates: list[dict]) -> str
             continue
         full = [alias for alias in aliases if " " in alias and alias in labels]
         if full:
-            groups.append(f"SOURCE-AUDITED VARIANT GROUP: {', '.join(present)}; use full source label {full[0]!r} as the one new owner and classify other listed labels known to it only with their source witnesses. {note}")
+            groups.append(
+                f"SOURCE-AUDITED VARIANT GROUP: {', '.join(present)}; use full source label {full[0]!r} as the one new owner and classify other listed labels known to it only with their source witnesses. {note}"
+            )
     semantic_path = project / "qa-batch61-62-semantic-audit.json"
     if semantic_path.is_file():
         try:
@@ -565,7 +1036,9 @@ def source_audited_variant_context(project: Path, candidates: list[dict]) -> str
             present = [alias for alias in aliases if alias in labels]
             if len(present) >= 2:
                 full = next((alias for alias in present if " " in alias), present[0])
-                groups.append(f"SOURCE-AUDITED VARIANT GROUP: {', '.join(present)}; use full source label {full!r} as the one new owner and classify other listed labels known to it only with their source witnesses. {note}")
+                groups.append(
+                    f"SOURCE-AUDITED VARIANT GROUP: {', '.join(present)}; use full source label {full!r} as the one new owner and classify other listed labels known to it only with their source witnesses. {note}"
+                )
     return "\n".join(groups)
 
 
@@ -573,57 +1046,107 @@ def source_audited_variant_context(project: Path, candidates: list[dict]) -> str
 # classification chunks
 # partitions only native response cardinality while retaining the complete batch ledger as legal identity targets for every chunk.
 def classification_chunks(candidates: list[dict]) -> list[list[dict]]:
-    return [candidates[index : index + CLASSIFICATION_CHUNK_SIZE] for index in range(0, len(candidates), CLASSIFICATION_CHUNK_SIZE)]
+    return [
+        candidates[index : index + CLASSIFICATION_CHUNK_SIZE]
+        for index in range(0, len(candidates), CLASSIFICATION_CHUNK_SIZE)
+    ]
 
 
 # ##################################################################
 # validate classification chunk
 # rejects malformed or incomplete chunk transport before its response can be composed into the batch-wide exact-once ledger.
-def validate_classification_chunk(value: object, candidates: list[dict], registry: dict, aliases: dict, all_candidates: list[dict], units: list[dict], pending: list[dict] | None = None) -> list[dict]:
-    if not isinstance(value, dict) or set(value) != {"classifications"} or not isinstance(value["classifications"], list):
-        raise ValueError("classification chunk is not the exact object schema")
+def validate_classification_chunk(
+    value: object,
+    candidates: list[dict],
+    registry: dict,
+    aliases: dict,
+    all_candidates: list[dict],
+    units: list[dict],
+    pending: list[dict] | None = None,
+) -> list[dict]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"classifications"}
+        or not isinstance(value["classifications"], list)
+    ):
+        raise CastValidationError("classification chunk is not the exact object schema")
     expected = {candidate["id"] for candidate in candidates}
     records = value["classifications"]
     actual = [record.get("candidate_id") for record in records if isinstance(record, dict)]
     identities = {candidate["id"] for candidate in all_candidates} | set(registry) | {"none"}
     if len(records) != len(candidates) or set(actual) != expected or len(actual) != len(set(actual)):
-        raise ValueError("classification chunk omitted or duplicated lexical candidates")
+        raise CastValidationError("classification chunk omitted or duplicated lexical candidates")
     for record in records:
-        if not isinstance(record, dict) or set(record) != {"candidate_id", "status", "identity", "evidence_unit_ids"} or record["status"] not in {"known", "new", "non_character", "ambiguous"} or record["identity"] not in identities:
-            raise ValueError("classification chunk has invalid record")
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"candidate_id", "status", "identity", "evidence_unit_ids"}
+            or record["status"] not in {"known", "new", "non_character", "ambiguous"}
+            or record["identity"] not in identities
+        ):
+            raise CastValidationError("classification chunk has invalid record")
         candidate = next(candidate for candidate in candidates if candidate["id"] == record["candidate_id"])
         own_units = {ref_id.rsplit("n", 1)[0] for ref_id in candidate["ref_ids"]}
         evidence = record["evidence_unit_ids"]
-        if not isinstance(evidence, list) or not evidence or len(evidence) != len(set(evidence)) or not set(evidence) <= {unit["id"] for unit in units} or not own_units.intersection(evidence):
-            raise ValueError(f"classification lacks a unique own source witness: {record['candidate_id']}")
+        if (
+            not isinstance(evidence, list)
+            or not evidence
+            or len(evidence) != len(set(evidence))
+            or not set(evidence) <= {unit["id"] for unit in units}
+            or not own_units.intersection(evidence)
+        ):
+            raise CastValidationError(f"classification lacks a unique own source witness: {record['candidate_id']}")
         if record["status"] == "new" and record["identity"] != record["candidate_id"]:
-            raise ValueError(f"new classification must own its candidate ID: {record['candidate_id']}")
+            raise CastValidationError(f"new classification must own its candidate ID: {record['candidate_id']}")
         if record["status"] in {"non_character", "ambiguous"} and record["identity"] != "none":
-            raise ValueError(f"non-identity classification has a target: {record['candidate_id']}")
+            raise CastValidationError(f"non-identity classification has a target: {record['candidate_id']}")
         if record["status"] == "known" and record["identity"] == "none":
-            raise ValueError(f"known classification lacks an identity target: {record['candidate_id']}")
+            raise CastValidationError(f"known classification lacks an identity target: {record['candidate_id']}")
         if record["status"] == "known" and record["identity"] == record["candidate_id"]:
-            raise ValueError(f"known classification must target another identity: {record['candidate_id']}")
-        target_candidate = next((candidate for candidate in all_candidates if candidate["id"] == record["identity"]), None)
-        if record["status"] == "known" and target_candidate is not None and target_candidate.get("known_owner") in registry:
+            raise CastValidationError(f"known classification must target another identity: {record['candidate_id']}")
+        target_candidate = next(
+            (candidate for candidate in all_candidates if candidate["id"] == record["identity"]), None
+        )
+        if (
+            record["status"] == "known"
+            and target_candidate is not None
+            and target_candidate.get("known_owner") in registry
+        ):
             # chain through a known-owner candidate resolves to its established canonical before any new-alias evidence guard; the mention still needs contextual approval below
             record["identity"] = target_candidate["known_owner"]
             target_candidate = None
             if record["identity"] == record["candidate_id"]:
-                raise ValueError(f"known classification must target another identity: {record['candidate_id']}")
+                raise CastValidationError(
+                    f"known classification must target another identity: {record['candidate_id']}"
+                )
         if record["status"] == "known" and record["identity"] in registry:
             canonical = record["identity"]
             if scoped_alias_approved(candidate, canonical):
                 pass
-            elif pending is not None and not scope_final(candidate) and not approved_known_label(candidate["label"], canonical, record["evidence_unit_ids"], units, registry, aliases):
+            elif (
+                pending is not None
+                and not scope_final(candidate)
+                and not approved_known_label(
+                    candidate["label"], canonical, record["evidence_unit_ids"], units, registry, aliases
+                )
+            ):
                 pending.append({"candidate": candidate, "proposed": canonical})
-            elif not approved_known_label(candidate["label"], canonical, record["evidence_unit_ids"], units, registry, aliases):
-                raise ValueError(f"known classification assigns prose or cross-owner label to {canonical}: {candidate['label']!r}")
+            elif not approved_known_label(
+                candidate["label"], canonical, record["evidence_unit_ids"], units, registry, aliases
+            ):
+                raise CastValidationError(
+                    f"known classification assigns prose or cross-owner label to {canonical}: {candidate['label']!r}"
+                )
         if record["status"] == "ambiguous" and pending is not None and not scope_final(candidate):
             pending.append({"candidate": candidate, "proposed": None})
-        if candidate.get("scoped_stale") and pending is not None and not any(item["candidate"] is candidate for item in pending):
+        if (
+            candidate.get("scoped_stale")
+            and pending is not None
+            and not any(item["candidate"] is candidate for item in pending)
+        ):
             # a cached ambiguous decision is re-judged per mention whatever the primary says; it must not be silently replaced by a label-level answer
-            pending.append({"candidate": candidate, "proposed": record["identity"] if record["identity"] in registry else None})
+            pending.append(
+                {"candidate": candidate, "proposed": record["identity"] if record["identity"] in registry else None}
+            )
         if record["status"] == "known" and target_candidate is not None and not candidate.get("audited_target"):
             # A lexical candidate may itself resolve to an established canonical only after
             # its own bounded classification is composed.  Do not demand impossible
@@ -634,44 +1157,118 @@ def validate_classification_chunk(value: object, candidates: list[dict], registr
             else:
                 candidate_units = {ref_id.rsplit("n", 1)[0] for ref_id in candidate["ref_ids"]}
                 target_units = {ref_id.rsplit("n", 1)[0] for ref_id in target_candidate["ref_ids"]}
-                full_name_component = normalized_id(candidate["label"]) in {normalized_id(word) for word in target_candidate["label"].split()}
+                full_name_component = normalized_id(candidate["label"]) in {
+                    normalized_id(word) for word in target_candidate["label"].split()
+                }
                 evidence = set(record["evidence_unit_ids"])
-                if not full_name_component and (not candidate_units.intersection(evidence) or not target_units.intersection(evidence) or candidate_units.intersection(target_units).intersection(evidence) == evidence):
-                    raise ValueError(f"known candidate link lacks distinct source identity evidence: {candidate['label']!r}")
+                if not full_name_component and (
+                    not candidate_units.intersection(evidence)
+                    or not target_units.intersection(evidence)
+                    or candidate_units.intersection(target_units).intersection(evidence) == evidence
+                ):
+                    raise CastValidationError(
+                        f"known candidate link lacks distinct source identity evidence: {candidate['label']!r}"
+                    )
     return records
 
 
 # ##################################################################
 # verify proposed living entities
 # performs a second native, schema-bound source review only for proposed new identities, refusing equipment, attacks, groups, and labels without a living-agent witness.
-def verify_proposed_living_entities(batch_units: list[dict], discoveries: list[dict], ask) -> set[str]:
+def verify_proposed_living_entities(
+    batch_units: list[dict], discoveries: list[dict], ask, warnings: list[dict] | None = None
+) -> set[str]:
     if not discoveries:
         return set()
     unit_ids = [unit["id"] for unit in batch_units]
     identities = [item["id"] for item in discoveries]
     roster = "; ".join(f"{item['id']} name={item['name']!r} aliases={item['aliases']!r}" for item in discoveries)
-    schema = {"type": "object", "properties": {"entities": {"type": "array", "minItems": len(identities), "maxItems": len(identities), "items": {"type": "object", "properties": {"id": {"type": "string", "enum": identities}, "eligibility": {"type": "string", "enum": ["living", "nonliving", "uncertain"]}, "evidence_unit_ids": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "enum": unit_ids}}}, "required": ["id", "eligibility", "evidence_unit_ids"], "additionalProperties": False}}}, "required": ["entities"], "additionalProperties": False}
+    schema = {
+        "type": "object",
+        "properties": {
+            "entities": {
+                "type": "array",
+                "minItems": len(identities),
+                "maxItems": len(identities),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "enum": identities},
+                        "eligibility": {"type": "string", "enum": ["living", "nonliving", "uncertain"]},
+                        "evidence_unit_ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 3,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "enum": unit_ids},
+                        },
+                    },
+                    "required": ["id", "eligibility", "evidence_unit_ids"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["entities"],
+        "additionalProperties": False,
+    }
     narrative = "\n".join(f"[{unit['id']}] {unit['quote']}" for unit in batch_units)
     prompt = f"For each proposed identity decide only living, nonliving, or uncertain. A living result needs a cited witness naming this exact name or alias and proving a named living individual/creature. Equipment, weapons, attacks, skills, groups, places, and captions are nonliving. Use uncertain when source does not prove either result; uncertain fails closed. Output every ID exactly once.\nProposed identities: {roster}\nSOURCE:\n{narrative}"
     response = ask(prompt, max_tokens=1200, max_attempts=1, response_schema=schema)
-    value = json.loads(response)
+    warn = warnings if warnings is not None else []
+
+    def flag(identity: str, code: str, raw: object) -> None:
+        warn.append({"id": identity, "code": code, "raw": bounded(raw, 1500)})
+
+    try:
+        value = json.loads(response)
+    except (ValueError, RecursionError):
+        for identity in identities:
+            flag(identity, "verifier_malformed_json", response)
+        return set()
     records = value.get("entities") if isinstance(value, dict) else None
-    if not isinstance(records, list) or len(records) != len(identities) or {record.get("id") for record in records if isinstance(record, dict)} != set(identities):
-        raise RuntimeError("living-entity verifier omitted or duplicated a proposed identity")
+    if not isinstance(records, list):
+        for identity in identities:
+            flag(identity, "verifier_malformed_json", response)
+        return set()
     units_by_id = {unit["id"]: unit for unit in batch_units}
-    approved = set()
     by_id = {item["id"]: item for item in discoveries}
+    counts = collections.Counter(record.get("id") for record in records if isinstance(record, dict))
+    approved: set[str] = set()
+    seen: set[str] = set()
     for record in records:
-        if not isinstance(record, dict) or record.get("eligibility") not in {"living", "nonliving", "uncertain"} or not isinstance(record.get("evidence_unit_ids"), list) or not record["evidence_unit_ids"] or not set(record["evidence_unit_ids"]) <= set(unit_ids):
-            raise RuntimeError("living-entity verifier returned invalid source evidence")
-        identity = by_id[record["id"]]
+        rid = record.get("id") if isinstance(record, dict) else None
+        if rid not in by_id:
+            flag(str(rid), "verifier_bad_evidence", record)
+            continue
+        if counts[rid] > 1:
+            flag(rid, "verifier_duplicate_id", record)
+            seen.add(rid)
+            continue
+        seen.add(rid)
+        evidence = record.get("evidence_unit_ids")
+        if (
+            record.get("eligibility") not in {"living", "nonliving", "uncertain"}
+            or not isinstance(evidence, list)
+            or not evidence
+            or not all(isinstance(e, str) and e in units_by_id for e in evidence)
+        ):
+            flag(rid, "verifier_bad_evidence", record)
+            continue
+        identity = by_id[rid]
         labels = [identity["name"], *identity["aliases"]]
-        if not any(source_label_present(label, [units_by_id[evidence_id]]) for label in labels for evidence_id in record["evidence_unit_ids"]):
-            raise RuntimeError(f"living-entity verifier lacks own identity witness: {record['id']}")
+        if not any(
+            source_label_present(label, [units_by_id[evidence_id]]) for label in labels for evidence_id in evidence
+        ):
+            flag(rid, "verifier_missing_witness", record)
+            continue
         if record["eligibility"] == "uncertain":
-            raise RuntimeError(f"living-entity verifier is uncertain for {record['id']}")
+            flag(rid, "verifier_uncertain", record)
+            continue
         if record["eligibility"] == "living":
-            approved.add(record["id"])
+            approved.add(rid)
+    for identity in identities:
+        if identity not in seen:
+            flag(identity, "verifier_bad_evidence", "identity omitted from verifier response")
     return approved
 
 
@@ -691,38 +1288,278 @@ def load_new_identity_audit(project: Path) -> list[dict]:
 
 
 NEW_IDENTITY_REASKS = 2
-ROLE_WORDS = {"mom", "mum", "dad", "father", "mother", "uncle", "aunt", "sister", "brother", "boss", "master", "teacher", "captain", "king", "queen", "lord", "lady", "sir", "madam", "doctor", "guard", "elder", "boy", "girl", "man", "woman"}
+ROLE_WORDS = {
+    "mom",
+    "mum",
+    "dad",
+    "father",
+    "mother",
+    "uncle",
+    "aunt",
+    "sister",
+    "brother",
+    "boss",
+    "master",
+    "teacher",
+    "captain",
+    "king",
+    "queen",
+    "lord",
+    "lady",
+    "sir",
+    "madam",
+    "doctor",
+    "guard",
+    "elder",
+    "boy",
+    "girl",
+    "man",
+    "woman",
+}
 
-COMMON_STOP_WORDS = frozenset({
-    "a", "about", "above", "after", "again", "against", "all", "also", "am", "an",
-    "and", "another", "any", "are", "as", "at", "be", "because", "been", "before",
-    "being", "below", "between", "both", "but", "by", "can", "could", "did", "do",
-    "does", "doing", "down", "during", "each", "even", "every", "few", "for", "from",
-    "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself",
-    "him", "himself", "his", "how", "if", "in", "into", "is", "it", "its", "itself",
-    "just", "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of",
-    "off", "on", "once", "only", "or", "other", "our", "ours", "ourselves", "out",
-    "over", "own", "same", "she", "should", "so", "some", "such", "than", "that",
-    "the", "their", "theirs", "them", "themselves", "then", "there", "these", "they",
-    "this", "those", "through", "to", "too", "under", "until", "up", "very", "was",
-    "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why",
-    "will", "with", "would", "you", "your", "yours", "yourself", "yourselves",
-})
+COMMON_STOP_WORDS = frozenset(
+    {
+        "a",
+        "about",
+        "above",
+        "after",
+        "again",
+        "against",
+        "all",
+        "also",
+        "am",
+        "an",
+        "and",
+        "another",
+        "any",
+        "are",
+        "as",
+        "at",
+        "be",
+        "because",
+        "been",
+        "before",
+        "being",
+        "below",
+        "between",
+        "both",
+        "but",
+        "by",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "doing",
+        "down",
+        "during",
+        "each",
+        "even",
+        "every",
+        "few",
+        "for",
+        "from",
+        "further",
+        "had",
+        "has",
+        "have",
+        "having",
+        "he",
+        "her",
+        "here",
+        "hers",
+        "herself",
+        "him",
+        "himself",
+        "his",
+        "how",
+        "if",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "itself",
+        "just",
+        "me",
+        "more",
+        "most",
+        "my",
+        "myself",
+        "no",
+        "nor",
+        "not",
+        "now",
+        "of",
+        "off",
+        "on",
+        "once",
+        "only",
+        "or",
+        "other",
+        "our",
+        "ours",
+        "ourselves",
+        "out",
+        "over",
+        "own",
+        "same",
+        "she",
+        "should",
+        "so",
+        "some",
+        "such",
+        "than",
+        "that",
+        "the",
+        "their",
+        "theirs",
+        "them",
+        "themselves",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "through",
+        "to",
+        "too",
+        "under",
+        "until",
+        "up",
+        "very",
+        "was",
+        "we",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "who",
+        "whom",
+        "why",
+        "will",
+        "with",
+        "would",
+        "you",
+        "your",
+        "yours",
+        "yourself",
+        "yourselves",
+    }
+)
 
-CONTENT_ANCHOR_STOP_WORDS = frozenset({
-    "about", "above", "after", "again", "against", "all", "also", "among", "and",
-    "another", "any", "are", "back", "because", "been", "before", "being", "between",
-    "both", "came", "come", "could", "did", "does", "doing", "down", "during", "each",
-    "even", "every", "first", "from", "good", "great", "had", "has", "have", "having",
-    "here", "into", "just", "know", "like", "made", "make", "many", "more", "most",
-    "much", "must", "never", "only", "other", "over", "said", "same", "should", "some",
-    "still", "such", "than", "that", "the", "their", "them", "then", "there", "these",
-    "they", "this", "those", "through", "time", "under", "very", "well", "were", "what",
-    "when", "where", "which", "while", "who", "whom", "will", "with", "would", "your",
-    # generic descriptive words in character profiles
-    "look", "voice", "male", "female", "young", "adult", "companion", "character",
-    "person", "facts", "prior", "general", "name", "none", "true", "false",
-})
+CONTENT_ANCHOR_STOP_WORDS = frozenset(
+    {
+        "about",
+        "above",
+        "after",
+        "again",
+        "against",
+        "all",
+        "also",
+        "among",
+        "and",
+        "another",
+        "any",
+        "are",
+        "back",
+        "because",
+        "been",
+        "before",
+        "being",
+        "between",
+        "both",
+        "came",
+        "come",
+        "could",
+        "did",
+        "does",
+        "doing",
+        "down",
+        "during",
+        "each",
+        "even",
+        "every",
+        "first",
+        "from",
+        "good",
+        "great",
+        "had",
+        "has",
+        "have",
+        "having",
+        "here",
+        "into",
+        "just",
+        "know",
+        "like",
+        "made",
+        "make",
+        "many",
+        "more",
+        "most",
+        "much",
+        "must",
+        "never",
+        "only",
+        "other",
+        "over",
+        "said",
+        "same",
+        "should",
+        "some",
+        "still",
+        "such",
+        "than",
+        "that",
+        "the",
+        "their",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "through",
+        "time",
+        "under",
+        "very",
+        "well",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "who",
+        "whom",
+        "will",
+        "with",
+        "would",
+        "your",
+        # generic descriptive words in character profiles
+        "look",
+        "voice",
+        "male",
+        "female",
+        "young",
+        "adult",
+        "companion",
+        "character",
+        "person",
+        "facts",
+        "prior",
+        "general",
+        "name",
+        "none",
+        "true",
+        "false",
+    }
+)
 
 
 def provisional_plausible(label: str, other: str) -> bool:
@@ -743,7 +1580,9 @@ NEW_IDENTITY_VARIANT_REFS = 6
 NEW_IDENTITY_VARIANT_SCENE_CHARS = 600
 
 
-def provisional_variant_refs(candidates: list[dict], classifications: list[dict], references: dict, units_by_id: dict) -> dict[str, list[dict]]:
+def provisional_variant_refs(
+    candidates: list[dict], classifications: list[dict], references: dict, units_by_id: dict
+) -> dict[str, list[dict]]:
     """Per new-root candidate id, the other candidates the primary classification (or a source audit) already maps known->that root, each with its literally verified mention units. Registry-owned labels are never provisional; a chain is followed to its root with a visited set so a cycle or a chain that does not end at a root yields nothing; a label that does not literally occur at its recorded span is dropped."""
     by_id = {candidate["id"]: candidate for candidate in candidates}
     record_by_id = {item["candidate_id"]: item for item in classifications}
@@ -762,7 +1601,13 @@ def provisional_variant_refs(candidates: list[dict], classifications: list[dict]
             seen.add(root)
             root = direct_target(by_id[root])
         root_item = record_by_id.get(root) if root else None
-        if root is None or root in seen or by_id[root].get("known_owner") or normalized_id(by_id[root]["label"]) == normalized_id(candidate["label"]) or (root_item and root_item["status"] != "new"):
+        if (
+            root is None
+            or root in seen
+            or by_id[root].get("known_owner")
+            or normalized_id(by_id[root]["label"]) == normalized_id(candidate["label"])
+            or (root_item and root_item["status"] != "new")
+        ):
             continue
         mention_units = []
         for ref_id in candidate["ref_ids"]:
@@ -830,18 +1675,22 @@ def registry_anchor_counts(registry: dict, name_words: set[str]) -> dict[str, in
 
 
 def find_existing_owner_support(
-    label: str,
-    owner: str,
-    witness_units: list[dict],
-    registry: dict,
-    aliases: dict,
+    label: str, owner: str, witness_units: list[dict], registry: dict, aliases: dict
 ) -> tuple[bool, dict | None]:
-    names = [registry[owner].get("name", owner), *(alias.replace("_", " ") for alias, target in aliases.items() if target == owner)]
+    names = [
+        registry[owner].get("name", owner),
+        *(alias.replace("_", " ") for alias, target in aliases.items() if target == owner),
+    ]
     for unit in witness_units:
         for name in names:
             if source_label_present(name, [unit]):
                 field = "name" if name == registry[owner].get("name") else "alias"
-                return True, {"type": "literal_witness", "owner_name": name, "owner_profile_field": field, "witness_unit_id": unit["id"]}
+                return True, {
+                    "type": "literal_witness",
+                    "owner_name": name,
+                    "owner_profile_field": field,
+                    "witness_unit_id": unit["id"],
+                }
 
     name_words = registry_name_words(registry, aliases) | set(re.findall(r"[a-z]+", label.casefold()))
     counts = registry_anchor_counts(registry, name_words)
@@ -926,7 +1775,9 @@ def are_enumerated_distinct_actors(quote: str, label_a: str, label_b: str) -> bo
     return any(re.search(pat, quote, re.IGNORECASE) for pat in patterns)
 
 
-def owner_support(label: str, owner: str, witness_units: list[dict], episode_units: list[dict] | None, registry: dict, aliases: dict) -> tuple[bool, dict | None]:
+def owner_support(
+    label: str, owner: str, witness_units: list[dict], episode_units: list[dict] | None, registry: dict, aliases: dict
+) -> tuple[bool, dict | None]:
     """Source/registry support for an existing owner: the cited units first, then (only when a continuous episode was reviewed) the mention's own episode. Provenance is exactly what find_existing_owner_support found, naming the real unit it came from."""
     supported, provenance = find_existing_owner_support(label, owner, witness_units, registry, aliases)
     if not supported and episode_units:
@@ -934,7 +1785,18 @@ def owner_support(label: str, owner: str, witness_units: list[dict], episode_uni
     return supported, provenance
 
 
-def review_verdict_error(label: str, verdict: str, witnesses: list[str], candidate: dict, plausible: dict, registry: dict, aliases: dict, units_by_id: dict, mention_unit: dict, episode_units: list[dict] | None = None) -> str | None:
+def review_verdict_error(
+    label: str,
+    verdict: str,
+    witnesses: list[str],
+    candidate: dict,
+    plausible: dict,
+    registry: dict,
+    aliases: dict,
+    units_by_id: dict,
+    mention_unit: dict,
+    episode_units: list[dict] | None = None,
+) -> str | None:
     """Why a review verdict is invalid, or None. Witnesses must carry the label's own mention; an existing target needs its own source/registry support (cited units, or the mention's own reviewed episode) and may not be a distinct participant of the same quote."""
     witness_units = [units_by_id[w] for w in witnesses]
     # Every verdict—including nonidentity_fragment—must cite this exact label's
@@ -945,7 +1807,11 @@ def review_verdict_error(label: str, verdict: str, witnesses: list[str], candida
     if verdict.startswith(SAME_PROVISIONAL):
         target = plausible[verdict[len(SAME_PROVISIONAL) :]]
         own_units = {ref_id.rsplit("n", 1)[0] for ref_id in candidate["ref_ids"]}
-        if not source_label_present(label, witness_units) or not source_label_present(target["label"], witness_units) or not own_units.intersection(witnesses):
+        if (
+            not source_label_present(label, witness_units)
+            or not source_label_present(target["label"], witness_units)
+            or not own_units.intersection(witnesses)
+        ):
             return f"new-identity review lacks literal witnesses for same as {target['label']!r}"
         if target.get("known_owner") or target.get("audited_target"):
             return f"new-identity review cannot chain provisional into existing {target['label']!r}"
@@ -954,7 +1820,10 @@ def review_verdict_error(label: str, verdict: str, witnesses: list[str], candida
             return f"new-identity review links {label!r} to {target['label']!r}, enumerated distinct actors of the same scene"
     if verdict.startswith("existing:"):
         owner = verdict.split(":", 1)[1]
-        names = [registry[owner].get("name", owner), *(alias.replace("_", " ") for alias, target in aliases.items() if target == owner)]
+        names = [
+            registry[owner].get("name", owner),
+            *(alias.replace("_", " ") for alias, target in aliases.items() if target == owner),
+        ]
         if not source_label_present(label, witness_units):
             return f"new-identity review lacks own-mention witness for existing {owner!r}"
         supported, _ = owner_support(label, owner, witness_units, episode_units, registry, aliases)
@@ -962,14 +1831,171 @@ def review_verdict_error(label: str, verdict: str, witnesses: list[str], candida
             return f"new-identity review lacks source/registry support for existing {owner!r}"
         for name in names:
             if mention_unit_has_separate_owner_token(mention_unit["quote"], label, name):
-                is_approved = aliases.get(normalized_id(label)) == owner or aliases.get(label.casefold()) == owner or normalized_id(label) == normalized_id(registry[owner].get("name", owner))
+                is_approved = (
+                    aliases.get(normalized_id(label)) == owner
+                    or aliases.get(label.casefold()) == owner
+                    or normalized_id(label) == normalized_id(registry[owner].get("name", owner))
+                )
                 if not is_approved and not is_apposition_mention(mention_unit["quote"], label, name):
                     return f"new-identity review maps to {owner!r}, a distinct participant of the same scene"
     return None
 
 
-def review_proposed_identities(project: Path, units: list[dict], classifications: list[dict], candidates: list[dict], progress: dict, ask) -> bool:
-    """Review every candidate classified new, mention by mention. Returns True when scoped audit decisions were written and classification must be redone."""
+# ##################################################################
+# typed pending new-identity review lane
+# a named span the source leaves unresolved is never forced onto an existing owner and never fatal to its chapter: the candidate is held out of the registry and aliases (a non_character classification, so no narrator or global alias can form), and a typed recoverable pending row preserves every literal mention, witness and nearby fact for replay or later review.
+PENDING_IDENTITY_TYPES = ("new_identity", "garbled_variant", "unapproved_alias", "uncertain_living")
+PENDING_IDENTITY_CODE_PREFIX = "pending_"
+PERSON_KINDS = frozenset({"individual_name", "specific_role"})
+
+
+def source_context_quotes(units: list[dict], unit_ids: list[str]) -> list[str]:
+    """Literal quotes of each cited unit with its immediate neighbours (one before, two after), each once, in first-cited order."""
+    order = [unit["id"] for unit in units]
+    quotes_by_id = {unit["id"]: unit["quote"] for unit in units}
+    context: list[str] = []
+    for unit_id in unit_ids:
+        position = order.index(unit_id)
+        for nearby in order[max(0, position - 1) : position + 3]:
+            if nearby not in context:
+                context.append(nearby)
+    return [quotes_by_id[unit_id] for unit_id in context]
+
+
+def pending_identity_entry(
+    candidate: dict,
+    kind: str,
+    reason: str,
+    units: list[dict],
+    references: dict,
+    decisions: dict | None = None,
+) -> dict:
+    """Typed pending entry holding every exact mention of the candidate (with the review decision and cited witnesses where one exists) and the literal source facts around them."""
+    if kind not in PENDING_IDENTITY_TYPES:
+        raise ValueError(f"unknown pending identity type: {kind!r}")
+    units_by_id = {unit["id"]: unit for unit in units}
+    mentions: list[dict] = []
+    for ref_id in candidate["ref_ids"]:
+        reference = references[ref_id]
+        unit = units_by_id[reference["unit_id"]]
+        scope = mention_scope(unit, reference)
+        decision = (decisions or {}).get(scope) or {}
+        witnesses = [wid for wid in decision.get("witness_unit_ids", []) if wid in units_by_id]
+        mentions.append(
+            {
+                "chapter": unit["chapter"],
+                "chapter_sha256": scope[0],
+                "quote_sha256": scope[1],
+                "unit_id": unit["id"],
+                "label": scope[2],
+                "span_start": scope[3],
+                "quote": unit["quote"],
+                "verdict": decision.get("verdict"),
+                "raw_review": decision.get("raw_review"),
+                "witnesses": [{"unit_id": wid, "quote": units_by_id[wid]["quote"]} for wid in witnesses],
+            }
+        )
+    return {
+        "type": kind,
+        "id": normalized_id(candidate["label"]),
+        "candidate_id": candidate["id"],
+        "label": candidate["label"],
+        "reason": bounded(reason, 300),
+        "mentions": mentions,
+        "facts": source_context_quotes(units, [mention["unit_id"] for mention in mentions]),
+    }
+
+
+def pending_review_result(result: dict, rejected: set[str], reason: object) -> dict | None:
+    """Tag a review result with the pending type of the invalid targets the model proposed (an unsupported existing owner is an unapproved alias; an unsupported provisional link is a garbled variant), or None when no target was invalid."""
+    kind = (
+        "unapproved_alias"
+        if any(verdict.startswith("existing:") for verdict in rejected)
+        else "garbled_variant"
+        if any(verdict.startswith(SAME_PROVISIONAL) for verdict in rejected)
+        else None
+    )
+    if kind is None:
+        return None
+    return {
+        **result,
+        "pending_type": kind,
+        "invalid_reason": bounded(reason, 300),
+        "raw_confidence": result["confidence"],
+    }
+
+
+def ambiguous_pending_kind(candidate: dict) -> str:
+    """new_identity when an exact-mention adjudication found a named living individual or role that no offered owner proves; otherwise uncertain_living."""
+    record = candidate.get("scoped_audit") or {}
+    raw = record.get("raw_adjudication") or {}
+    if (
+        record.get("decision") == "ambiguous"
+        and raw.get("refers_to_person") == "yes"
+        and raw.get("candidate_kind") in PERSON_KINDS
+    ):
+        return "new_identity"
+    return "uncertain_living"
+
+
+def defer_ambiguous_candidates(
+    records: list[dict], candidates: list[dict], units: list[dict], deferred: list[dict]
+) -> None:
+    """Move every still-ambiguous candidate into the pending lane."""
+    references = immutable_name_references(units)
+    candidate_by_id = {candidate["id"]: candidate for candidate in candidates}
+    already = {entry["candidate_id"] for entry in deferred}
+    for item in records:
+        if item["status"] == "ambiguous" and item["candidate_id"] not in already:
+            candidate = candidate_by_id[item["candidate_id"]]
+            deferred.append(
+                pending_identity_entry(
+                    candidate,
+                    ambiguous_pending_kind(candidate),
+                    "source leaves this named span unresolved after exact-mention adjudication",
+                    units,
+                    references,
+                )
+            )
+
+
+def demote_deferred(records: list[dict], candidates: list[dict], units: list[dict], deferred: list[dict]) -> None:
+    """Hold every deferred candidate out of identity mapping; a candidate linked to a deferred one is itself a pending variant (cascades to a fixed point). Nothing is aliased or merged."""
+    references = immutable_name_references(units)
+    candidate_by_id = {candidate["id"]: candidate for candidate in candidates}
+    held = {entry["candidate_id"] for entry in deferred}
+    grew = True
+    while grew:
+        grew = False
+        for item in records:
+            if item["candidate_id"] not in held and item["status"] == "known" and item["identity"] in held:
+                deferred.append(
+                    pending_identity_entry(
+                        candidate_by_id[item["candidate_id"]],
+                        "garbled_variant",
+                        f"variant of pending identity {candidate_by_id[item['identity']]['label']!r}",
+                        units,
+                        references,
+                    )
+                )
+                held.add(item["candidate_id"])
+                grew = True
+    for item in records:
+        if item["candidate_id"] in held:
+            item["status"], item["identity"] = "non_character", "none"
+
+
+def review_proposed_identities(
+    project: Path,
+    units: list[dict],
+    classifications: list[dict],
+    candidates: list[dict],
+    progress: dict,
+    ask,
+    deferred: list[dict] | None = None,
+) -> bool:
+    """Review every candidate classified new, mention by mention. Returns True when scoped audit decisions were written and classification must be redone.
+    With a deferred list, a candidate whose review stays uncertain or invalid after bounded correction (and a provisional link that cannot stand) is appended there as a typed pending entry instead of failing the chapter."""
     registry, aliases = progress["registry"], progress["aliases"]
     candidate_by_id = {candidate["id"]: candidate for candidate in candidates}
     proposed = [candidate_by_id[item["candidate_id"]] for item in classifications if item["status"] == "new"]
@@ -992,7 +2018,17 @@ def review_proposed_identities(project: Path, units: list[dict], classifications
         # new label can map to an established owner only when its spelling/role form
         # has a plausible lexical-continuity path to that owner's canonical name or
         # approved aliases. Scene evidence then proves (rather than creates) it.
-        owners = [owner for owner in adjudication_owners(label, registry, aliases) if any(provisional_plausible(label, name) for name in [registry[owner].get("name", owner), *(alias.replace("_", " ") for alias, target in aliases.items() if target == owner)])]
+        owners = [
+            owner
+            for owner in adjudication_owners(label, registry, aliases)
+            if any(
+                provisional_plausible(label, name)
+                for name in [
+                    registry[owner].get("name", owner),
+                    *(alias.replace("_", " ") for alias, target in aliases.items() if target == owner),
+                ]
+            )
+        ]
         # Each mention is scoped by its own immutable reference label (several spellings can share one
         # normalized candidate key); the candidate label only seeds roster/provisional plausibility.
         mentions: dict[tuple[str, str, str, int], dict] = {}
@@ -1003,76 +2039,244 @@ def review_proposed_identities(project: Path, units: list[dict], classifications
         todo = []
         for scope in mentions:
             cached = by_scope.get(scope)
-            if cached and cached.get("owners") == owners and (cached["verdict"] == DISTINCT_VERDICT or (cached["verdict"].startswith(SAME_PROVISIONAL) and cached["verdict"][len(SAME_PROVISIONAL) :] in provisional_ids)):
+            if (
+                cached
+                and cached.get("owners") == owners
+                and (
+                    cached["verdict"] == DISTINCT_VERDICT
+                    or (
+                        cached["verdict"].startswith(SAME_PROVISIONAL)
+                        and cached["verdict"][len(SAME_PROVISIONAL) :] in provisional_ids
+                    )
+                )
+            ):
                 verdicts[scope] = cached["verdict"]
             else:
                 todo.append(scope)
         # A root is also a plausible target when one of its source-provisional variant refs (a short form the primary
         # classification already mapped to it) is lexically continuous with this label; the variant only widens context,
         # never the target (links always end at the independently introduced root).
-        plausible = {other_id: other for other_id, other in provisional_ids.items() if provisional_plausible(label, other["label"]) or any(provisional_plausible(label, variant["candidate"]["label"]) for variant in variants_by_root.get(other_id, []))}
+        plausible = {
+            other_id: other
+            for other_id, other in provisional_ids.items()
+            if provisional_plausible(label, other["label"])
+            or any(
+                provisional_plausible(label, variant["candidate"]["label"])
+                for variant in variants_by_root.get(other_id, [])
+            )
+        }
         # This root's own variant refs: same-participant context nearest its mentions, bounded.
         own_positions = [order.index(unit["id"]) for unit in mentions.values()]
-        variant_refs = sorted(((unit, reference, variant["candidate"]) for variant in variants_by_root.get(candidate["id"], []) for unit, reference in variant["mentions"]), key=lambda row: (min(abs(order.index(row[0]["id"]) - position) for position in own_positions), order.index(row[0]["id"]), row[1]["start"]))[:NEW_IDENTITY_VARIANT_REFS]
-        base_options = [*(f"existing:{owner}" for owner in owners), *(f"{SAME_PROVISIONAL}{other_id}" for other_id in plausible), DISTINCT_VERDICT, FRAGMENT_VERDICT, "uncertain"]
+        variant_refs = sorted(
+            (
+                (unit, reference, variant["candidate"])
+                for variant in variants_by_root.get(candidate["id"], [])
+                for unit, reference in variant["mentions"]
+            ),
+            key=lambda row: (
+                min(abs(order.index(row[0]["id"]) - position) for position in own_positions),
+                order.index(row[0]["id"]),
+                row[1]["start"],
+            ),
+        )[:NEW_IDENTITY_VARIANT_REFS]
+        base_options = [
+            *(f"existing:{owner}" for owner in owners),
+            *(f"{SAME_PROVISIONAL}{other_id}" for other_id in plausible),
+            DISTINCT_VERDICT,
+            FRAGMENT_VERDICT,
+            "uncertain",
+        ]
 
-        def build_review(chunk, options, note="", scene_chars=None, label=label, owners=owners, plausible=plausible, mentions=mentions, variant_refs=variant_refs):
+        def build_review(
+            chunk,
+            options,
+            note="",
+            scene_chars=None,
+            label=label,
+            owners=owners,
+            plausible=plausible,
+            mentions=mentions,
+            variant_refs=variant_refs,
+        ):
             ids = [f"m{index}" for index in range(len(chunk))]
-            item = {"type": "object", "properties": {"mention_id": {"type": "string", "enum": ids}, "verdict": {"type": "string", "enum": options}, "witness_unit_ids": {"type": "array", "minItems": 0, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "enum": order}}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "reason": {"type": "string", "minLength": 1, "maxLength": 300}}, "required": ["mention_id", "verdict", "witness_unit_ids", "confidence", "reason"], "additionalProperties": False}
-            schema = {"type": "object", "properties": {"mentions": {"type": "array", "minItems": len(chunk), "maxItems": len(chunk), "items": item}}, "required": ["mentions"], "additionalProperties": False}
+            item = {
+                "type": "object",
+                "properties": {
+                    "mention_id": {"type": "string", "enum": ids},
+                    "verdict": {"type": "string", "enum": options},
+                    "witness_unit_ids": {
+                        "type": "array",
+                        "minItems": 0,
+                        "maxItems": 3,
+                        "uniqueItems": True,
+                        "items": {"type": "string", "enum": order},
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+                },
+                "required": ["mention_id", "verdict", "witness_unit_ids", "confidence", "reason"],
+                "additionalProperties": False,
+            }
+            schema = {
+                "type": "object",
+                "properties": {
+                    "mentions": {"type": "array", "minItems": len(chunk), "maxItems": len(chunk), "items": item}
+                },
+                "required": ["mentions"],
+                "additionalProperties": False,
+            }
             compact = scene_chars is not None
             # Compact mode renders every mention's scene AND every source-provisional variant ref's scene as merged
             # continuous episodes (each unit once); the first pass keeps per-mention scenes and gives variant refs their own compact episodes.
             mention_positions = [order.index(mentions[scope]["id"]) for scope in chunk] if compact else []
             variant_positions = [order.index(unit["id"]) for unit, _, _ in variant_refs]
-            episode_ranges, episode_of = scene_episode_ranges(units_by_id, order, [*mention_positions, *variant_positions], scene_chars if compact else NEW_IDENTITY_VARIANT_SCENE_CHARS)
-            episodes = [" ".join(f"[{order[index]}] {units_by_id[order[index]]['quote']}" for index in range(low, high + 1)) for low, high in episode_ranges]
+            episode_ranges, episode_of = scene_episode_ranges(
+                units_by_id,
+                order,
+                [*mention_positions, *variant_positions],
+                scene_chars if compact else NEW_IDENTITY_VARIANT_SCENE_CHARS,
+            )
+            episodes = [
+                " ".join(f"[{order[index]}] {units_by_id[order[index]]['quote']}" for index in range(low, high + 1))
+                for low, high in episode_ranges
+            ]
             if compact:
-                rows = [f"{mention_id} [{mentions[scope]['chapter']}] unit {mentions[scope]['id']} label {scope[2]!r} at char {scope[3]} mention: {mentions[scope]['quote']}\n   scene: episode E{episode_of[index] + 1}" for index, (mention_id, scope) in enumerate(zip(ids, chunk, strict=True))]
+                rows = [
+                    f"{mention_id} [{mentions[scope]['chapter']}] unit {mentions[scope]['id']} label {scope[2]!r} at char {scope[3]} mention: {mentions[scope]['quote']}\n   scene: episode E{episode_of[index] + 1}"
+                    for index, (mention_id, scope) in enumerate(zip(ids, chunk, strict=True))
+                ]
             else:
-                rows = [f"{mention_id} [{mentions[scope]['chapter']}] unit {mentions[scope]['id']} mention: {mentions[scope]['quote']}\n   bounded scene (unit ids in brackets): {bounded_scene_with_ids(units_by_id, order, order.index(mentions[scope]['id']))}" for mention_id, scope in zip(ids, chunk, strict=True)]
-            scene_block = "CONTINUOUS SOURCE EPISODES (unit ids in brackets; each unit appears once):\n" + "\n".join(f"E{index + 1}: {text}" for index, text in enumerate(episodes)) + "\n" if episodes else ""
+                rows = [
+                    f"{mention_id} [{mentions[scope]['chapter']}] unit {mentions[scope]['id']} mention: {mentions[scope]['quote']}\n   bounded scene (unit ids in brackets): {bounded_scene_with_ids(units_by_id, order, order.index(mentions[scope]['id']))}"
+                    for mention_id, scope in zip(ids, chunk, strict=True)
+                ]
+            scene_block = (
+                "CONTINUOUS SOURCE EPISODES (unit ids in brackets; each unit appears once):\n"
+                + "\n".join(f"E{index + 1}: {text}" for index, text in enumerate(episodes))
+                + "\n"
+                if episodes
+                else ""
+            )
             if variant_refs:
-                scene_block += f"SOURCE-PROVISIONAL VARIANT REFS (other labels the primary classification already mapped to {label!r}; same-participant CONTEXT only, never proof of a verdict and never a target):\n" + "\n".join(f"V{index + 1} label {reference['label']!r} ({variant['id']}) unit {unit['id']} at char {reference['start']} mention: {unit['quote']}\n   scene: episode E{episode_of[len(mention_positions) + index] + 1}" for index, (unit, reference, variant) in enumerate(variant_refs)) + "\n"
-            episode_units = {scope: [units_by_id[order[index]] for index in range(episode_ranges[episode_of[position_index]][0], episode_ranges[episode_of[position_index]][1] + 1)] for position_index, scope in enumerate(chunk)} if compact else {}
+                scene_block += (
+                    f"SOURCE-PROVISIONAL VARIANT REFS (other labels the primary classification already mapped to {label!r}; same-participant CONTEXT only, never proof of a verdict and never a target):\n"
+                    + "\n".join(
+                        f"V{index + 1} label {reference['label']!r} ({variant['id']}) unit {unit['id']} at char {reference['start']} mention: {unit['quote']}\n   scene: episode E{episode_of[len(mention_positions) + index] + 1}"
+                        for index, (unit, reference, variant) in enumerate(variant_refs)
+                    )
+                    + "\n"
+                )
+            episode_units = (
+                {
+                    scope: [
+                        units_by_id[order[index]]
+                        for index in range(
+                            episode_ranges[episode_of[position_index]][0],
+                            episode_ranges[episode_of[position_index]][1] + 1,
+                        )
+                    ]
+                    for position_index, scope in enumerate(chunk)
+                }
+                if compact
+                else {}
+            )
             live_owners = [owner for owner in owners if f"existing:{owner}" in options]
             live_provisional = [other for other in plausible.values() if f"{SAME_PROVISIONAL}{other['id']}" in options]
-            episode_clause = ' In a CONTINUOUS SOURCE EPISODES review the owner\'s name or profile anchor may also come from any unit of the mention\'s own episode (cite it when you can). ' if compact else ''
-            prompt = f"The label {label!r} was proposed as a NEW character identity. For each exact mention decide, from its full bounded scene and the registry's prior facts only (never from spelling or sound similarity, never generalising across mentions): existing:<id> when this exact span names or addresses that already-registered character (including a misspelling, nickname, title form, or a name merged with an adjacent word or hesitation); distinct_living_identity when it names a living individual or creature that is a different person from every registered character; nonidentity_fragment when the span is a prose fragment, a sentence-initial/hesitation/verb-bearing run of words, an equipment/skill/place/group name or otherwise not a stable actor name; same_provisional:<candidate> when this exact span is the same living individual as another proposed-new candidate listed below (a spelling variant, typo or short form of that candidate's own name proven by the scene, never by similarity alone) and not any registered character; No existing match is NOT the same as nonliving or uncertain: when the source introduces a named living individual (it acts, speaks, is addressed or is described as a person or creature) and no registered candidate credibly owns the span, that supports distinct_living_identity; nonidentity_fragment is only for spans that are not a living actor's name; uncertain only when the source leaves genuinely open whether the span is a living individual or which owner it belongs to. Each mention's own unit is attached automatically as the span's own-source witness. Cite 0-3 ADDITIONAL witness unit IDs only where they prove the verdict; existing:<id> and same_provisional:<candidate> must cite at least one unit, and the owner's name/facts (existing) or the target candidate's label literally (same_provisional) must appear in the units cited together with the mention's own unit. {episode_clause}Give honest confidence.\nOther proposed-new candidates: {'; '.join(f'{other['id']}={other['label']!r}' for other in live_provisional) or '(none)'}\nRegistered candidates: {'; '.join(f'{owner}={registry[owner].get('name', owner)!r}' for owner in live_owners) or '(none)'}\nCanonical prior facts:\n{owner_prior_facts(registry, live_owners, label)}\n{note}{scene_block}MENTIONS:\n" + "\n".join(rows)
+            episode_clause = (
+                " In a CONTINUOUS SOURCE EPISODES review the owner's name or profile anchor may also come from any unit of the mention's own episode (cite it when you can). "
+                if compact
+                else ""
+            )
+            prompt = (
+                f"The label {label!r} was proposed as a NEW character identity. For each exact mention decide, from its full bounded scene and the registry's prior facts only (never from spelling or sound similarity, never generalising across mentions): existing:<id> when this exact span names or addresses that already-registered character (including a misspelling, nickname, title form, or a name merged with an adjacent word or hesitation); distinct_living_identity when it names a living individual or creature that is a different person from every registered character; nonidentity_fragment when the span is a prose fragment, a sentence-initial/hesitation/verb-bearing run of words, an equipment/skill/place/group name or otherwise not a stable actor name; same_provisional:<candidate> when this exact span is the same living individual as another proposed-new candidate listed below (a spelling variant, typo or short form of that candidate's own name proven by the scene, never by similarity alone) and not any registered character; No existing match is NOT the same as nonliving or uncertain: when the source introduces a named living individual (it acts, speaks, is addressed or is described as a person or creature) and no registered candidate credibly owns the span, that supports distinct_living_identity; nonidentity_fragment is only for spans that are not a living actor's name; uncertain only when the source leaves genuinely open whether the span is a living individual or which owner it belongs to. Each mention's own unit is attached automatically as the span's own-source witness. Cite 0-3 ADDITIONAL witness unit IDs only where they prove the verdict; existing:<id> and same_provisional:<candidate> must cite at least one unit, and the owner's name/facts (existing) or the target candidate's label literally (same_provisional) must appear in the units cited together with the mention's own unit. {episode_clause}Give honest confidence.\nOther proposed-new candidates: {'; '.join(f'{other['id']}={other['label']!r}' for other in live_provisional) or '(none)'}\nRegistered candidates: {'; '.join(f'{owner}={registry[owner].get('name', owner)!r}' for owner in live_owners) or '(none)'}\nCanonical prior facts:\n{owner_prior_facts(registry, live_owners, label)}\n{note}{scene_block}MENTIONS:\n"
+                + "\n".join(rows)
+            )
             return prompt, schema, ids, episode_units
 
-        def review_chunk(chunk, options, note="", scene_chars=None, label=label, candidate=candidate, mentions=mentions, plausible=plausible):
+        def review_chunk(
+            chunk,
+            options,
+            note="",
+            scene_chars=None,
+            label=label,
+            candidate=candidate,
+            mentions=mentions,
+            plausible=plausible,
+        ):
             prompt, schema, ids, episode_units = build_review(chunk, options, note, scene_chars)
             if len(prompt) > PREPARATION_PROMPT_MAX_CHARS:
-                raise RuntimeError(f"new-identity review prompt exceeds native context budget for {label!r}")
-            raw = ask(prompt, max_tokens=min(NATIVE_RESERVED_OUTPUT_TOKENS, max(1500, 200 + REVIEW_OUTPUT_TOKENS_PER_MENTION * len(chunk))), max_attempts=1, response_schema=schema)
-            value = json.loads(raw)
-            returned = value.get("mentions") if isinstance(value, dict) else None
-            if not isinstance(returned, list) or len(returned) != len(ids) or {r.get("mention_id") for r in returned if isinstance(r, dict)} != set(ids):
-                raise RuntimeError(f"new-identity review omitted or duplicated mentions for {label!r}")
+                raise CastDataIssue(f"new-identity review prompt exceeds native context budget for {label!r}")
+            raw = ask(
+                prompt,
+                max_tokens=min(
+                    NATIVE_RESERVED_OUTPUT_TOKENS, max(1500, 200 + REVIEW_OUTPUT_TOKENS_PER_MENTION * len(chunk))
+                ),
+                max_attempts=1,
+                response_schema=schema,
+            )
+            value = model_object(raw, f"new-identity review for {label!r}")
+            returned = value.get("mentions")
+            if (
+                not isinstance(returned, list)
+                or len(returned) != len(ids)
+                or {r.get("mention_id") for r in returned if isinstance(r, dict)} != set(ids)
+                or not all({"verdict", "witness_unit_ids"} <= set(r) for r in returned)
+            ):
+                raise CastDataIssue(f"new-identity review omitted or duplicated mentions for {label!r}")
             out = []
             for result in returned:
                 scope = chunk[ids.index(result["mention_id"])]
                 verdict, selected = result["verdict"], result["witness_unit_ids"]
                 if verdict not in options or not isinstance(selected, list) or not set(selected) <= set(order):
-                    raise RuntimeError(f"new-identity review returned an invalid verdict for {label!r}")
+                    raise CastDataIssue(f"new-identity review returned an invalid verdict for {label!r}")
                 # The mention's own unit is deterministic input, never a model choice: bind it to the exact
                 # immutable reference (label bytes at the recorded span) and attach it as a witness.
                 own = mentions[scope]
                 if own["quote"][scope[3] : scope[3] + len(scope[2])] != scope[2]:
-                    raise RuntimeError(f"immutable candidate reference for {scope[2]!r} does not match its source span")
+                    raise CastDataIssue(
+                        f"immutable candidate reference for {scope[2]!r} does not match its source span"
+                    )
                 witnesses = [own["id"], *dict.fromkeys(w for w in selected if w != own["id"])]
-                error = review_verdict_error(scope[2], verdict, witnesses, candidate, plausible, registry, aliases, units_by_id, own, episode_units.get(scope))
+                error = review_verdict_error(
+                    scope[2],
+                    verdict,
+                    witnesses,
+                    candidate,
+                    plausible,
+                    registry,
+                    aliases,
+                    units_by_id,
+                    own,
+                    episode_units.get(scope),
+                )
                 episode_support = None
                 if not error and verdict.startswith("existing:"):
                     # support found only in the mention's own reviewed episode keeps its exact unit as a recorded witness
-                    _, prov = owner_support(scope[2], verdict.split(":", 1)[1], [units_by_id[w] for w in witnesses], episode_units.get(scope), registry, aliases)
+                    _, prov = owner_support(
+                        scope[2],
+                        verdict.split(":", 1)[1],
+                        [units_by_id[w] for w in witnesses],
+                        episode_units.get(scope),
+                        registry,
+                        aliases,
+                    )
                     if prov and prov["witness_unit_id"] not in witnesses:
                         episode_support = prov["witness_unit_id"]
                         witnesses = [*witnesses, episode_support]
-                if not error and verdict.startswith((SAME_PROVISIONAL, "existing:")) and not selected and episode_support is None and not (verdict.startswith("existing:") and episode_units.get(scope)):
+                if (
+                    not error
+                    and verdict.startswith((SAME_PROVISIONAL, "existing:"))
+                    and not selected
+                    and episode_support is None
+                    and not (verdict.startswith("existing:") and episode_units.get(scope))
+                ):
                     error = f"new-identity review cites no support for {verdict}"
-                result = {**result, "witness_unit_ids": witnesses, "selected_witness_unit_ids": selected, "episode_support_unit_id": episode_support}
+                result = {
+                    **result,
+                    "witness_unit_ids": witnesses,
+                    "selected_witness_unit_ids": selected,
+                    "episode_support_unit_id": episode_support,
+                }
                 out.append((scope, result, error))
             return out
 
@@ -1080,9 +2284,35 @@ def review_proposed_identities(project: Path, units: list[dict], classifications
             verdict, witnesses = result["verdict"], result["witness_unit_ids"]
             if result["confidence"] < ADJUDICATION_MIN_CONFIDENCE and verdict != "uncertain":
                 verdict = "uncertain"
-            record = {"chapter_sha256": scope[0], "quote_sha256": scope[1], "label": scope[2], "span_start": scope[3], "verdict": verdict, "witness_unit_ids": witnesses, "own_source_witness": {"unit_id": witnesses[0], "provenance": "immutable_candidate_reference", "label": scope[2], "span_start": scope[3]}, "confidence": float(result["confidence"]), "reason": result["reason"], "owners": list(owners), "raw_review": {"verdict": result["verdict"], "witness_unit_ids": result["selected_witness_unit_ids"], "confidence": result["confidence"], "reason": result["reason"]}}
+            record = {
+                "chapter_sha256": scope[0],
+                "quote_sha256": scope[1],
+                "label": scope[2],
+                "span_start": scope[3],
+                "verdict": verdict,
+                "witness_unit_ids": witnesses,
+                "own_source_witness": {
+                    "unit_id": witnesses[0],
+                    "provenance": "immutable_candidate_reference",
+                    "label": scope[2],
+                    "span_start": scope[3],
+                },
+                "confidence": float(result["confidence"]),
+                "reason": result["reason"],
+                "owners": list(owners),
+                "raw_review": {
+                    "verdict": result["verdict"],
+                    "witness_unit_ids": result["selected_witness_unit_ids"],
+                    "confidence": result["confidence"],
+                    "reason": result["reason"],
+                },
+            }
             if result.get("episode_support_unit_id"):
                 record["episode_support_unit_id"] = result["episode_support_unit_id"]
+            if result.get("pending_type"):
+                record["pending_type"] = result["pending_type"]
+                record["invalid_reason"] = result["invalid_reason"]
+                record["raw_review"]["confidence"] = result["raw_confidence"]
             if verdict.startswith("existing:"):
                 owner = verdict.split(":", 1)[1]
                 witness_units = [units_by_id[w] for w in witnesses]
@@ -1095,22 +2325,59 @@ def review_proposed_identities(project: Path, units: list[dict], classifications
                         record["anchor"] = prov["anchor"]
             prior = by_scope.get(scope)
             if prior:
-                record["history"] = [*prior.get("history", []), {key: prior[key] for key in ("verdict", "confidence", "reason", "owners", "provenance", "witness", "owner_profile_field", "anchor") if key in prior}]
+                record["history"] = [
+                    *prior.get("history", []),
+                    {
+                        key: prior[key]
+                        for key in (
+                            "verdict",
+                            "confidence",
+                            "reason",
+                            "owners",
+                            "provenance",
+                            "witness",
+                            "owner_profile_field",
+                            "anchor",
+                        )
+                        if key in prior
+                    },
+                ]
                 audit[:] = [r for r in audit if r is not prior]
             audit.append(record)
             by_scope[scope] = record
             verdicts[scope] = verdict
 
-        def correct_mention(scope, removed, error, context_note="", scene_chars=None, label=label, base_options=base_options, review_chunk=review_chunk):
+        def correct_mention(
+            scope,
+            removed,
+            error,
+            context_note="",
+            scene_chars=None,
+            label=label,
+            base_options=base_options,
+            review_chunk=review_chunk,
+        ):
             """Bounded correction shared by the ordinary and the consistency review: re-ask this one mention with every invalid target removed from the options (never supply aliases by hand); still invalid after the bounded reasks fails closed."""
             result = None
+            first_error = error
             for _ in range(NEW_IDENTITY_REASKS):
                 options = [option for option in base_options if option not in removed]
-                ((_, result, error),) = review_chunk([scope], options, f"{context_note}A previous answer for this exact mention was invalid ({error}); the mention's own unit is already attached.\n", scene_chars)
+                ((_, result, error),) = review_chunk(
+                    [scope],
+                    options,
+                    f"{context_note}A previous answer for this exact mention was invalid ({error}); the mention's own unit is already attached.\n",
+                    scene_chars,
+                )
                 if not error:
-                    return result
+                    # a model that withdraws to uncertain after an invalid target leaves a typed pending scope, not an anonymous one
+                    pending = pending_review_result(result, removed, first_error) if deferred is not None else None
+                    return pending if pending and result["verdict"] == "uncertain" else result
                 removed.add(result["verdict"])
-            raise RuntimeError(f"{error} for {label!r} after bounded correction")
+            # never choose a target by hand: the invalid verdict is kept as raw evidence and the scope becomes pending
+            pending = pending_review_result(result, removed, error) if deferred is not None else None
+            if pending is None:
+                raise CastDataIssue(f"{error} for {label!r} after bounded correction")
+            return {**pending, "confidence": 0.0}
 
         for offset in range(0, len(todo), NEW_IDENTITY_MENTIONS_PER_CALL):
             chunk = todo[offset : offset + NEW_IDENTITY_MENTIONS_PER_CALL]
@@ -1123,22 +2390,39 @@ def review_proposed_identities(project: Path, units: list[dict], classifications
             for scope, removed, error in invalid:
                 record_result(scope, correct_mention(scope, removed, error))
             atomic_json(project / NEW_IDENTITY_AUDIT_NAME, {"records": audit})
+
         # Bounded normalization of a per-scope conflict: one label whose exact scopes got different verdict kinds.
         # Source-validated existing / same_provisional scopes bind exactly (never collapsed onto each other); a
         # distinct verdict among them is an independent identity only if a single contextual re-review that
         # sees its siblings' verdicts reaffirms it with valid witnesses. Anything else fails closed.
         def verdict_kind(verdict):
-            return "existing" if verdict.startswith("existing:") else "same_provisional" if verdict.startswith(SAME_PROVISIONAL) else verdict
+            return (
+                "existing"
+                if verdict.startswith("existing:")
+                else "same_provisional"
+                if verdict.startswith(SAME_PROVISIONAL)
+                else verdict
+            )
+
         kinds = {verdict_kind(v) for v in verdicts.values()}
         if len(kinds - {FRAGMENT_VERDICT}) > 1 and "uncertain" not in kinds:
-            recheck = [scope for scope, v in verdicts.items() if v != FRAGMENT_VERDICT and not by_scope[scope].get("reconciled")]
+            recheck = [
+                scope
+                for scope, v in verdicts.items()
+                if v != FRAGMENT_VERDICT and not by_scope[scope].get("reconciled")
+            ]
             if recheck:
-                summary = "; ".join(f"unit {mentions[scope]['id']} char {scope[3]}: {verdicts[scope]}" for scope in recheck)
+                summary = "; ".join(
+                    f"unit {mentions[scope]['id']} char {scope[3]}: {verdicts[scope]}" for scope in recheck
+                )
                 note = f"CONSISTENCY REVIEW of conflicting verdicts for this one label across its exact mentions ({summary}). Decide every mention below once, on its own quote, direct owner anchors and continuous scene, never by majority and never by global alias. A mention may be existing:<id> or same_provisional only if its own scene proves that individual; distinct_living_identity only if its own scene proves a different living individual from every other verdict here. Genuine contextual splits between different people sharing a label are allowed when each scope is separately proven; otherwise choose uncertain.\n"
                 output_cap = max(1, (NATIVE_RESERVED_OUTPUT_TOKENS - 200) // REVIEW_OUTPUT_TOKENS_PER_MENTION)
 
                 def fits(group, width, output_cap=output_cap, base_options=base_options, note=note):
-                    return len(group) <= output_cap and len(build_review(group, base_options, note, width)[0]) <= PREPARATION_PROMPT_MAX_CHARS
+                    return (
+                        len(group) <= output_cap
+                        and len(build_review(group, base_options, note, width)[0]) <= PREPARATION_PROMPT_MAX_CHARS
+                    )
 
                 # One logical review: all conflicts in one call over compacted continuous episodes, narrowing every
                 # scene uniformly until it fits. Only if even own-unit-only evidence (or the output budget) cannot hold
@@ -1164,7 +2448,26 @@ def review_proposed_identities(project: Path, units: list[dict], classifications
                         by_scope[scope]["reconciled"] = True
                 atomic_json(project / NEW_IDENTITY_AUDIT_NAME, {"records": audit})
         if "uncertain" in verdicts.values():
-            raise RuntimeError(f"proposed new identity {label!r} is uncertain for at least one mention: {sorted(set(verdicts.values()))}")
+            if deferred is None:
+                raise CastDataIssue(
+                    f"proposed new identity {label!r} is uncertain for at least one mention: {sorted(set(verdicts.values()))}"
+                )
+            kinds = {
+                by_scope[scope].get("pending_type") for scope, verdict in verdicts.items() if verdict == "uncertain"
+            }
+            deferred.append(
+                pending_identity_entry(
+                    candidate,
+                    next(
+                        (kind for kind in ("unapproved_alias", "garbled_variant") if kind in kinds), "uncertain_living"
+                    ),
+                    f"proposed new identity is uncertain for at least one mention: {sorted(set(verdicts.values()))}",
+                    units,
+                    references,
+                    by_scope,
+                )
+            )
+            continue
         final_verdicts[candidate["id"]] = set(verdicts.values())
         for scope in mentions:
             verdict = verdicts[scope]
@@ -1172,30 +2475,58 @@ def review_proposed_identities(project: Path, units: list[dict], classifications
                 continue
             record = by_scope[scope]
             existing = verdict.startswith("existing:")
-            scoped = {"chapter_sha256": scope[0], "quote_sha256": scope[1], "label": scope[2], "span_start": scope[3], "canonical": verdict.split(":", 1)[1] if existing else "none", "decision": "alias" if existing else "non_character", "confidence": record["confidence"], "reason": f"[new-identity review {record['witness_unit_ids']}] {record['reason']}"[:300], "owners": list(owners), "raw_adjudication": {"source": "new_identity_review", "verdict": record["raw_review"]["verdict"], "confidence": record["raw_review"]["confidence"], "reason": record["raw_review"]["reason"]}}
+            scoped = {
+                "chapter_sha256": scope[0],
+                "quote_sha256": scope[1],
+                "label": scope[2],
+                "span_start": scope[3],
+                "canonical": verdict.split(":", 1)[1] if existing else "none",
+                "decision": "alias" if existing else "non_character",
+                "confidence": record["confidence"],
+                "reason": f"[new-identity review {record['witness_unit_ids']}] {record['reason']}"[:300],
+                "owners": list(owners),
+                "raw_adjudication": {
+                    "source": "new_identity_review",
+                    "verdict": record["raw_review"]["verdict"],
+                    "confidence": record["raw_review"]["confidence"],
+                    "reason": record["raw_review"]["reason"],
+                },
+            }
             if "provenance" in record:
                 scoped["provenance"] = record["provenance"]
                 if "anchor" in record:
                     scoped["anchor"] = record["anchor"]
                 if "owner_profile_field" in record:
                     scoped["owner_profile_field"] = record["owner_profile_field"]
-            prior = next((r for r in scoped_records if (r["chapter_sha256"], r["quote_sha256"], r["label"], r["span_start"]) == scope), None)
+            prior = next(
+                (
+                    r
+                    for r in scoped_records
+                    if (r["chapter_sha256"], r["quote_sha256"], r["label"], r["span_start"]) == scope
+                ),
+                None,
+            )
             if prior:
-                scoped["history"] = [*prior.get("history", []), {key: prior[key] for key in ("decision", "canonical", "confidence", "reason", "owners") if key in prior}]
+                scoped["history"] = [
+                    *prior.get("history", []),
+                    {
+                        key: prior[key]
+                        for key in ("decision", "canonical", "confidence", "reason", "owners")
+                        if key in prior
+                    },
+                ]
                 scoped_records[:] = [r for r in scoped_records if r is not prior]
             scoped_records.append(scoped)
             wrote_scoped = True
         mention_scoped_audit_index(scoped_records)
         atomic_json(project / SCOPED_AUDIT_NAME, {"records": scoped_records})
-    link_provisional_identities(proposed, classifications, final_verdicts, by_scope, references, units_by_id)
+    link_provisional_identities(
+        proposed, classifications, final_verdicts, by_scope, references, units_by_id, units, deferred
+    )
     return wrote_scoped
 
 
-def resolve_provisional_chains_before_materialize(
-    records: list[dict],
-    candidates: list[dict],
-    registry: dict,
-) -> None:
+def resolve_provisional_chains_before_materialize(records: list[dict], candidates: list[dict], registry: dict) -> None:
     """Resolve candidate chains before materialization. If a candidate targets another candidate that resolved to an established registry owner, re-route to that canonical owner; if it targets a candidate by normalized label, map to the candidate ID; if the target is invalid or not a valid discovery, fail closed."""
     candidate_by_id = {c["id"]: c for c in candidates}
     candidate_by_label_id = {normalized_id(c["label"]): c["id"] for c in candidates}
@@ -1212,34 +2543,76 @@ def resolve_provisional_chains_before_materialize(
         if identity in candidate_by_id:
             target_record = record_by_id.get(identity)
             if target_record is None:
-                raise RuntimeError(f"candidate {item['candidate_id']!r} targets unrecorded candidate {identity!r}")
+                raise CastDataIssue(f"candidate {item['candidate_id']!r} targets unrecorded candidate {identity!r}")
             if target_record["status"] == "known" and target_record["identity"] in registry:
                 item["identity"] = target_record["identity"]
             elif target_record["status"] == "new":
                 pass
             else:
-                raise RuntimeError(f"candidate {item['candidate_id']!r} targets candidate {identity!r} which is not a living discovery ({target_record['status']})")
+                raise CastDataIssue(
+                    f"candidate {item['candidate_id']!r} targets candidate {identity!r} which is not a living discovery ({target_record['status']})"
+                )
         else:
-            raise RuntimeError(f"known classification has unknown identity target: {identity!r}")
+            raise CastDataIssue(f"known classification has unknown identity target: {identity!r}")
 
 
-def link_provisional_identities(proposed: list[dict], classifications: list[dict], final_verdicts: dict[str, set[str]], by_scope: dict, references: dict, units_by_id: dict) -> None:
-    """Turn same_provisional verdicts into known->new links. The target must be independently introduced (its own mentions are reviewed distinct_living_identity), never itself a link (no chains or cycles), and every surviving mention of the linked label must agree."""
+def link_provisional_identities(
+    proposed: list[dict],
+    classifications: list[dict],
+    final_verdicts: dict[str, set[str]],
+    by_scope: dict,
+    references: dict,
+    units_by_id: dict,
+    units: list[dict] | None = None,
+    deferred: list[dict] | None = None,
+) -> None:
+    """Turn same_provisional verdicts into known->new links. The target must be independently introduced (its own mentions are reviewed distinct_living_identity), never itself a link (no chains or cycles), and every surviving mention of the linked label must agree.
+    A link that cannot stand is a garbled_variant pending entry when a deferred list is given (candidates already deferred are skipped), otherwise it fails closed."""
     record_by_id = {item["candidate_id"]: item for item in classifications}
+
+    def refuse(candidate: dict, message: str) -> None:
+        if deferred is None:
+            raise CastDataIssue(message)
+        deferred.append(pending_identity_entry(candidate, "garbled_variant", message, units, references, by_scope))
+
     for candidate in proposed:
+        if candidate["id"] not in final_verdicts:
+            continue
         links = {verdict for verdict in final_verdicts[candidate["id"]] if verdict.startswith(SAME_PROVISIONAL)}
         if not links:
             continue
         if len(links) > 1 or DISTINCT_VERDICT in final_verdicts[candidate["id"]]:
-            raise RuntimeError(f"proposed new identity {candidate['label']!r} has conflicting provisional verdicts: {sorted(final_verdicts[candidate['id']])}")
+            refuse(
+                candidate,
+                f"proposed new identity {candidate['label']!r} has conflicting provisional verdicts: {sorted(final_verdicts[candidate['id']])}",
+            )
+            continue
         target_id = next(iter(links))[len(SAME_PROVISIONAL) :]
-        target_verdicts = final_verdicts[target_id]
-        if DISTINCT_VERDICT not in target_verdicts or any(verdict.startswith(SAME_PROVISIONAL) for verdict in target_verdicts) or any(verdict.startswith("existing:") for verdict in target_verdicts):
-            raise RuntimeError(f"provisional target {target_id!r} for {candidate['label']!r} is not an independently introduced identity")
-        candidate_scopes = {mention_scope(units_by_id[references[ref_id]["unit_id"]], references[ref_id]) for ref_id in candidate["ref_ids"]}
-        witnesses = sorted({w for scope in candidate_scopes if by_scope[scope]["verdict"] == next(iter(links)) for w in by_scope[scope]["witness_unit_ids"]})
+        target_verdicts = final_verdicts.get(target_id, set())
+        if (
+            DISTINCT_VERDICT not in target_verdicts
+            or any(verdict.startswith(SAME_PROVISIONAL) for verdict in target_verdicts)
+            or any(verdict.startswith("existing:") for verdict in target_verdicts)
+        ):
+            refuse(
+                candidate,
+                f"provisional target {target_id!r} for {candidate['label']!r} is not an independently introduced identity",
+            )
+            continue
+        candidate_scopes = {
+            mention_scope(units_by_id[references[ref_id]["unit_id"]], references[ref_id])
+            for ref_id in candidate["ref_ids"]
+        }
+        witnesses = sorted(
+            {
+                w
+                for scope in candidate_scopes
+                if by_scope[scope]["verdict"] == next(iter(links))
+                for w in by_scope[scope]["witness_unit_ids"]
+            }
+        )
         item = record_by_id[candidate["id"]]
-        item["status"], item["identity"], item["evidence_unit_ids"] = "known", target_id, witnesses
+        item["status"], item["identity"], item["evidence_unit_ids"] = ("known", target_id, witnesses)
         candidate["audited_target"] = target_id
 
 
@@ -1257,7 +2630,9 @@ ADJUDICATION_OWNER_FACT_CHARS = 700
 ADJUDICATION_FACTS_TOTAL_CHARS = 6000
 
 
-def bounded_scene_range(units_by_id: dict, order: list[str], position: int, chars: int = ADJUDICATION_SCENE_CHARS) -> tuple[int, int]:
+def bounded_scene_range(
+    units_by_id: dict, order: list[str], position: int, chars: int = ADJUDICATION_SCENE_CHARS
+) -> tuple[int, int]:
     """Inclusive order positions of the contiguous same-chapter source around one mention, grown alternately both ways within a character budget; the mention's own unit is always whole."""
     chapter = units_by_id[order[position]]["chapter_sha256"]
     low = high = position
@@ -1279,25 +2654,41 @@ def bounded_scene_range(units_by_id: dict, order: list[str], position: int, char
 def bounded_scene(units_by_id: dict, order: list[str], position: int, with_ids: bool = False) -> str:
     """Contiguous same-chapter source around one mention, grown alternately both ways within a fixed character budget; the mention's own unit is always whole."""
     low, high = bounded_scene_range(units_by_id, order, position)
-    return " ".join((f"[{order[index]}] " if with_ids else "") + units_by_id[order[index]]["quote"] for index in range(low, high + 1))
+    return " ".join(
+        (f"[{order[index]}] " if with_ids else "") + units_by_id[order[index]]["quote"]
+        for index in range(low, high + 1)
+    )
 
 
-def scene_episode_ranges(units_by_id: dict, order: list[str], positions: list[int], chars: int) -> tuple[list[tuple[int, int]], list[int]]:
+def scene_episode_ranges(
+    units_by_id: dict, order: list[str], positions: list[int], chars: int
+) -> tuple[list[tuple[int, int]], list[int]]:
     """Merge every position's bounded scene into maximal continuous same-chapter episodes (inclusive order ranges). Returns the ranges and, per input position, its episode index (no position is dropped)."""
     ranges = [bounded_scene_range(units_by_id, order, position, chars) for position in positions]
     merged: list[list[int]] = []
     for low, high in sorted(set(ranges)):
-        if merged and low <= merged[-1][1] + 1 and units_by_id[order[low]]["chapter_sha256"] == units_by_id[order[merged[-1][0]]]["chapter_sha256"]:
+        if (
+            merged
+            and low <= merged[-1][1] + 1
+            and units_by_id[order[low]]["chapter_sha256"] == units_by_id[order[merged[-1][0]]]["chapter_sha256"]
+        ):
             merged[-1][1] = max(merged[-1][1], high)
         else:
             merged.append([low, high])
-    return [(low, high) for low, high in merged], [next(i for i, (low, high) in enumerate(merged) if low <= r_low and r_high <= high) for r_low, r_high in ranges]
+    return [(low, high) for low, high in merged], [
+        next(i for i, (low, high) in enumerate(merged) if low <= r_low and r_high <= high) for r_low, r_high in ranges
+    ]
 
 
-def scene_episodes(units_by_id: dict, order: list[str], positions: list[int], chars: int) -> tuple[list[str], list[int]]:
+def scene_episodes(
+    units_by_id: dict, order: list[str], positions: list[int], chars: int
+) -> tuple[list[str], list[int]]:
     """Episode texts (each unit rendered once with its ID) and, per input position, its episode index."""
     merged, episode_of = scene_episode_ranges(units_by_id, order, positions, chars)
-    return [" ".join(f"[{order[index]}] {units_by_id[order[index]]['quote']}" for index in range(low, high + 1)) for low, high in merged], episode_of
+    return [
+        " ".join(f"[{order[index]}] {units_by_id[order[index]]['quote']}" for index in range(low, high + 1))
+        for low, high in merged
+    ], episode_of
 
 
 def bounded_scene_with_ids(units_by_id: dict, order: list[str], position: int) -> str:
@@ -1317,7 +2708,9 @@ def owner_prior_facts(registry: dict, owners: list[str], label: str | None = Non
         flat = json.dumps(entry, ensure_ascii=False)
         hit = flat.casefold().find(label.casefold()) if label else -1
         if hit >= 0:
-            parts.append(f"prior facts mentioning {label!r}: ...{flat[max(0, hit - ADJUDICATION_SNIPPET_CHARS) : hit + len(label) + ADJUDICATION_SNIPPET_CHARS]}...")
+            parts.append(
+                f"prior facts mentioning {label!r}: ...{flat[max(0, hit - ADJUDICATION_SNIPPET_CHARS) : hit + len(label) + ADJUDICATION_SNIPPET_CHARS]}..."
+            )
         for field in ("bio", "look"):
             if entry.get(field):
                 parts.append(f"{field}={str(entry[field])!r}")
@@ -1346,11 +2739,16 @@ SCOPED_REFERENCE_FIELDS = ("chapter_sha256", "quote_sha256", "label", "span_star
 
 def scoped_audit_attestation(records: list[dict]) -> dict:
     """Order-independent digest binding the exact validated set of mention-scoped audit records to the freeze."""
-    ordered = sorted(mention_scoped_audit_index(records).values(), key=lambda r: (r["chapter_sha256"], r["quote_sha256"], r["span_start"], r["label"]))
+    ordered = sorted(
+        mention_scoped_audit_index(records).values(),
+        key=lambda r: (r["chapter_sha256"], r["quote_sha256"], r["span_start"], r["label"]),
+    )
     return {"version": 1, "count": len(ordered), "sha256": json_digest(ordered)}
 
 
-def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[dict], registry: dict, ask, aliases: dict | None = None) -> int:
+def adjudicate_pending_mentions(
+    project: Path, pending: list[dict], units: list[dict], registry: dict, ask, aliases: dict | None = None
+) -> int:
     """Adjudicate every pending mention lacking a binding decision; returns the number of audit records written (0 means no new context)."""
     written = 0
     references = immutable_name_references(units)
@@ -1376,57 +2774,230 @@ def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[
             chunk = scopes[offset : offset + ADJUDICATION_MENTIONS_PER_CALL]
             ids = [f"m{index}" for index in range(len(chunk))]
             decisions = ["alias", "non_character", "ambiguous"] if owners else ["non_character", "ambiguous"]
-            item = {"type": "object", "properties": {"mention_id": {"type": "string", "enum": ids}, "refers_to_person": {"type": "string", "enum": ["yes", "no", "unclear"]}, "candidate_kind": {"type": "string", "enum": ["individual_name", "specific_role", "endearment", "prose_fragment", "nonliving", "unclear"]}, "decision": {"type": "string", "enum": decisions}, "canonical": {"type": "string", "enum": [*owners, "none"]}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "reason": {"type": "string", "minLength": 1, "maxLength": 300}}, "required": ["mention_id", "refers_to_person", "candidate_kind", "decision", "canonical", "confidence", "reason"], "additionalProperties": False, "allOf": [{"if": {"properties": {"decision": {"const": "non_character"}}}, "then": {"properties": {"candidate_kind": {"enum": ["endearment", "prose_fragment", "nonliving"]}}}}, {"if": {"properties": {"candidate_kind": {"enum": ["individual_name", "specific_role"]}}}, "then": {"properties": {"decision": {"enum": ["alias", "ambiguous"]}}}}]}
-            schema = {"type": "object", "properties": {"mentions": {"type": "array", "minItems": len(chunk), "maxItems": len(chunk), "items": item}}, "required": ["mentions"], "additionalProperties": False}
-            roster = "; ".join(f"{owner}={registry[owner].get('name', owner)!r}" for owner in owners) or "(no candidate owner)"
+            item = {
+                "type": "object",
+                "properties": {
+                    "mention_id": {"type": "string", "enum": ids},
+                    "refers_to_person": {"type": "string", "enum": ["yes", "no", "unclear"]},
+                    "candidate_kind": {
+                        "type": "string",
+                        "enum": [
+                            "individual_name",
+                            "specific_role",
+                            "endearment",
+                            "prose_fragment",
+                            "nonliving",
+                            "unclear",
+                        ],
+                    },
+                    "decision": {"type": "string", "enum": decisions},
+                    "canonical": {"type": "string", "enum": [*owners, "none"]},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+                },
+                "required": [
+                    "mention_id",
+                    "refers_to_person",
+                    "candidate_kind",
+                    "decision",
+                    "canonical",
+                    "confidence",
+                    "reason",
+                ],
+                "additionalProperties": False,
+                "allOf": [
+                    {
+                        "if": {"properties": {"decision": {"const": "non_character"}}},
+                        "then": {
+                            "properties": {"candidate_kind": {"enum": ["endearment", "prose_fragment", "nonliving"]}}
+                        },
+                    },
+                    {
+                        "if": {"properties": {"candidate_kind": {"enum": ["individual_name", "specific_role"]}}},
+                        "then": {"properties": {"decision": {"enum": ["alias", "ambiguous"]}}},
+                    },
+                ],
+            }
+            schema = {
+                "type": "object",
+                "properties": {
+                    "mentions": {"type": "array", "minItems": len(chunk), "maxItems": len(chunk), "items": item}
+                },
+                "required": ["mentions"],
+                "additionalProperties": False,
+            }
+            roster = (
+                "; ".join(f"{owner}={registry[owner].get('name', owner)!r}" for owner in owners)
+                or "(no candidate owner)"
+            )
             rows = []
             for mention_id, scope in zip(ids, chunk, strict=True):
                 position = order.index(mentions[scope]["id"])
-                rows.append(f"{mention_id} [{mentions[scope]['chapter']}] mention: {mentions[scope]['quote']}\n   bounded scene: {bounded_scene(units_by_id, order, position)}")
+                rows.append(
+                    f"{mention_id} [{mentions[scope]['chapter']}] mention: {mentions[scope]['quote']}\n   bounded scene: {bounded_scene(units_by_id, order, position)}"
+                )
                 if scope in known:
                     prior = known[scope]
-                    rows.append(f"   previous decision (made when only {prior.get('owners', 'unrecorded owners')} were offered): {prior['decision']} confidence={prior['confidence']} because: {prior['reason']}")
-            prompt = f"Decide separately, for each exact mention of the label {candidate['label']!r}, whether THIS exact span refers to an existing character. Do not expand it with an adjacent capitalized narrative subject followed by a speech/action verb; for a title vocative, use direct response and scene continuity to identify its addressee. Never decide by spelling or sound similarity, and never generalise from one mention to another. alias requires the mention or its bounded scene to prove identity with the named owner, consistent with that owner's canonical prior facts; canonical must be that owner. The possible owners are only candidates (a shared name component, or a bounded roster of the whole cast when the label matches no name): a kinship or role label such as Mom or Dad may be a vocative or reference for a cast member whose prior facts say they are that person's parent, and a full name may extend a shorter canonical name; accept such a link only when the scene and prior facts support it. A previous decision is shown only where one exists; reconsider it with the fuller owner information. First answer refers_to_person for this mention: yes when it names or addresses a person/creature in the story (a vocative such as Mom, or a full name, counts), no only when it is a place, object, group, title word or other non-living thing, unclear when you cannot tell. Also classify candidate_kind: individual_name is a stable actor identity; specific_role can map only when the scene identifies its owner; endearment and prose_fragment address/describes a person but are not actor names; nonliving is not a person. Then decide: alias only for individual_name or source-owned specific_role with a supported owner. non_character is correct for nonliving, endearment, or prose_fragment even when refers_to_person=yes. ambiguous only when a potential individual_name/specific_role owner cannot be decided. Give honest confidence and a short source-based reason.\nPossible owners: {roster}\nCanonical prior facts for the possible owners:\n{owner_prior_facts(registry, owners, candidate['label'])}\nMENTIONS:\n" + "\n".join(rows)
+                    rows.append(
+                        f"   previous decision (made when only {prior.get('owners', 'unrecorded owners')} were offered): {prior['decision']} confidence={prior['confidence']} because: {prior['reason']}"
+                    )
+            prompt = (
+                f"Decide separately, for each exact mention of the label {candidate['label']!r}, whether THIS exact span refers to an existing character. Do not expand it with an adjacent capitalized narrative subject followed by a speech/action verb; for a title vocative, use direct response and scene continuity to identify its addressee. Never decide by spelling or sound similarity, and never generalise from one mention to another. alias requires the mention or its bounded scene to prove identity with the named owner, consistent with that owner's canonical prior facts; canonical must be that owner. The possible owners are only candidates (a shared name component, or a bounded roster of the whole cast when the label matches no name): a kinship or role label such as Mom or Dad may be a vocative or reference for a cast member whose prior facts say they are that person's parent, and a full name may extend a shorter canonical name; accept such a link only when the scene and prior facts support it. A previous decision is shown only where one exists; reconsider it with the fuller owner information. First answer refers_to_person for this mention: yes when it names or addresses a person/creature in the story (a vocative such as Mom, or a full name, counts), no only when it is a place, object, group, title word or other non-living thing, unclear when you cannot tell. Also classify candidate_kind: individual_name is a stable actor identity; specific_role can map only when the scene identifies its owner; endearment and prose_fragment address/describes a person but are not actor names; nonliving is not a person. Then decide: alias only for individual_name or source-owned specific_role with a supported owner. non_character is correct for nonliving, endearment, or prose_fragment even when refers_to_person=yes. ambiguous only when a potential individual_name/specific_role owner cannot be decided, which includes a named living person or creature that none of the possible owners is shown to be: never force an owner onto it, and never call it non_character merely because no owner fits. Give honest confidence and a short source-based reason.\nPossible owners: {roster}\nCanonical prior facts for the possible owners:\n{owner_prior_facts(registry, owners, candidate['label'])}\nMENTIONS:\n"
+                + "\n".join(rows)
+            )
             if len(prompt) > PREPARATION_PROMPT_MAX_CHARS:
-                raise RuntimeError(f"scoped adjudication prompt exceeds native context budget for {candidate['label']!r}")
-            value = json.loads(ask(prompt, max_tokens=1500, max_attempts=1, response_schema=schema))
-            returned = value.get("mentions") if isinstance(value, dict) else None
-            if not isinstance(returned, list) or {r.get("mention_id") for r in returned if isinstance(r, dict)} != set(ids) or len(returned) != len(ids):
-                raise RuntimeError(f"scoped adjudication omitted or duplicated mentions for {candidate['label']!r}")
+                raise CastDataIssue(
+                    f"scoped adjudication prompt exceeds native context budget for {candidate['label']!r}"
+                )
+            value = model_object(
+                ask(prompt, max_tokens=1500, max_attempts=1, response_schema=schema),
+                f"scoped adjudication for {candidate['label']!r}",
+            )
+            returned = value.get("mentions")
+            if (
+                not isinstance(returned, list)
+                or {r.get("mention_id") for r in returned if isinstance(r, dict)} != set(ids)
+                or len(returned) != len(ids)
+                or not all(
+                    {"decision", "canonical", "refers_to_person", "reason", "candidate_kind"} <= set(r)
+                    for r in returned
+                )
+            ):
+                raise CastDataIssue(f"scoped adjudication omitted or duplicated mentions for {candidate['label']!r}")
             for result in returned:
                 scope = chunk[ids.index(result["mention_id"])]
                 decision, canonical = result["decision"], result["canonical"]
                 person = result["refers_to_person"]
                 reason = str(result["reason"])
                 kind = result["candidate_kind"]
-                if decision == "alias" and (canonical not in owners or result["confidence"] < ADJUDICATION_MIN_CONFIDENCE or person != "yes" or kind not in {"individual_name", "specific_role"}):
+                if decision == "alias" and (
+                    canonical not in owners
+                    or result["confidence"] < ADJUDICATION_MIN_CONFIDENCE
+                    or person != "yes"
+                    or kind not in {"individual_name", "specific_role"}
+                ):
                     decision, canonical = "ambiguous", "none"
                 elif decision in {"non_character", "ambiguous"} and person == "yes" and result["canonical"] in owners:
-                    relationship_schema = {"type": "object", "properties": {"relationship": {"type": "string", "enum": ["same_owner", "distinct", "not_identity", "unclear"]}, "witness_unit_ids": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "enum": [unit["id"] for unit in units]}}, "reason": {"type": "string", "minLength": 1, "maxLength": 300}}, "required": ["relationship", "witness_unit_ids", "reason"], "additionalProperties": False}
+                    relationship_schema = {
+                        "type": "object",
+                        "properties": {
+                            "relationship": {
+                                "type": "string",
+                                "enum": ["same_owner", "distinct", "not_identity", "unclear"],
+                            },
+                            "witness_unit_ids": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 3,
+                                "uniqueItems": True,
+                                "items": {"type": "string", "enum": [unit["id"] for unit in units]},
+                            },
+                            "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+                        },
+                        "required": ["relationship", "witness_unit_ids", "reason"],
+                        "additionalProperties": False,
+                    }
                     relationship_prompt = f"For this one exact mention only, determine its relationship to proposed canonical {result['canonical']!r}: same_owner only with source scene continuity; distinct/not_identity/unclear otherwise. Do not infer from spelling. Cite witness IDs. Mention [{mentions[scope]['id']}]: {mentions[scope]['quote']!r}. Bounded scene: {bounded_scene(units_by_id, order, order.index(mentions[scope]['id']))}. Raw rationale: {reason!r}"
-                    relationship = json.loads(ask(relationship_prompt, max_tokens=500, max_attempts=1, response_schema=relationship_schema))
+                    relationship = model_object(
+                        ask(relationship_prompt, max_tokens=500, max_attempts=1, response_schema=relationship_schema),
+                        "relationship review",
+                        ("relationship", "witness_unit_ids", "reason"),
+                    )
                     if relationship["relationship"] == "same_owner":
-                        decision, canonical, reason = "alias", result["canonical"], f"[relationship review {relationship['witness_unit_ids']}] {relationship['reason']}"[:300]
+                        decision, canonical, reason = (
+                            "alias",
+                            result["canonical"],
+                            f"[relationship review {relationship['witness_unit_ids']}] {relationship['reason']}"[:300],
+                        )
                     else:
-                        decision, canonical, reason = "ambiguous", "none", f"[relationship review={relationship['relationship']}] {relationship['reason']}"[:300]
+                        decision, canonical, reason = (
+                            "ambiguous",
+                            "none",
+                            f"[relationship review={relationship['relationship']}] {relationship['reason']}"[:300],
+                        )
                 elif decision == "non_character" and person != "no" and kind not in {"endearment", "prose_fragment"}:
                     # One bounded native tiebreak distinguishes a bad coupled transport from a genuinely unresolved identity.
                     # It sees only this immutable mention/scene and the raw rationale; it cannot create a global alias.
-                    review_schema = {"type": "object", "properties": {"semantic_type": {"type": "string", "enum": ["individual_identity", "actor_reference", "endearment", "prose_fragment", "nonliving", "unclear"]}, "witness_unit_ids": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "enum": [unit["id"] for unit in units]}}, "reason": {"type": "string", "minLength": 1, "maxLength": 300}}, "required": ["semantic_type", "witness_unit_ids", "reason"], "additionalProperties": False}
+                    review_schema = {
+                        "type": "object",
+                        "properties": {
+                            "semantic_type": {
+                                "type": "string",
+                                "enum": [
+                                    "individual_identity",
+                                    "actor_reference",
+                                    "endearment",
+                                    "prose_fragment",
+                                    "nonliving",
+                                    "unclear",
+                                ],
+                            },
+                            "witness_unit_ids": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 3,
+                                "uniqueItems": True,
+                                "items": {"type": "string", "enum": [unit["id"] for unit in units]},
+                            },
+                            "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+                        },
+                        "required": ["semantic_type", "witness_unit_ids", "reason"],
+                        "additionalProperties": False,
+                    }
                     review_prompt = f"Classify ONE exact source span using exactly one semantic_type and cite immutable witness IDs. individual_identity is a stable actor name; actor_reference is a known person's name/reference but not a new name; endearment/prose_fragment/nonliving are not stable actor identities. Do not output a decision, canonical ID, or person flag; the caller derives those mechanically. Raw inconsistent result: person={person!r}, kind={kind!r}, decision={decision!r}, reason={reason!r}. Mention [{mentions[scope]['id']}]: {mentions[scope]['quote']!r}. Bounded scene: {bounded_scene(units_by_id, order, order.index(mentions[scope]['id']))}"
-                    reviewed = json.loads(ask(review_prompt, max_tokens=500, max_attempts=1, response_schema=review_schema))
-                    review_type, review_reason = reviewed["semantic_type"], reviewed["reason"]
+                    reviewed = model_object(
+                        ask(review_prompt, max_tokens=500, max_attempts=1, response_schema=review_schema),
+                        "semantic-type review",
+                        ("semantic_type", "witness_unit_ids", "reason"),
+                    )
+                    review_type, review_reason = (reviewed["semantic_type"], reviewed["reason"])
                     if review_type in {"endearment", "prose_fragment", "nonliving"}:
-                        kind, decision, canonical, reason = review_type, "non_character", "none", f"[semantic-type review {reviewed['witness_unit_ids']}] {review_reason}"[:300]
+                        kind, decision, canonical, reason = (
+                            review_type,
+                            "non_character",
+                            "none",
+                            f"[semantic-type review {reviewed['witness_unit_ids']}] {review_reason}"[:300],
+                        )
                     else:
-                        decision, canonical, reason = "ambiguous", "none", f"[inconsistent non_character with refers_to_person={person}; semantic-type review={review_type}] {review_reason}"[:300]
+                        decision, canonical, reason = (
+                            "ambiguous",
+                            "none",
+                            f"[inconsistent non_character with refers_to_person={person}; semantic-type review={review_type}] {review_reason}"[
+                                :300
+                            ],
+                        )
                 if decision != "alias":
                     canonical = "none"
-                record = {"chapter_sha256": scope[0], "quote_sha256": scope[1], "label": candidate["label"], "span_start": scope[3], "canonical": canonical, "decision": decision, "confidence": float(result["confidence"]), "reason": reason, "owners": list(owners), "raw_adjudication": {"decision": result["decision"], "canonical": result["canonical"], "refers_to_person": person, "candidate_kind": kind, "confidence": result["confidence"], "reason": result["reason"]}}
+                record = {
+                    "chapter_sha256": scope[0],
+                    "quote_sha256": scope[1],
+                    "label": candidate["label"],
+                    "span_start": scope[3],
+                    "canonical": canonical,
+                    "decision": decision,
+                    "confidence": float(result["confidence"]),
+                    "reason": reason,
+                    "owners": list(owners),
+                    "raw_adjudication": {
+                        "decision": result["decision"],
+                        "canonical": result["canonical"],
+                        "refers_to_person": person,
+                        "candidate_kind": kind,
+                        "confidence": result["confidence"],
+                        "reason": result["reason"],
+                    },
+                }
                 prior = known.get(scope)
                 if prior:
                     # keep every superseded decision and its reason; the audit is append-only history, not an overwrite
-                    record["history"] = [*prior.get("history", []), {key: prior[key] for key in ("decision", "canonical", "confidence", "reason", "owners") if key in prior}]
+                    record["history"] = [
+                        *prior.get("history", []),
+                        {
+                            key: prior[key]
+                            for key in ("decision", "canonical", "confidence", "reason", "owners")
+                            if key in prior
+                        },
+                    ]
                     records[:] = [item for item in records if item is not prior]
                 records.append(record)
                 known[scope] = record
@@ -1439,42 +3010,124 @@ def adjudicate_pending_mentions(project: Path, pending: list[dict], units: list[
 # ##################################################################
 # discover batch
 # executes bounded schema calls for ledger chunks, then materializes their composed complete classification once so omissions cannot be hidden between calls.
-def discover_batch(project: Path, start: int, batch: list[Path], batch_units: list[dict[str, str]], batch_text: str, progress: dict, ambiguous: set[str], prompt: str | None = None, ask=None) -> tuple[list[dict], list[dict]]:
+def discover_batch(
+    project: Path,
+    start: int,
+    batch: list[Path],
+    batch_units: list[dict[str, str]],
+    batch_text: str,
+    progress: dict,
+    ambiguous: set[str],
+    prompt: str | None = None,
+    ask=None,
+) -> tuple[list[dict], list[dict]]:
     del ambiguous, prompt
     ask = ask or ask_sync
     for review_round in range(2):
         records, candidates = collect_classifications(project, start, batch, batch_units, batch_text, progress, ask)
-        # The proposed-new review runs on the raw classification BEFORE materialization, which fails closed on unresolved named-person spans.
-        if not review_proposed_identities(project, batch_units, records, candidates, progress, ask):
+        # The proposed-new review runs on the raw classification BEFORE materialization. A span it cannot resolve joins
+        # the typed pending lane (never an owner, alias or fatal error); it is recorded below with literal evidence.
+        deferred: list[dict] = []
+        if not review_proposed_identities(project, batch_units, records, candidates, progress, ask, deferred):
             break
         if review_round == 1:
-            raise RuntimeError("proposed-new identity review did not converge")
+            raise CastDataIssue("proposed-new identity review did not converge")
+    defer_ambiguous_candidates(records, candidates, batch_units, deferred)
+    demote_deferred(records, candidates, batch_units, deferred)
     resolve_provisional_chains_before_materialize(records, candidates, progress["registry"])
-    discoveries, classifications = materialize_classifications({"classifications": records}, batch_units, candidates, progress["registry"], progress["aliases"])
-    approved = verify_proposed_living_entities(batch_units, discoveries, ask)
+    discoveries, classifications = materialize_classifications(
+        {"classifications": records}, batch_units, candidates, progress["registry"], progress["aliases"]
+    )
+    verifier_warnings: list[dict] = []
+    approved = verify_proposed_living_entities(batch_units, discoveries, ask, verifier_warnings)
+    proposals = {item["id"]: item for item in discoveries}
+    pending_rows = [
+        {
+            "id": warning["id"],
+            "code": warning["code"],
+            "message": f"proposed identity {warning['id']} is pending",
+            "evidence": warning,
+            "proposal": proposals.get(warning["id"]),
+        }
+        for warning in verifier_warnings
+    ] + [
+        {
+            "id": entry["id"],
+            "code": f"{PENDING_IDENTITY_CODE_PREFIX}{entry['type']}",
+            "message": f"{entry['type']} review of {entry['label']!r} is pending",
+            "evidence": {key: entry[key] for key in ("type", "label", "reason", "mentions")},
+            "proposal": entry,
+        }
+        for entry in deferred
+    ]
+    if pending_rows:
+        recovery = RecoveryLedger(project)
+        scope_names = [path.name for path in batch]
+        scope_hashes = {path.name: file_digest(path) for path in batch}
+        for row in pending_rows:
+            proposal_sha = save_pending_proposal(project, row["proposal"]) if row["proposal"] is not None else None
+            # Pending: kept out of registry/aliases (demoted), exact raw evidence persisted at the chapter checkpoint.
+            recovery.record(
+                "cast",
+                f"chapters {start}-{start + len(batch) - 1}:{row['id']}",
+                row["code"],
+                row["message"],
+                severity="pending",
+                evidence={
+                    **row["evidence"],
+                    "source": scope_names,
+                    "source_hash": scope_hashes,
+                    **({"proposal_sha256": proposal_sha} if proposal_sha else {}),
+                },
+                checkpoint={"start_chapter": start, "next_chapter": start + len(batch)},
+            )
     rejected = {item["id"] for item in discoveries} - approved
     if rejected:
         for record in classifications:
             candidate = next(item for item in candidates if item["id"] == record["candidate_id"])
             candidate_id = normalized_id(candidate["label"])
-            if candidate_id in rejected or record["identity"] in {next(item["id"] for item in discoveries if item["id"] == rejected_id) for rejected_id in rejected}:
+            if candidate_id in rejected or record["identity"] in {
+                next(item["id"] for item in discoveries if item["id"] == rejected_id) for rejected_id in rejected
+            }:
                 record["status"], record["identity"] = "non_character", "none"
         discoveries = [item for item in discoveries if item["id"] in approved]
     return discoveries, classifications
 
 
-def collect_classifications(project: Path, start: int, batch: list[Path], batch_units: list[dict[str, str]], batch_text: str, progress: dict, ask) -> tuple[list[dict], list[dict]]:
+def collect_classifications(
+    project: Path,
+    start: int,
+    batch: list[Path],
+    batch_units: list[dict[str, str]],
+    batch_text: str,
+    progress: dict,
+    ask,
+) -> tuple[list[dict], list[dict]]:
     for adjudication_round in range(ADJUDICATION_MAX_ROUNDS):
-        candidates = candidate_coverage_ledger(batch_units, progress["registry"], progress["aliases"], load_scoped_audit(project))
+        candidates = candidate_coverage_ledger(
+            batch_units, progress["registry"], progress["aliases"], load_scoped_audit(project)
+        )
         if not candidates:
             return [], []
         pending: list[dict] = []
         # Binding mention-scoped decisions are already source-validated exact references.
         # Materialize them deterministically; asking the provider to reclassify them can
         # overwrite a valid Lou→Lu scope with an unrelated lexical candidate target.
-        bound = [candidate for candidate in candidates if candidate.get("scoped_audit", {}).get("decision") in {"alias", "non_character"} and not candidate.get("scoped_stale")]
+        bound = [
+            candidate
+            for candidate in candidates
+            if candidate.get("scoped_audit", {}).get("decision") in {"alias", "non_character"}
+            and not candidate.get("scoped_stale")
+        ]
         records: list[dict] = [
-            {"candidate_id": candidate["id"], "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]], "status": "known" if candidate["scoped_audit"]["decision"] == "alias" else "non_character", "identity": candidate["scoped_audit"]["canonical"] if candidate["scoped_audit"]["decision"] == "alias" else "none"}
+            {
+                "candidate_id": candidate["id"],
+                "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]],
+                "status": "known" if candidate["scoped_audit"]["decision"] == "alias" else "non_character",
+                "identity": candidate["scoped_audit"]["canonical"]
+                if candidate["scoped_audit"]["decision"] == "alias"
+                else "none",
+            }
             for candidate in bound
         ]
         unresolved = [candidate for candidate in candidates if candidate not in bound]
@@ -1484,27 +3137,58 @@ def collect_classifications(project: Path, start: int, batch: list[Path], batch_
             candidate["audited_target"] = variant_targets.get(candidate["id"])
         audited_context = source_audited_variant_context(project, candidates)
         for chunk_index, chunk in enumerate(classification_chunks(unresolved)):
-            chunk_prompt = discovery_prompt(batch, progress["registry"], progress["aliases"], chunk, candidates, allow_new)
+            chunk_prompt = discovery_prompt(
+                batch, progress["registry"], progress["aliases"], chunk, candidates, allow_new, batch_units
+            )
             if audited_context:
                 chunk_prompt += "\n\n" + audited_context
             schema = discovery_schema(list(progress["registry"]), chunk, candidates, allow_new)
             response = ask(chunk_prompt, max_tokens=1800, max_attempts=1, response_schema=schema)
             for attempt in range(EVIDENCE_REPAIR_ATTEMPTS + 1):
                 try:
-                    records.extend(validate_classification_chunk(json.loads(response), chunk, progress["registry"], progress["aliases"], candidates, batch_units, pending))
+                    records.extend(
+                        validate_classification_chunk(
+                            json.loads(response),
+                            chunk,
+                            progress["registry"],
+                            progress["aliases"],
+                            candidates,
+                            batch_units,
+                            pending,
+                        )
+                    )
                     break
                 except (ValueError, json.JSONDecodeError) as error:
-                    record_rejected_discovery(project, start, batch, batch_units, response, RuntimeError(f"chunk {chunk_index}: {error}"), attempt)
+                    record_rejected_discovery(
+                        project,
+                        start,
+                        batch,
+                        batch_units,
+                        response,
+                        RuntimeError(f"chunk {chunk_index}: {error}"),
+                        attempt,
+                    )
                     if attempt == EVIDENCE_REPAIR_ATTEMPTS:
-                        raise RuntimeError(f"cast semantic classification {start}-{start + len(batch) - 1} chunk {chunk_index} rejected after bounded repairs; archived evidence: {error}") from error
-                    response = ask(f"Your chunk classification was rejected: {error}. Return the complete schema object for this chunk only.\n\n{chunk_prompt}", max_tokens=1800, max_attempts=1, response_schema=schema)
+                        raise CastDataIssue(
+                            f"cast semantic classification {start}-{start + len(batch) - 1} chunk {chunk_index} rejected after bounded repairs; archived evidence: {error}"
+                        ) from error
+                    response = ask(
+                        f"Your chunk classification was rejected: {error}. Return the complete schema object for this chunk only.\n\n{chunk_prompt}",
+                        max_tokens=1800,
+                        max_attempts=1,
+                        response_schema=schema,
+                    )
         if not pending:
             break
         # monotonic: only mentions without a binding decision are adjudicated, so a round that writes nothing has no new context and cannot change the next classification
-        if not adjudicate_pending_mentions(project, pending, batch_units, progress["registry"], ask, progress["aliases"]):
+        if not adjudicate_pending_mentions(
+            project, pending, batch_units, progress["registry"], ask, progress["aliases"]
+        ):
             break
         if adjudication_round == ADJUDICATION_MAX_ROUNDS - 1:
-            raise RuntimeError(f"scoped adjudication did not converge within {ADJUDICATION_MAX_ROUNDS} classification rounds")
+            raise CastDataIssue(
+                f"scoped adjudication did not converge within {ADJUDICATION_MAX_ROUNDS} classification rounds"
+            )
     return records, candidates
 
 
@@ -1520,18 +3204,25 @@ def context_safe_batch(
         candidate = [*selected, chapter]
         # Reserve the complete original chapter bytes as semantic context budget even though the wire prompt transports compact candidate witnesses.
         # The source-only lower bound is checked first so an oversized chapter never pays for prompt/ledger construction.
-        source_bytes = sum(len(path.read_text(encoding="utf-8")) for path in candidate)
-        candidate_prompt = "" if source_bytes * 2 > PREPARATION_PROMPT_MAX_CHARS else discovery_prompt(candidate, registry, aliases)
+        try:
+            source_bytes = sum(len(path.read_text(encoding="utf-8")) for path in candidate)
+        except UnicodeDecodeError as error:
+            # An undecodable chapter ends the batch before it; when it is first it is quarantined by the caller.
+            if not selected:
+                raise undecodable_issue(chapter, error) from error
+            break
+        candidate_prompt = (
+            "" if source_bytes * 2 > PREPARATION_PROMPT_MAX_CHARS else discovery_prompt(candidate, registry, aliases)
+        )
         conservative_size = len(candidate_prompt) + (source_bytes * 2)
         if conservative_size > PREPARATION_PROMPT_MAX_CHARS:
             if not selected:
-                raise RuntimeError(
-                    f"source chapter {chapter.name} exceeds safe native model context; refusing to truncate or skip it"
-                )
+                # Oversized single chapter: the caller classifies it through immutable-unit context windows.
+                return [chapter], ""
             break
         selected, prompt = candidate, candidate_prompt
     if not selected:
-        raise RuntimeError("no source chapters fit the native model context")
+        raise CastDataIssue("no source chapters fit the native model context")
     return selected, prompt
 
 
@@ -1546,7 +3237,13 @@ def source_label_present(label: str, units: list[dict[str, str]]) -> bool:
 # record rejected discovery
 # retains every complete native response and immutable unit citations so each original or repair failure is auditable without a lossy exception snippet.
 def record_rejected_discovery(
-    project: Path, start: int, batch: list[Path], units: list[dict[str, str]], response: str, error: Exception, attempt: int
+    project: Path,
+    start: int,
+    batch: list[Path],
+    units: list[dict[str, str]],
+    response: str,
+    error: Exception,
+    attempt: int,
 ) -> None:
     payload = {
         "start_chapter": start,
@@ -1590,7 +3287,7 @@ def apply_discoveries(registry: dict, aliases: dict, discoveries: list[dict]) ->
             if key:
                 prior = aliases.get(key)
                 if prior is not None and prior != actor_id:
-                    raise RuntimeError(
+                    raise CastDataIssue(
                         f"source-backed alias is ambiguous: {alias!r} maps to both {prior} and {actor_id}"
                     )
                 aliases[key] = actor_id
@@ -1630,7 +3327,7 @@ def apply_alias_audit(project: Path, source_text: str, registry: dict, aliases: 
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError("alias audit is unreadable") from error
+        raise OperationalError("cast_integrity", "alias audit is unreadable") from error
     records = report if isinstance(report, list) else report.get("records") if isinstance(report, dict) else None
     if not isinstance(records, list):
         raise TypeError("alias audit requires a records array")
@@ -1638,23 +3335,23 @@ def apply_alias_audit(project: Path, source_text: str, registry: dict, aliases: 
     ambiguous: set[str] = set()
     for record in records:
         if not isinstance(record, dict) or set(record) != {"alias", "canonical", "evidence", "decision"}:
-            raise RuntimeError("alias audit record has an invalid schema")
+            raise OperationalError("cast_integrity", "alias audit record has an invalid schema")
         alias = record["alias"]
         canonical = record["canonical"]
         evidence = record["evidence"]
         decision = record["decision"]
         if not all(isinstance(value, str) for value in (alias, canonical, decision)) or not isinstance(evidence, list):
-            raise RuntimeError("alias audit record has invalid values")
+            raise OperationalError("cast_integrity", "alias audit record has invalid values")
         if (
             canonical not in registry
             or not evidence
             or not all(isinstance(quote, str) and quote in source_text for quote in evidence)
         ):
-            raise RuntimeError("alias audit lacks source-grounded canonical evidence")
+            raise OperationalError("cast_integrity", "alias audit lacks source-grounded canonical evidence")
         if decision == "distinct":
             continue
         if decision not in {"merge", "ambiguous"}:
-            raise RuntimeError("alias audit decision must be merge, distinct, or ambiguous")
+            raise OperationalError("cast_integrity", "alias audit decision must be merge, distinct, or ambiguous")
         if decision == "ambiguous":
             ambiguous.add(normalized_id(alias))
             continue
@@ -1666,13 +3363,13 @@ def apply_alias_audit(project: Path, source_text: str, registry: dict, aliases: 
             merge_target = alias_id if preferred == alias_id else canonical_id
             prior = merges.get(merge_alias)
             if prior is not None and prior != merge_target:
-                raise RuntimeError(f"alias audit conflicts with prior alias: {alias}")
+                raise OperationalError("cast_integrity", f"alias audit conflicts with prior alias: {alias}")
             merges[merge_alias] = merge_target
 
     def resolved(actor_id: str, trail: set[str] | None = None) -> str:
         trail = trail or set()
         if actor_id in trail:
-            raise RuntimeError(f"alias audit contains a cycle at {actor_id}")
+            raise OperationalError("cast_integrity", f"alias audit contains a cycle at {actor_id}")
         target = merges.get(actor_id)
         if target is None:
             return actor_id
@@ -1682,7 +3379,9 @@ def apply_alias_audit(project: Path, source_text: str, registry: dict, aliases: 
     for alias_id in merges:
         canonical = resolved(alias_id)
         if canonical not in registry:
-            raise RuntimeError(f"alias audit resolves outside registry: {alias_id} -> {canonical}")
+            raise OperationalError(
+                "cast_integrity", f"alias audit resolves outside registry: {alias_id} -> {canonical}"
+            )
         aliases[alias_id] = canonical
         if alias_id != canonical:
             inactive.add(alias_id)
@@ -1705,7 +3404,9 @@ def refresh_alias_audit(project: Path, source_text: str, progress: dict) -> tupl
     inactive.update(progress.get("inactive_legacy_ids", []))
     ambiguous.update(progress.get("ambiguous_new_ids", []))
     if inactive:
-        progress["registry"] = {actor_id: entry for actor_id, entry in progress["registry"].items() if actor_id not in inactive}
+        progress["registry"] = {
+            actor_id: entry for actor_id, entry in progress["registry"].items() if actor_id not in inactive
+        }
     progress["inactive_legacy_ids"] = sorted(inactive)
     progress["ambiguous_new_ids"] = sorted(ambiguous)
     progress["audit_applied"] = True
@@ -1778,14 +3479,14 @@ def asset_hashes(project: Path, actor_ids: set[str]) -> dict:
     profiles: dict[str, dict] = {}
     for actor_id in sorted(actor_ids):
         if actor_id not in characters or actor_id not in voices or actor_id not in breeze:
-            raise RuntimeError(f"frozen actor lacks profile or Breeze voice: {actor_id}")
+            raise OperationalError("cast_integrity", f"frozen actor lacks profile or Breeze voice: {actor_id}")
         if actor_id != "narrator" and (
             actor_id not in appearances or not (project / "refs" / f"{actor_id}.png").is_file()
         ):
-            raise RuntimeError(f"frozen actor lacks appearance or portrait: {actor_id}")
+            raise OperationalError("cast_integrity", f"frozen actor lacks appearance or portrait: {actor_id}")
         wav = project / str(breeze[actor_id].get("ref_wav", ""))
         if not wav.is_file():
-            raise RuntimeError(f"frozen actor lacks reference WAV: {actor_id}")
+            raise OperationalError("cast_integrity", f"frozen actor lacks reference WAV: {actor_id}")
         profiles[actor_id] = {
             "character_profile": json_digest(characters[actor_id]),
             "voice_profile": json_digest(voices[actor_id]),
@@ -1805,26 +3506,30 @@ def verify_frozen_cast(source: Path, project: Path | None = None) -> dict:
     project = project or get_output_dir(source)
     manifest = load_object(project / MANIFEST_NAME, "frozen cast manifest")
     if manifest.get("version") != 1 or manifest.get("source_sha256") != source_fingerprint(source):
-        raise RuntimeError("frozen cast manifest does not bind this exact source")
+        raise OperationalError("cast_integrity", "frozen cast manifest does not bind this exact source")
     _, _, chapters = source_chapters(source, project)
     expected = {path.name: file_digest(path) for path in chapters}
     if manifest.get("chapter_sha256") != expected:
-        raise RuntimeError("frozen cast manifest lacks complete exact source chapter coverage")
+        raise OperationalError("cast_integrity", "frozen cast manifest lacks complete exact source chapter coverage")
     actors = manifest.get("actors")
     aliases = manifest.get("approved_aliases")
     if not isinstance(actors, dict) or not actors or not isinstance(aliases, dict):
-        raise RuntimeError("frozen cast manifest has no approved registry")
+        raise OperationalError("cast_integrity", "frozen cast manifest has no approved registry")
     if not ANCHOR_IDS <= set(actors):
-        raise RuntimeError("frozen cast manifest is missing original anchor identities")
+        raise OperationalError("cast_integrity", "frozen cast manifest is missing original anchor identities")
     if any(not isinstance(value, str) or value not in actors for value in aliases.values()):
-        raise RuntimeError("frozen cast manifest has alias outside approved registry")
+        raise OperationalError("cast_integrity", "frozen cast manifest has alias outside approved registry")
     actual = asset_hashes(project, set(actors))
     if actual != manifest.get("asset_hashes"):
-        raise RuntimeError("frozen cast profile, voice, WAV, appearance, or portrait bytes changed")
+        raise OperationalError(
+            "cast_integrity", "frozen cast profile, voice, WAV, appearance, or portrait bytes changed"
+        )
     # A manifest frozen before scoped audit existed attests an empty record set; any record appearing later is unattested.
     attested = manifest.get("scoped_audit", scoped_audit_attestation([]))
     if attested != scoped_audit_attestation(load_scoped_audit(project)):
-        raise RuntimeError("frozen cast manifest does not attest the current mention-scoped audit records")
+        raise OperationalError(
+            "cast_integrity", "frozen cast manifest does not attest the current mention-scoped audit records"
+        )
     return manifest
 
 
@@ -1838,18 +3543,25 @@ def validated_scoped_references(source: Path, project: Path | None = None, manif
     _, _, chapters = source_chapters(source, project)
     units = {(unit["chapter_sha256"], text_digest(unit["quote"])): unit for unit in immutable_evidence_units(chapters)}
     references: list[dict] = []
-    for record in sorted(load_scoped_audit(project), key=lambda r: (r["chapter_sha256"], r["quote_sha256"], r["span_start"], r["label"])):
+    for record in sorted(
+        load_scoped_audit(project), key=lambda r: (r["chapter_sha256"], r["quote_sha256"], r["span_start"], r["label"])
+    ):
         if record["decision"] != "alias":
             continue
         unit = units.get((record["chapter_sha256"], record["quote_sha256"]))
         if unit is None:
-            raise RuntimeError("mention-scoped alias is bound to source text that does not exist")
-        if not any(ref["label"] == record["label"] and ref["start"] == record["span_start"] for ref in immutable_name_references([unit]).values()):
-            raise RuntimeError("mention-scoped alias does not name an exact source mention at its offset")
+            raise OperationalError("cast_integrity", "mention-scoped alias is bound to source text that does not exist")
+        if not any(
+            ref["label"] == record["label"] and ref["start"] == record["span_start"]
+            for ref in immutable_name_references([unit]).values()
+        ):
+            raise OperationalError(
+                "cast_integrity", "mention-scoped alias does not name an exact source mention at its offset"
+            )
         if record["canonical"] not in manifest["actors"]:
-            raise RuntimeError("mention-scoped alias targets an actor outside the frozen cast")
+            raise OperationalError("cast_integrity", "mention-scoped alias targets an actor outside the frozen cast")
         if record["confidence"] < ADJUDICATION_MIN_CONFIDENCE:
-            raise RuntimeError("mention-scoped alias is below the adjudication confidence floor")
+            raise OperationalError("cast_integrity", "mention-scoped alias is below the adjudication confidence floor")
         references.append({field: record[field] for field in SCOPED_REFERENCE_FIELDS})
     return references
 
@@ -1874,8 +3586,8 @@ def validate_preparation_coverage(progress: dict, chapters: list[Path]) -> None:
     expected_start = 0
     seen: set[str] = set()
     for batch in progress.get("completed_batches", []):
-        if not isinstance(batch, dict) or set(batch) != {"start", "end", "chapter_sha256"}:
-            raise RuntimeError("cast preparation has an invalid completed batch record")
+        if not isinstance(batch, dict) or set(batch) - {"quarantined"} != {"start", "end", "chapter_sha256"}:
+            raise OperationalError("cast_integrity", "cast preparation has an invalid completed batch record")
         start, end, hashes = batch["start"], batch["end"], batch["chapter_sha256"]
         if (
             not isinstance(start, int)
@@ -1884,14 +3596,20 @@ def validate_preparation_coverage(progress: dict, chapters: list[Path]) -> None:
             or end <= start
             or end > len(chapters)
         ):
-            raise RuntimeError("cast preparation completed batches do not have unique consecutive chapter coverage")
+            raise OperationalError(
+                "cast_integrity", "cast preparation completed batches do not have unique consecutive chapter coverage"
+            )
         expected_hashes = {path.name: file_digest(path) for path in chapters[start:end]}
         if not isinstance(hashes, dict) or hashes != expected_hashes or seen.intersection(hashes):
-            raise RuntimeError("cast preparation completed batches lack unique exact chapter hashes")
+            raise OperationalError(
+                "cast_integrity", "cast preparation completed batches lack unique exact chapter hashes"
+            )
         seen.update(hashes)
         expected_start = end
     if progress.get("next_chapter") != expected_start:
-        raise RuntimeError("cast preparation cursor does not match completed exact chapter coverage")
+        raise OperationalError(
+            "cast_integrity", "cast preparation cursor does not match completed exact chapter coverage"
+        )
 
 
 # ##################################################################
@@ -1903,7 +3621,7 @@ def semantic_coverage(progress: dict) -> dict:
         coverage = {"version": SEMANTIC_COVERAGE_VERSION, "next_chapter": 0, "completed_batches": []}
         progress["semantic_coverage"] = coverage
     if not isinstance(coverage, dict) or coverage.get("version") != SEMANTIC_COVERAGE_VERSION:
-        raise RuntimeError("cast preparation has an unsupported semantic coverage ledger")
+        raise OperationalError("cast_integrity", "cast preparation has an unsupported semantic coverage ledger")
     return coverage
 
 
@@ -1914,40 +3632,377 @@ def validate_semantic_coverage(progress: dict, chapters: list[Path]) -> None:
     coverage = semantic_coverage(progress)
     expected_start = 0
     for batch in coverage["completed_batches"]:
-        if not isinstance(batch, dict) or set(batch) != {"start", "end", "chapter_sha256", "ledger_sha256"}:
-            raise RuntimeError("semantic coverage has an invalid completed batch record")
+        if not isinstance(batch, dict) or set(batch) - {"quarantined"} != {
+            "start",
+            "end",
+            "chapter_sha256",
+            "ledger_sha256",
+        }:
+            raise OperationalError("cast_integrity", "semantic coverage has an invalid completed batch record")
         start, end = batch["start"], batch["end"]
-        if not isinstance(start, int) or not isinstance(end, int) or start != expected_start or end <= start or end > len(chapters):
-            raise RuntimeError("semantic coverage batches are not unique consecutive source coverage")
-        if batch["chapter_sha256"] != {path.name: file_digest(path) for path in chapters[start:end]} or not isinstance(batch["ledger_sha256"], str):
-            raise RuntimeError("semantic coverage batch is not bound to exact source and candidate ledger")
+        if (
+            not isinstance(start, int)
+            or not isinstance(end, int)
+            or start != expected_start
+            or end <= start
+            or end > len(chapters)
+        ):
+            raise OperationalError(
+                "cast_integrity", "semantic coverage batches are not unique consecutive source coverage"
+            )
+        if batch["chapter_sha256"] != {path.name: file_digest(path) for path in chapters[start:end]} or not isinstance(
+            batch["ledger_sha256"], str
+        ):
+            raise OperationalError(
+                "cast_integrity", "semantic coverage batch is not bound to exact source and candidate ledger"
+            )
         expected_start = end
     if coverage.get("next_chapter") != expected_start:
-        raise RuntimeError("semantic coverage cursor does not match its completed batches")
+        raise OperationalError("cast_integrity", "semantic coverage cursor does not match its completed batches")
 
 
 # ##################################################################
 # record semantic batch
 # writes the complete local ledger and native classifications before any cursor advances, making omitted candidates auditable across restarts.
-def record_semantic_batch(project: Path, start: int, batch: list[Path], units: list[dict], classifications: list[dict], coverage: dict, revalidation: bool) -> None:
-    ledger = candidate_coverage_ledger(units, {}, {})
+def record_semantic_batch(
+    project: Path,
+    start: int,
+    batch: list[Path],
+    units: list[dict],
+    classifications: list[dict],
+    coverage: dict,
+    revalidation: bool,
+    quarantined: bool = False,
+) -> None:
+    ledger = [] if quarantined else candidate_coverage_ledger(units, {}, {})
     ledger_sha256 = json_digest(ledger)
-    payload = {"start_chapter": start, "chapters": [path.name for path in batch], "semantic_revalidation": revalidation, "candidate_ledger": ledger, "classifications": classifications}
+    payload = {
+        "start_chapter": start,
+        "chapters": [path.name for path in batch],
+        "semantic_revalidation": revalidation,
+        "candidate_ledger": ledger,
+        "classifications": classifications,
+        **({"quarantined": True} if quarantined else {}),
+    }
     with (project / DISCOVERIES_NAME).open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    coverage["completed_batches"].append({"start": start, "end": start + len(batch), "chapter_sha256": {path.name: file_digest(path) for path in batch}, "ledger_sha256": ledger_sha256})
+    coverage["completed_batches"].append(
+        {
+            "start": start,
+            "end": start + len(batch),
+            "chapter_sha256": {path.name: file_digest(path) for path in batch},
+            "ledger_sha256": ledger_sha256,
+            **({"quarantined": True} if quarantined else {}),
+        }
+    )
     coverage["next_chapter"] = start + len(batch)
+
+
+# ##################################################################
+# recoverable batches
+# runs one source batch; a data problem (malformed/unknown/ambiguous/overlarge/empty/odd-unicode source or bad model JSON) isolates the failing chapter(s), records exact evidence and a checkpoint, and continues. Registry and aliases only change on a fully valid result, so a quarantined unit can never leave a partial or global alias. Infrastructure errors propagate untouched.
+def recoverable_batches(
+    project: Path,
+    pool: list[Path],
+    start: int,
+    progress: dict,
+    ambiguous: set[str],
+    source_text: str,
+    recovery: RecoveryLedger,
+    ask,
+    stop_at: int | None,
+):
+    def attempt(paths: list[Path], prompt: str | None) -> dict:
+        units = immutable_evidence_units(paths)
+        work = {"registry": copy.deepcopy(progress["registry"]), "aliases": dict(progress["aliases"])}
+        classifications: list[dict] = []
+        # Each window is an immutable-unit slice that fits the native context; discoveries accumulate on the working copy only.
+        for window in unit_windows(units, work["registry"], work["aliases"]):
+            discoveries, window_classes = discover_batch(
+                project, start, paths, window, source_text, work, ambiguous, prompt, ask
+            )
+            apply_discoveries(work["registry"], work["aliases"], discoveries)
+            classifications.extend(window_classes)
+        return {
+            "start": start,
+            "batch": paths,
+            "units": units,
+            "classifications": classifications,
+            "registry": work["registry"],
+            "aliases": work["aliases"],
+            "quarantine": None,
+        }
+
+    def quarantine(paths: list[Path], error: DataIssue) -> dict:
+        names = [path.name for path in paths]
+        archive = archive_quarantine(project, start, paths, error)
+        recovery.record_error(
+            "cast",
+            f"chapters {start}-{start + len(paths) - 1}",
+            error,
+            evidence={
+                "chapters": names,
+                "rejection_archive": REJECTIONS_NAME,
+                **archive,
+                "source": names,
+                "source_hash": archive["raw_chapter_sha256"],
+            },
+            checkpoint={"start_chapter": start, "end_chapter": start + len(paths), "next_chapter": start + len(paths)},
+        )
+        return {
+            "start": start,
+            "batch": paths,
+            "units": [],
+            "classifications": [],
+            "registry": None,
+            "aliases": None,
+            "quarantine": names,
+        }
+
+    # Only a typed DataIssue is recoverable; programming, integrity, store, source-hash and alias-cycle errors propagate.
+    try:
+        batch, prompt = context_safe_batch(pool, start, progress["registry"], progress["aliases"])
+    except DataIssue as error:
+        yield quarantine(pool[start : start + 1], error)
+        return
+    try:
+        yield attempt(batch, prompt)
+        return
+    except DataIssue as error:
+        first_error = error
+    if len(batch) == 1:
+        yield quarantine(batch, first_error)
+        return
+    # Isolate: retry each chapter of the failed batch alone so one bad chapter never costs its neighbours.
+    position = start
+    for chapter in batch:
+        start = position
+        try:
+            yield attempt([chapter], None)
+        except DataIssue as error:
+            yield quarantine([chapter], error)
+        position += 1
+
+
+# ##################################################################
+# unit windows
+# partitions a batch's immutable evidence units into consecutive windows that each fit the native context, so an oversized chapter is classified completely instead of quarantined.
+def unit_windows(units: list[dict[str, str]], registry: dict, aliases: dict[str, str]) -> list[list[dict[str, str]]]:
+    def fits(window: list[dict[str, str]]) -> bool:
+        source = sum(len(unit["quote"]) for unit in window)
+        if source * 2 > PREPARATION_PROMPT_MAX_CHARS:
+            return False
+        return len(discovery_prompt([], registry, aliases, units=window)) + source * 2 <= PREPARATION_PROMPT_MAX_CHARS
+
+    windows: list[list[dict[str, str]]] = []
+    index = 0
+    while index < len(units):
+        if fits(units[index:]):
+            windows.append(units[index:])
+            break
+        if not fits(units[index : index + 1]):
+            raise CastDataIssue(
+                f"immutable unit {units[index]['id']} exceeds safe native model context",
+                {
+                    "unit_id": units[index]["id"],
+                    "chapter": units[index]["chapter"],
+                    "unit_chars": len(units[index]["quote"]),
+                },
+                "source_unit_oversized",
+            )
+        low, high = index + 1, len(units)  # low fits, high does not
+        while high - low > 1:
+            mid = (low + high) // 2
+            if fits(units[index:mid]):
+                low = mid
+            else:
+                high = mid
+        windows.append(units[index:low])
+        index = low
+    return windows
+
+
+# ##################################################################
+# archive quarantine
+# appends the durable rejection record for a quarantined unit: exact raw source bytes hashes and a reference to every prior raw model rejection for the same scope.
+def archive_quarantine(project: Path, start: int, paths: list[Path], error: DataIssue) -> dict:
+    names = [path.name for path in paths]
+    raw = {path.name: path.read_bytes() for path in paths}
+    archive = project / REJECTIONS_NAME
+    prior: list[dict] = []
+    line_count = 0
+    if archive.exists():
+        for number, line in enumerate(archive.read_text(encoding="utf-8").splitlines()):
+            line_count = number + 1
+            record = json.loads(line)
+            if record.get("start_chapter") == start and record.get("chapters") == names:
+                prior.append({"line": number, "sha256": hashlib.sha256(line.encode("utf-8")).hexdigest()})
+    payload = {
+        "kind": "quarantine",
+        "start_chapter": start,
+        "chapters": names,
+        "code": getattr(error, "code", type(error).__name__),
+        "error": str(error),
+        "evidence": safe_evidence(getattr(error, "evidence", {})),
+        "raw_chapter_sha256": {name: hashlib.sha256(data).hexdigest() for name, data in raw.items()},
+        "raw_chapter_bytes": {name: len(data) for name, data in raw.items()},
+        "model_rejections": prior,
+    }
+    line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    with archive.open("a", encoding="utf-8") as stream:
+        stream.write(line + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return {
+        "archive_line": line_count,
+        "archive_sha256": hashlib.sha256(line.encode("utf-8")).hexdigest(),
+        "raw_chapter_sha256": payload["raw_chapter_sha256"],
+        "model_rejections": prior,
+    }
+
+
+PENDING_REPLAY_LIMIT = 3
+PROPOSALS_NAME = "cast_pending_proposals.jsonl"
+
+
+# ##################################################################
+# save pending proposal
+# persists the exact demoted identity proposal so a pending row's evidence is reproducible.
+def save_pending_proposal(project: Path, proposal: dict) -> str:
+    line = json.dumps(proposal, ensure_ascii=False, sort_keys=True)
+    with (project / PROPOSALS_NAME).open("a", encoding="utf-8") as stream:
+        stream.write(line + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return hashlib.sha256(line.encode("utf-8")).hexdigest()
+
+
+# ##################################################################
+# replay pending
+# re-runs each open pending row's exact scope (only when every recorded chapter still has its exact recorded hash), bounded per row; the structural cursor and semantic ledger never move. A scope that now yields no pending warning is resolved durably and coverage records it; otherwise the row stays open and freezes publication.
+def replay_pending(
+    project: Path,
+    chapters: list[Path],
+    progress: dict,
+    ambiguous: set[str],
+    source_text: str,
+    recovery: RecoveryLedger,
+    ask,
+) -> dict:
+    by_name = {path.name: path for path in chapters}
+    coverage = semantic_coverage(progress)
+    summary = {"resolved": 0, "open": 0, "attempts": 0}
+    for row in recovery.open_pending("cast"):
+        evidence = row["evidence"]
+        names, hashes = evidence.get("source"), evidence.get("source_hash")
+        exact = (
+            isinstance(names, list)
+            and isinstance(hashes, dict)
+            and names
+            and all(name in by_name and hashes.get(name) == file_digest(by_name[name]) for name in names)
+        )
+        if not exact:
+            summary["open"] += 1
+            continue
+        attempts = [
+            r
+            for r in recovery.entries()
+            if r["stage"] == "cast"
+            and r["severity"] == "replay_attempt"
+            and r["item_sha256"] == row["item_sha256"]
+            and r["evidence"].get("replays") == row["code"]
+        ]
+        if len(attempts) >= PENDING_REPLAY_LIMIT:
+            summary["open"] += 1
+            continue
+        recovery.record(
+            "cast",
+            row["item"],
+            "pending_replay_attempt",
+            f"replay attempt {len(attempts) + 1}",
+            severity="replay_attempt",
+            evidence={"replays": row["code"], "source": names, "source_hash": {"attempt": len(attempts) + 1, **hashes}},
+        )
+        summary["attempts"] += 1
+        paths = [by_name[name] for name in names]
+        RecoveryLedger.presented.clear()
+        start = chapters.index(paths[0])
+        try:
+            units = immutable_evidence_units(paths)
+            work = {"registry": copy.deepcopy(progress["registry"]), "aliases": dict(progress["aliases"])}
+            outcome_ok = True
+            for window in unit_windows(units, work["registry"], work["aliases"]):
+                discoveries, _ = discover_batch(project, start, paths, window, source_text, work, ambiguous, None, ask)
+                apply_discoveries(work["registry"], work["aliases"], discoveries)
+        except DataIssue:
+            outcome_ok = False
+        key = (row["stage"], row["item_sha256"], row["code"], row.get("dedup_scope", ""), row.get("dedup_hash", ""))
+        if outcome_ok and key not in RecoveryLedger.presented:
+            progress["registry"], progress["aliases"] = (work["registry"], work["aliases"])
+            recovery.resolve(row, "replayed_exact_scope_clean", {"attempt": len(attempts) + 1})
+            coverage.setdefault("resolved_pending", []).append(
+                {"item": row["item"], "code": row["code"], "source_hash": hashes}
+            )
+            summary["resolved"] += 1
+        else:
+            summary["open"] += 1
+    return summary
+
+
+# ##################################################################
+# commit batch
+# atomically advances registry, semantic ledger and (for production batches) the structural cursor for one recovered unit.
+def commit_batch(project: Path, progress: dict, coverage: dict, unit: dict, revalidation: bool) -> None:
+    batch, start = unit["batch"], unit["start"]
+    if unit["quarantine"] is None:
+        progress["registry"], progress["aliases"] = unit["registry"], unit["aliases"]
+    record_semantic_batch(
+        project,
+        start,
+        batch,
+        unit["units"],
+        unit["classifications"],
+        coverage,
+        revalidation,
+        unit["quarantine"] is not None,
+    )
+    if revalidation:
+        return
+    progress["next_chapter"] = start + len(batch)
+    progress["completed_batches"].append(
+        {
+            "start": start,
+            "end": start + len(batch),
+            "chapter_sha256": {path.name: file_digest(path) for path in batch},
+            **({"quarantined": True} if unit["quarantine"] is not None else {}),
+        }
+    )
+
+
+# ##################################################################
+# quarantined chapter names
+def quarantined_chapter_names(progress: dict) -> list[str]:
+    return sorted(
+        {
+            name
+            for batch in semantic_coverage(progress)["completed_batches"]
+            if batch.get("quarantined")
+            for name in batch["chapter_sha256"]
+        }
+    )
 
 
 # ##################################################################
 # prepare cast
 # resumes each bounded native-Ollama batch from durable progress and atomically publishes a freeze only after all chapters and assets validate.
-def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | None = None) -> dict:
+def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | None = None, ask=None) -> dict:
     source = source.resolve()
     if not source.is_file():
-        raise ValueError(f"input source is not a file: {source}")
-    if LLM_STYLE != "ollama" and not verify_only:
-        raise RuntimeError("prepare-cast requires schema-constrained native Ollama configured in local/config.toml")
+        raise OperationalError("source_missing", f"input source is not a file: {source}")
+    if LLM_STYLE != "ollama" and not verify_only and ask is None:
+        raise OperationalError(
+            "cast_integrity", "prepare-cast requires schema-constrained native Ollama configured in local/config.toml"
+        )
     project = get_output_dir(source)
     title, author, chapters = source_chapters(source, project)
     del title, author
@@ -1960,16 +4015,16 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
             "manifest": str(project / MANIFEST_NAME),
         }
     if verify_only:
-        raise RuntimeError("no frozen cast manifest exists")
+        raise OperationalError("cast_integrity", "no frozen cast manifest exists")
     source_sha = source_fingerprint(source)
     source_text = source.read_text(encoding="utf-8")
     progress_path = project / PROGRESS_NAME
     if progress_path.exists():
         progress = load_object(progress_path, "cast preparation progress")
         if progress.get("source_sha256") != source_sha or progress.get("chapter_count") != len(chapters):
-            raise RuntimeError("cast preparation progress belongs to a different source")
+            raise OperationalError("cast_integrity", "cast preparation progress belongs to a different source")
         if progress.get("version") not in {1, 2, 3}:
-            raise RuntimeError("cast preparation progress has an unsupported version")
+            raise OperationalError("cast_integrity", "cast preparation progress has an unsupported version")
         if progress.get("version") in {1, 2}:
             # Version 3 adds a separate semantic ledger beginning at source chapter zero; structural cursor and cached media remain unchanged.
             progress["version"] = 3
@@ -1988,7 +4043,7 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
             for actor_id, info in base.items()
         }
         if not ANCHOR_IDS <= set(registry):
-            raise RuntimeError("existing project is missing original Part 1 canonical anchors")
+            raise OperationalError("cast_integrity", "existing project is missing original Part 1 canonical anchors")
         progress = {
             "version": 3,
             "source_sha256": source_sha,
@@ -2006,51 +4061,55 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
     atomic_json(progress_path, progress)
     batches = 0
     coverage = semantic_coverage(progress)
+    recovery = RecoveryLedger(project)
     # Historical 0..cursor batches had structural hashes only. Reclassify that prefix under the semantic ledger before touching the next production batch.
+    # A data problem quarantines only the offending chapter (semantic ledger only; the structural cursor never moves backwards).
     while int(coverage["next_chapter"]) < int(progress["next_chapter"]):
         start = int(coverage["next_chapter"])
         prefix = chapters[: int(progress["next_chapter"])]
-        batch, _ = context_safe_batch(prefix, start, progress["registry"], progress["aliases"])
-        units = immutable_evidence_units(batch)
-        discoveries, classifications = discover_batch(project, start, batch, units, source_text, progress, ambiguous)
-        apply_discoveries(progress["registry"], progress["aliases"], discoveries)
-        record_semantic_batch(project, start, batch, units, classifications, coverage, True)
-        atomic_json(progress_path, progress)
+        for unit in recoverable_batches(project, prefix, start, progress, ambiguous, source_text, recovery, ask, None):
+            commit_batch(project, progress, coverage, unit, True)
+            atomic_json(progress_path, progress)
     while int(progress["next_chapter"]) < len(chapters):
         # Audit records may be appended while this resumable preparation is paused; refresh is idempotent and leaves cursor and media untouched.
         inactive, ambiguous = refresh_alias_audit(project, source_text, progress)
         atomic_json(progress_path, progress)
         start = int(progress["next_chapter"])
-        batch, prompt = context_safe_batch(chapters, start, progress["registry"], progress["aliases"])
-        batch_units = immutable_evidence_units(batch)
-        discoveries, classifications = discover_batch(project, start, batch, batch_units, source_text, progress, ambiguous, prompt)
-        apply_discoveries(progress["registry"], progress["aliases"], discoveries)
-        record_semantic_batch(project, start, batch, batch_units, classifications, coverage, False)
-        progress["next_chapter"] = start + len(batch)
-        progress["completed_batches"].append(
-            {
-                "start": start,
-                "end": start + len(batch),
-                "chapter_sha256": {path.name: file_digest(path) for path in batch},
-            }
-        )
-        atomic_json(progress_path, progress)
-        batches += 1
+        for unit in recoverable_batches(
+            project, chapters, start, progress, ambiguous, source_text, recovery, ask, start
+        ):
+            commit_batch(project, progress, coverage, unit, False)
+            atomic_json(progress_path, progress)
+            batches += 1
         if max_batches is not None and batches >= max_batches:
             return {
                 "status": "preparing",
                 "chapters": len(chapters),
                 "next_chapter": progress["next_chapter"],
                 "actors": len(progress["registry"]),
+                "warnings": len(recovery.entries()),
             }
+    replay_pending(project, chapters, progress, ambiguous, source_text, recovery, ask)
+    atomic_json(progress_path, progress)
+    blocked = quarantined_chapter_names(progress)
+    pending_rows = recovery.open_pending("cast")
+    if blocked or pending_rows:
+        # Publication refuses (typed status, no manifest) only after every scan artifact and cursor is durable.
+        return {
+            "status": "blocked",
+            "chapters": len(chapters),
+            "pending": len(blocked) + len(pending_rows),
+            "quarantined_chapters": blocked,
+            "warnings": len(recovery.entries()),
+        }
     if int(semantic_coverage(progress)["next_chapter"]) != len(chapters):
-        raise RuntimeError("cannot freeze cast before full semantic coverage attestation")
+        raise OperationalError("cast_integrity", "cannot freeze cast before full semantic coverage attestation")
     # Reapply the audited transitive map against retained legacy profiles before
     # publication; no inactive identifier can escape into the approved registry.
     legacy_registry = {**load_object(project / "characters.json", "characters profile"), **progress["registry"]}
     final_inactive, final_ambiguous = apply_alias_audit(project, source_text, legacy_registry, progress["aliases"])
     if final_ambiguous != ambiguous:
-        raise RuntimeError("alias audit ambiguity changed during cast preparation")
+        raise OperationalError("cast_integrity", "alias audit ambiguity changed during cast preparation")
     inactive.update(final_inactive)
     active = {actor_id for actor_id in progress["registry"] if actor_id not in inactive}
     characters = materialize_profiles(project, {actor_id: progress["registry"][actor_id] for actor_id in active})
@@ -2074,6 +4133,7 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
         "inactive_legacy_ids": sorted(inactive),
         "asset_hashes": asset_hashes(project, set(actors)),
         "scoped_audit": scoped_audit_attestation(load_scoped_audit(project)),
+        "quarantined_chapters": quarantined_chapter_names(progress),
     }
     atomic_json(project / MANIFEST_NAME, manifest)
     verify_frozen_cast(source, project)
@@ -2082,4 +4142,6 @@ def prepare_cast(source: Path, verify_only: bool = False, max_batches: int | Non
         "chapters": len(chapters),
         "actors": len(actors),
         "manifest": str(project / MANIFEST_NAME),
+        "warnings": len(recovery.entries()),
+        "quarantined_chapters": manifest["quarantined_chapters"],
     }

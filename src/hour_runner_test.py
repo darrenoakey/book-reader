@@ -134,7 +134,10 @@ def test_prepare_frozen_hour_excludes_inactive_legacy_metadata() -> None:
         for name, value in (
             ("characters.json", {"tiger_boy": {"name": "Tiger Boy"}, "gene": {"name": "Gene"}}),
             ("voices.json", {"tiger_boy": {"description": "canonical"}, "gene": {"description": "legacy"}}),
-            ("breeze_voices.json", {"tiger_boy": {"ref_wav": "voices/tiger_boy.wav"}, "gene": {"ref_wav": "voices/gene.wav"}}),
+            (
+                "breeze_voices.json",
+                {"tiger_boy": {"ref_wav": "voices/tiger_boy.wav"}, "gene": {"ref_wav": "voices/gene.wav"}},
+            ),
             ("appearances.json", {"tiger_boy": "canonical appearance", "gene": "legacy appearance"}),
         ):
             (project / name).write_text(json.dumps(value), encoding="utf-8")
@@ -242,3 +245,52 @@ def test_synthesis_window_respects_remaining_duration() -> None:
         assert count == 1
         assert len(selected) == 1
         assert selected[0]["duration"] <= HOUR_MAX_SECONDS
+
+
+# ##################################################################
+# test native fault then next valid chapter persists across restart
+# a real corrupt canonical script quarantines only its chapter; the next real valid chapter is accepted, and a fresh ledger/process view still holds the fault and the cursor.
+def test_native_fault_then_next_valid_chapter_persists_across_restart() -> None:
+    from src.data_recovery import DataIssue, RecoveryLedger, is_data_error
+
+    with tempfile.TemporaryDirectory() as directory:
+        project = Path(directory)
+        chapters = project / "chapters"
+        cache = project / "script_cache"
+        chapters.mkdir()
+        cache.mkdir()
+        texts = {"01-bad.txt": "Gene said hello.", "02-good.txt": "Gene waved."}
+        for name, text in texts.items():
+            (chapters / name).write_text(text, encoding="utf-8")
+        for name, body in (("01-bad.jsonl", "not json at all\n"), ("02-good.jsonl", '{"gene": "Gene waved."}\n')):
+            payload = body.encode()
+            (cache / name).write_bytes(payload)
+            source = texts[name.replace(".jsonl", ".txt")]
+            (cache / f"{name}.hour.meta.json").write_text(
+                json.dumps(
+                    {
+                        "mode": "immutable-spans",
+                        "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+        cast = {"gene": {"name": "Gene"}, "narrator": {"name": "Narrator"}}
+        recovery = RecoveryLedger(project)
+        accepted: list[str] = []
+        cursor = 0
+        for index, name in enumerate(sorted(texts)):
+            try:
+                script_for_chapter(project, project / "hours/hour-003", chapters / name, cast, {})
+                accepted.append(name)
+            except DataIssue as error:
+                assert is_data_error(error)
+                checkpoint = {"next_chapter": index + 1, "next_piece": 0}
+                recovery.record_error("hour", name, error, checkpoint=checkpoint)
+            cursor = index + 1
+        assert accepted == ["02-good.txt"] and cursor == 2
+        restarted = RecoveryLedger(project).entries()
+        assert [row["item"] for row in restarted] == ["01-bad.txt"]
+        assert restarted[0]["code"] == "canonical_script_invalid"
+        assert restarted[0]["checkpoint"] == {"next_chapter": 1, "next_piece": 0}

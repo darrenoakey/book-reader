@@ -1,4 +1,5 @@
 """Immutable source-span classifier for hourly productions."""
+
 from __future__ import annotations
 
 import asyncio
@@ -44,7 +45,12 @@ def assignment_objects(response: str) -> list[object]:
 def parse_assignments(response: str, start: int, count: int, speakers: set[str]) -> dict[int, str]:
     seen: dict[int, str] = {}
     for item in assignment_objects(response):
-        if not isinstance(item, dict) or set(item) != {"index", "speaker_id"} or not isinstance(item["index"], int) or not isinstance(item["speaker_id"], str):
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"index", "speaker_id"}
+            or not isinstance(item["index"], int)
+            or not isinstance(item["speaker_id"], str)
+        ):
             raise ValueError("classifier output must contain only index and speaker_id")
         index, speaker = item["index"], item["speaker_id"]
         if index in seen or index < start or index >= start + count or speaker not in speakers:
@@ -69,7 +75,11 @@ def speaker_array_schema(speaker_ids: list[str], count: int) -> dict:
 # bind each source-span position to exactly one schema-constrained speaker and reject malformed output without fallback.
 def parse_speakers(response: str, count: int, speakers: set[str]) -> list[str]:
     values = json.loads(response)
-    if not isinstance(values, list) or len(values) != count or any(not isinstance(value, str) or value not in speakers for value in values):
+    if (
+        not isinstance(values, list)
+        or len(values) != count
+        or any(not isinstance(value, str) or value not in speakers for value in values)
+    ):
         raise ValueError("classifier schema response must be an exact list of valid speaker IDs")
     return values
 
@@ -77,7 +87,9 @@ def parse_speakers(response: str, count: int, speakers: set[str]) -> list[str]:
 # ##################################################################
 # scoped reference notes
 # turns exact validated mention references into per-span prompt notes keyed by this chapter's content hash and each span's hash and offset; a reference never applies to any other mention of the same name.
-def scoped_reference_notes(text: str, spans: list[str], speakers: set[str], references: list[dict] | None) -> dict[int, list[str]]:
+def scoped_reference_notes(
+    text: str, spans: list[str], speakers: set[str], references: list[dict] | None
+) -> dict[int, list[str]]:
     chapter_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     by_span: dict[str, list[dict]] = {}
     for reference in references or []:
@@ -85,24 +97,35 @@ def scoped_reference_notes(text: str, spans: list[str], speakers: set[str], refe
             by_span.setdefault(reference["quote_sha256"], []).append(reference)
     notes: dict[int, list[str]] = {}
     for index, span in enumerate(spans):
-        for reference in sorted(by_span.get(hashlib.sha256(span.encode("utf-8")).hexdigest(), []), key=lambda r: r["span_start"]):
+        for reference in sorted(
+            by_span.get(hashlib.sha256(span.encode("utf-8")).hexdigest(), []), key=lambda r: r["span_start"]
+        ):
             label, start = reference["label"], reference["span_start"]
             if span[start : start + len(label)] != label:
                 raise ValueError("scoped reference does not match its source span")
             if reference["canonical"] not in speakers:
-                raise ValueError(f"scoped reference targets a speaker outside the valid speakers: {reference['canonical']}")
-            notes.setdefault(index, []).append(f"span {index}: the mention {label!r} at character offset {start} is the character {reference['canonical']}")
+                raise ValueError(
+                    f"scoped reference targets a speaker outside the valid speakers: {reference['canonical']}"
+                )
+            notes.setdefault(index, []).append(
+                f"span {index}: the mention {label!r} at character offset {start} is the character {reference['canonical']}"
+            )
     return notes
 
 
 def classification_prompt(speaker_ids: list[str], alias_notes: str, scoped_notes: list[str], indexed: str) -> str:
     return f"""Classify each immutable source span to exactly one audiobook speaker.
-Valid speakers: {', '.join(speaker_ids)}. Approved aliases that must use their canonical speaker ID: {alias_notes or '(none)'}. Mention-scoped identity references (each applies ONLY to that exact mention in that exact span, never to the same name anywhere else): {'; '.join(scoped_notes) or '(none)'}. Return only the JSON array specified by the response schema: one speaker ID per listed span, in exactly the listed order. narrator for narration and third-person prose. Direct speech may be quoted OR clearly attributed without quotes (for example, 'Klein said Look at it'); assign that speech to its named speaker when unambiguous. Never rewrite, copy, omit, or add text: the program constructs text locally from the immutable spans.
+Valid speakers: {", ".join(speaker_ids)}. Approved aliases that must use their canonical speaker ID: {alias_notes or "(none)"}. Mention-scoped identity references (each applies ONLY to that exact mention in that exact span, never to the same name anywhere else): {"; ".join(scoped_notes) or "(none)"}. Return only the JSON array specified by the response schema: one speaker ID per listed span, in exactly the listed order. narrator for narration and third-person prose. Direct speech may be quoted OR clearly attributed without quotes (for example, 'Klein said Look at it'); assign that speech to its named speaker when unambiguous. Never rewrite, copy, omit, or add text: the program constructs text locally from the immutable spans.
 
 SPANS:\n{indexed}"""
 
 
-async def classify_spans(text: str, speaker_ids: list[str], approved_aliases: dict[str, str] | None = None, scoped_references: list[dict] | None = None) -> list[dict]:
+async def classify_spans(
+    text: str,
+    speaker_ids: list[str],
+    approved_aliases: dict[str, str] | None = None,
+    scoped_references: list[dict] | None = None,
+) -> list[dict]:
     spans = immutable_spans(text)
     speakers = set(speaker_ids)
     if "narrator" not in speakers:
@@ -111,13 +134,19 @@ async def classify_spans(text: str, speaker_ids: list[str], approved_aliases: di
     assigned: dict[int, str] = {}
     for start in range(0, len(spans), BATCH_SIZE):
         batch = spans[start : start + BATCH_SIZE]
-        indexed = "\n".join(f"{start+i}: {span}" for i, span in enumerate(batch))
-        alias_notes = ", ".join(f"{alias}->{canonical}" for alias, canonical in sorted((approved_aliases or {}).items()) if alias != canonical)
+        indexed = "\n".join(f"{start + i}: {span}" for i, span in enumerate(batch))
+        alias_notes = ", ".join(
+            f"{alias}->{canonical}"
+            for alias, canonical in sorted((approved_aliases or {}).items())
+            if alias != canonical
+        )
         batch_notes = [note for index in range(start, start + len(batch)) for note in scoped_notes.get(index, [])]
         prompt = classification_prompt(speaker_ids, alias_notes, batch_notes, indexed)
         response = await ask(prompt, response_schema=speaker_array_schema(speaker_ids, len(batch)))
         try:
-            assigned.update({start + index: speaker for index, speaker in enumerate(parse_speakers(response, len(batch), speakers))})
+            assigned.update(
+                {start + index: speaker for index, speaker in enumerate(parse_speakers(response, len(batch), speakers))}
+            )
         except (ValueError, json.JSONDecodeError) as error:
             raise ValueError(f"schema classifier failed batch {start}: {error}; response={response[:500]!r}") from error
     return [{assigned[index]: span} for index, span in enumerate(spans)]

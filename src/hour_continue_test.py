@@ -67,7 +67,12 @@ def write_project(root: Path, eof: bool) -> tuple[Path, Path]:
         "source": str(source),
         "sha256": source_fingerprint(source),
         "hours": {
-            "1": {"complete": True, "movie": "hours/hour-001/movie.mp4", "next_chapter": cursor[0], "next_piece": cursor[1]},
+            "1": {
+                "complete": True,
+                "movie": "hours/hour-001/movie.mp4",
+                "next_chapter": cursor[0],
+                "next_piece": cursor[1],
+            },
         },
     }
     (project / "hours.json").write_text(json.dumps(ledger), encoding="utf-8")
@@ -114,11 +119,15 @@ def test_clear_blocker_requires_latched_failure() -> None:
         source, project = write_project(Path(directory), eof=False)
         try:
             continuation_status(source, create_target=True)
-            (project / PROGRESS_NAME).write_text(json.dumps({"status": "failed", "error": "schema rejected"}), encoding="utf-8")
+            (project / PROGRESS_NAME).write_text(
+                json.dumps({"status": "failed", "error": "schema rejected"}), encoding="utf-8"
+            )
             cleared = clear_continuation_blocker(source)
             assert cleared["status"] == "ready"
             assert cleared["cleared_failure"] == "schema rejected"
-            assert "continuation_failure_cleared" in (project / "hour_continuation_events.jsonl").read_text(encoding="utf-8")
+            assert "continuation_failure_cleared" in (project / "hour_continuation_events.jsonl").read_text(
+                encoding="utf-8"
+            )
         finally:
             shutil.rmtree(project, ignore_errors=True)
 
@@ -172,7 +181,12 @@ def test_externally_completed_final_hour_is_audited_before_eof() -> None:
         def finish_externally() -> None:
             time.sleep(0.5)
             ledger = json.loads((project / "hours.json").read_text(encoding="utf-8"))
-            ledger["hours"]["2"] = {"complete": True, "movie": "hours/hour-002/missing.mp4", "next_chapter": 2, "next_piece": 0}
+            ledger["hours"]["2"] = {
+                "complete": True,
+                "movie": "hours/hour-002/missing.mp4",
+                "next_chapter": 2,
+                "next_piece": 0,
+            }
             (project / "hours.json").write_text(json.dumps(ledger), encoding="utf-8")
 
         worker = threading.Thread(target=finish_externally)

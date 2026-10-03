@@ -98,9 +98,9 @@ def window_lines(lines: list[dict], target_seconds: float = TARGET_SECONDS) -> l
         mid = (s[0]["start"] + s[-1]["end"]) / 2
         line = min(
             s,
-            key=lambda l: min(abs(mid - l["start"]), abs(mid - l["end"]))
-            if not (l["start"] <= mid <= l["end"])
-            else 0.0,
+            key=lambda l: (
+                min(abs(mid - l["start"]), abs(mid - l["end"])) if not (l["start"] <= mid <= l["end"]) else 0.0
+            ),
         )
         return line["text"]
 

@@ -173,6 +173,4 @@ def test_validation_rejects_bad_speakers_and_short_coverage() -> None:
     validate_chunk([{"narrator": chunk}], chunk, ["narrator"])
     with pytest.raises(ScriptGenerationError):
         validate_script_lines([{"narrator": "Title"}], chunk, ["narrator"])
-    validate_script_lines(
-        [{"narrator": "Title"}, {"narrator": chunk}], chunk, ["narrator"]
-    )
+    validate_script_lines([{"narrator": "Title"}, {"narrator": chunk}], chunk, ["narrator"])

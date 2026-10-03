@@ -104,7 +104,10 @@ def write_frozen_project(root: Path) -> tuple[Path, Path]:
 # test exhaustive candidate schema
 # constrains native output to one classification for every locally-derived lexical candidate.
 def test_discovery_schema_requires_exact_complete_candidate_classification() -> None:
-    candidates = [{"id": "p0000", "label": "Han", "ref_ids": ["c00s00000n000"]}, {"id": "p0001", "label": "The", "ref_ids": ["c00s00001n000"]}]
+    candidates = [
+        {"id": "p0000", "label": "Han", "ref_ids": ["c00s00000n000"]},
+        {"id": "p0001", "label": "The", "ref_ids": ["c00s00001n000"]},
+    ]
     schema = discovery_schema(["ren"], candidates)["properties"]["classifications"]
     assert schema["minItems"] == schema["maxItems"] == 2
     branches = schema["items"]["oneOf"]
@@ -123,12 +126,24 @@ def test_classifications_materialize_exact_labels_and_reject_omissions() -> None
         chapter.write_text("Foam Xiao waved. Aster Blackwood spoke. The beasts ran.", encoding="utf-8")
         units = immutable_evidence_units([chapter])
         candidates = candidate_coverage_ledger(units, {}, {})
-        response = {"classifications": [
-            {"candidate_id": candidate["id"], "status": "new", "identity": candidate["id"], "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]}
-            if candidate["label"] in {"Foam Xiao", "Aster Blackwood"}
-            else {"candidate_id": candidate["id"], "status": "non_character", "identity": "none", "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]}
-            for candidate in candidates
-        ]}
+        response = {
+            "classifications": [
+                {
+                    "candidate_id": candidate["id"],
+                    "status": "new",
+                    "identity": candidate["id"],
+                    "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]],
+                }
+                if candidate["label"] in {"Foam Xiao", "Aster Blackwood"}
+                else {
+                    "candidate_id": candidate["id"],
+                    "status": "non_character",
+                    "identity": "none",
+                    "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]],
+                }
+                for candidate in candidates
+            ]
+        }
         discoveries, classifications = materialize_classifications(response, units, candidates, {}, {})
         assert {entry["id"] for entry in discoveries} == {"foam_xiao", "aster_blackwood"}
         assert len(classifications) == len(candidates)
@@ -189,8 +204,9 @@ def test_context_safe_batch_reduces_without_source_truncation() -> None:
         assert [path.name for path in batch] == ["01-part.txt", "02-part.txt"]
         assert len(prompt) <= 53_536
         chapters[0].write_text("X " * 30_000, encoding="utf-8")
-        with pytest.raises(RuntimeError, match="refusing to truncate or skip"):
-            context_safe_batch(chapters, 0, {"narrator": {"name": "Narrator"}}, {})
+        # an oversized lone chapter is returned whole (never truncated) for immutable-unit windowing
+        oversized, no_prompt = context_safe_batch(chapters, 0, {"narrator": {"name": "Narrator"}}, {})
+        assert oversized == [chapters[0]] and no_prompt == ""
 
 
 # ##################################################################
@@ -253,6 +269,7 @@ def test_source_label_requires_whole_word_boundary() -> None:
     assert not source_label_present("Xia", units)
     assert source_label_present("Xiao", [{"id": "x", "chapter": "a", "quote": "Hi, Xiao."}])
 
+
 # ##################################################################
 # test additive audit refresh
 # applies newly appended verified aliases at cursor 60 without moving progress or rewriting media, and remains identical on a second refresh.
@@ -269,7 +286,8 @@ def test_audit_refresh_is_additive_idempotent_and_preserves_cursor(tmp_path: Pat
         encoding="utf-8",
     )
     (tmp_path / "characters.json").write_text(
-        json.dumps({"k_goldest": {"name": "K Goldest"}, "kai": {"name": "Kai"}, "lizard_boy": {"name": "Lizard Boy"}}), encoding="utf-8"
+        json.dumps({"k_goldest": {"name": "K Goldest"}, "kai": {"name": "Kai"}, "lizard_boy": {"name": "Lizard Boy"}}),
+        encoding="utf-8",
     )
     progress = {
         "next_chapter": 60,
@@ -292,6 +310,7 @@ def test_audit_refresh_is_additive_idempotent_and_preserves_cursor(tmp_path: Pat
     refresh_alias_audit(tmp_path, source_text, progress)
     assert progress == before
 
+
 # ##################################################################
 # test semantic prefix migration
 # installs a separate semantic ledger at zero while retaining an existing structural cursor until each historical chapter is reclassified.
@@ -305,7 +324,16 @@ def test_semantic_coverage_migration_requires_prefix_revalidation() -> None:
             chapter = root / f"{index + 1:02d}.txt"
             chapter.write_text(f"Han {index}.", encoding="utf-8")
             chapters.append(chapter)
-        progress = {"next_chapter": 2, "completed_batches": [{"start": 0, "end": 2, "chapter_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in chapters}}]}
+        progress = {
+            "next_chapter": 2,
+            "completed_batches": [
+                {
+                    "start": 0,
+                    "end": 2,
+                    "chapter_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in chapters},
+                }
+            ],
+        }
         coverage = semantic_coverage(progress)
         assert coverage["next_chapter"] == 0
         validate_semantic_coverage(progress, chapters)
@@ -313,16 +341,21 @@ def test_semantic_coverage_migration_requires_prefix_revalidation() -> None:
         with pytest.raises(RuntimeError, match="cursor does not match"):
             validate_semantic_coverage(progress, chapters)
 
+
 # ##################################################################
 # test bounded candidate chunks
 # retains every candidate exactly once while limiting a native schema response to a bounded cardinality.
 def test_classification_chunks_cover_ledger_without_overlap() -> None:
     from src.cast_freeze import CLASSIFICATION_CHUNK_SIZE, classification_chunks
 
-    candidates = [{"id": f"p{index:04d}", "label": f"Name{index}", "ref_ids": [f"c00s{index:05d}n000"]} for index in range(CLASSIFICATION_CHUNK_SIZE * 2 + 1)]
+    candidates = [
+        {"id": f"p{index:04d}", "label": f"Name{index}", "ref_ids": [f"c00s{index:05d}n000"]}
+        for index in range(CLASSIFICATION_CHUNK_SIZE * 2 + 1)
+    ]
     chunks = classification_chunks(candidates)
     assert [len(chunk) for chunk in chunks] == [CLASSIFICATION_CHUNK_SIZE, CLASSIFICATION_CHUNK_SIZE, 1]
     assert [candidate["id"] for chunk in chunks for candidate in chunk] == [candidate["id"] for candidate in candidates]
+
 
 # ##################################################################
 # test unresolved and alias evidence fail closed
@@ -337,11 +370,17 @@ def test_classification_blocks_ambiguity_and_requires_distinct_alias_witnesses()
         june, jun = by_label["June"], by_label["Jun"]
         records = []
         for candidate in candidates:
-            status, identity = ("new", june["id"]) if candidate == june else (("known", june["id"]) if candidate == jun else ("non_character", "none"))
+            status, identity = (
+                ("new", june["id"])
+                if candidate == june
+                else (("known", june["id"]) if candidate == jun else ("non_character", "none"))
+            )
             evidence = [candidate["ref_ids"][0].rsplit("n", 1)[0]]
             if candidate == jun:
                 evidence.append(june["ref_ids"][0].rsplit("n", 1)[0])
-            records.append({"candidate_id": candidate["id"], "status": status, "identity": identity, "evidence_unit_ids": evidence})
+            records.append(
+                {"candidate_id": candidate["id"], "status": status, "identity": identity, "evidence_unit_ids": evidence}
+            )
         discoveries, _ = materialize_classifications({"classifications": records}, units, candidates, {}, {})
         june_discovery = next(item for item in discoveries if item["id"] == "june")
         assert "Jun" in june_discovery["aliases"]
@@ -349,6 +388,7 @@ def test_classification_blocks_ambiguity_and_requires_distinct_alias_witnesses()
         records[0]["status"], records[0]["identity"] = "ambiguous", "none"
         with pytest.raises(RuntimeError, match="remains unresolved"):
             materialize_classifications({"classifications": records}, units, candidates, {}, {})
+
 
 # ##################################################################
 # test discourse prefixes never form aliases
@@ -361,6 +401,7 @@ def test_discourse_prefix_does_not_form_prose_name_compound() -> None:
     assert "As Ren" not in labels
     assert {"Ren", "Aster Blackwood"} <= labels
 
+
 # ##################################################################
 # test grammar labels excluded before semantic ledger
 # treats capitalized pronouns and indefinite grammar words as non-entity lexical material while retaining real names for explicit classification.
@@ -372,6 +413,7 @@ def test_pronoun_only_words_are_not_name_candidates() -> None:
     assert not labels.intersection({"Someone", "He"})
     assert {"Ren", "Sora"} <= labels
 
+
 # ##################################################################
 # test suffix-only fragments excluded
 # removes a surname/title fragment occurring only inside a longer capitalized label, while preserving a first-name candidate with source evidence.
@@ -381,6 +423,7 @@ def test_suffix_only_capitalized_fragment_is_not_a_candidate() -> None:
     assert "Crest" not in labels
     assert "Ron" in labels
 
+
 # ##################################################################
 # test house labels cannot take actor identity
 # rejects a clan or house phrase mapped to a person even when the actor's name shares one lexical component.
@@ -388,26 +431,57 @@ def test_house_label_cannot_be_known_actor_alias() -> None:
     units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "The Gold Crest airship carried Klein Goldest."}]
     candidates = candidate_coverage_ledger(units, {"k_goldest": {"name": "Klein Goldest"}}, {})
     gold_crest = next(candidate for candidate in candidates if candidate["label"] == "Gold Crest")
-    response = {"classifications": [{"candidate_id": candidate["id"], "status": "known", "identity": "k_goldest", "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]} if candidate == gold_crest else {"candidate_id": candidate["id"], "status": "non_character", "identity": "none", "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]} for candidate in candidates]}
+    response = {
+        "classifications": [
+            {
+                "candidate_id": candidate["id"],
+                "status": "known",
+                "identity": "k_goldest",
+                "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]],
+            }
+            if candidate == gold_crest
+            else {
+                "candidate_id": candidate["id"],
+                "status": "non_character",
+                "identity": "none",
+                "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]],
+            }
+            for candidate in candidates
+        ]
+    }
     with pytest.raises(ValueError, match="unapproved alias"):
         materialize_classifications(response, units, candidates, {"k_goldest": {"name": "Klein Goldest"}}, {})
+
 
 # ##################################################################
 # test full names lead candidate ownership
 # orders source-qualified full names before their components so new actor IDs remain Foam Xiao and Aster Blackwood rather than shortened fragments.
 def test_full_name_candidates_precede_short_components() -> None:
-    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Foam Xiao and Aster Blackwood arrived. Foam and Aster followed."}]
+    units = [
+        {
+            "id": "c00s00000",
+            "chapter": "01.txt",
+            "quote": "Foam Xiao and Aster Blackwood arrived. Foam and Aster followed.",
+        }
+    ]
     labels = [candidate["label"] for candidate in candidate_coverage_ledger(units, {}, {})]
     assert labels.index("Foam Xiao") < labels.index("Foam")
     assert labels.index("Aster Blackwood") < labels.index("Aster")
+
 
 # ##################################################################
 # test approved full names carry fixed owner
 # labels already audited to an established actor are visibly fixed in the native ledger rather than left eligible for a spurious new identity.
 def test_candidate_ledger_marks_approved_full_name_owner() -> None:
     units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Klein Goldest confronted Ren."}]
-    candidates = candidate_coverage_ledger(units, {"k_goldest": {"name": "Klein Goldest"}}, {"klein_goldest": "k_goldest"})
-    assert next(candidate for candidate in candidates if candidate["label"] == "Klein Goldest")["known_owner"] == "k_goldest"
+    candidates = candidate_coverage_ledger(
+        units, {"k_goldest": {"name": "Klein Goldest"}}, {"klein_goldest": "k_goldest"}
+    )
+    assert (
+        next(candidate for candidate in candidates if candidate["label"] == "Klein Goldest")["known_owner"]
+        == "k_goldest"
+    )
+
 
 # ##################################################################
 # test conjunction never forms a person compound
@@ -420,25 +494,40 @@ def test_conjunction_does_not_form_person_compound() -> None:
     assert "But Cass" not in labels
     assert {"Cass", "Ren"} <= labels
 
+
 # ##################################################################
 # test function-word compound eligibility
 # prevents every grammatical determiner, conjunction, or preposition from becoming a multiword person label while retaining its following role or name token.
 def test_function_word_prefixes_never_form_multiword_candidates() -> None:
     from src.cast_freeze import immutable_name_references
 
-    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "The Ceremony Master greeted Ren. In Luna Starwaver's hall, Cass waited."}]
+    units = [
+        {
+            "id": "c00s00000",
+            "chapter": "01.txt",
+            "quote": "The Ceremony Master greeted Ren. In Luna Starwaver's hall, Cass waited.",
+        }
+    ]
     labels = {reference["label"] for reference in immutable_name_references(units).values()}
     assert not {"The Ceremony Master", "In Luna", "In Luna Starwaver"}.intersection(labels)
     assert {"Ceremony Master", "Luna Starwaver", "Cass"} <= labels
+
 
 # ##################################################################
 # test lowercase lexical usage is not a standalone name
 # excludes a sentence-initial ordinary word when the exact lower-case lexical form appears in source, while preserving a name component of a full label.
 def test_lowercase_lexical_usage_excludes_single_word_candidate() -> None:
-    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Keep walking. Please keep walking. Foam Xiao arrived. Foam stayed."}]
+    units = [
+        {
+            "id": "c00s00000",
+            "chapter": "01.txt",
+            "quote": "Keep walking. Please keep walking. Foam Xiao arrived. Foam stayed.",
+        }
+    ]
     labels = {candidate["label"] for candidate in candidate_coverage_ledger(units, {}, {})}
     assert "Keep" not in labels
     assert {"Foam Xiao", "Foam"} <= labels
+
 
 # ##################################################################
 # test historical prefix semantic migration accepts chapter sixty introductions
@@ -450,7 +539,12 @@ def test_historical_semantic_migration_keeps_chapter_sixty_new_candidates_eligib
     assert project.is_dir(), "mandatory real weakest-beast-tamer project fixture is unavailable"
     from src.hour_runner import source_chapters
 
-    progress = json.loads((project / "cast_preparation_progress.json").read_text(encoding="utf-8"))
+    # Immutable pre-batch-61/62 snapshot: the live cursor keeps advancing, so the historical phase is read from the frozen QA backup.
+    snapshot = json.loads((project / "qa-new-identity-before-correction.json").read_text(encoding="utf-8"))
+    progress = snapshot["progress"]
+    assert progress["version"] == 3 and progress["next_chapter"] == 60
+    assert progress["source_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert len(snapshot["alias_audit"]) == 25, "historical alias audit snapshot changed"
     _, _, chapters = source_chapters(source, project)
     batch, _ = context_safe_batch(chapters, 59, progress["registry"], progress["aliases"])
     candidates = candidate_coverage_ledger(immutable_evidence_units(batch), progress["registry"], progress["aliases"])
@@ -459,8 +553,13 @@ def test_historical_semantic_migration_keeps_chapter_sixty_new_candidates_eligib
     assert not {"han", "sora", "june"}.intersection(progress["registry"])
     schema = discovery_schema(list(progress["registry"]), candidates, allow_new=True)
     han_id = next(candidate["id"] for candidate in candidates if candidate["label"] == "Han")
-    han = next(branch for branch in schema["properties"]["classifications"]["items"]["oneOf"] if "oneOf" in branch and branch["oneOf"][0]["properties"]["candidate_id"]["enum"] == [han_id])
+    han = next(
+        branch
+        for branch in schema["properties"]["classifications"]["items"]["oneOf"]
+        if "oneOf" in branch and branch["oneOf"][0]["properties"]["candidate_id"]["enum"] == [han_id]
+    )
     assert han["oneOf"][0]["properties"]["status"]["enum"] == ["new"]
+
 
 # ##################################################################
 # test full-name component link is local source proof
@@ -470,9 +569,36 @@ def test_full_name_component_alias_uses_local_full_span_proof() -> None:
     candidates = candidate_coverage_ledger(units, {}, {})
     full = next(candidate for candidate in candidates if candidate["label"] == "Aster Blackwood")
     short = next(candidate for candidate in candidates if candidate["label"] == "Aster")
-    response = {"classifications": [{"candidate_id": candidate["id"], "status": "new", "identity": candidate["id"], "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]} if candidate == full else ({"candidate_id": candidate["id"], "status": "known", "identity": full["id"], "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]} if candidate == short else {"candidate_id": candidate["id"], "status": "non_character", "identity": "none", "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]]}) for candidate in candidates]}
+    response = {
+        "classifications": [
+            {
+                "candidate_id": candidate["id"],
+                "status": "new",
+                "identity": candidate["id"],
+                "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]],
+            }
+            if candidate == full
+            else (
+                {
+                    "candidate_id": candidate["id"],
+                    "status": "known",
+                    "identity": full["id"],
+                    "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]],
+                }
+                if candidate == short
+                else {
+                    "candidate_id": candidate["id"],
+                    "status": "non_character",
+                    "identity": "none",
+                    "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]],
+                }
+            )
+            for candidate in candidates
+        ]
+    }
     discoveries, _ = materialize_classifications(response, units, candidates, {}, {})
     assert next(item for item in discoveries if item["id"] == "aster_blackwood")["aliases"] == ["Aster"]
+
 
 # ##################################################################
 # test bounded prompt includes complete source narrative
@@ -487,16 +613,24 @@ def test_discovery_prompt_carries_full_bounded_source_narrative() -> None:
         assert "FULL BOUNDED SOURCE NARRATIVE" in prompt
         assert "Fong carried cobra daggers." in prompt
 
+
 # ##################################################################
 # test source-audited variant context is advisory and full-name preserving
 # derives group guidance from the read-only audit file without writing it or turning its short aliases into canonical IDs.
 def test_source_audited_variant_context_prefers_full_candidate_owner(tmp_path: Path) -> None:
     from src.cast_freeze import source_audited_variant_context
 
-    (tmp_path / "qa-klein-team-alias-proposal.json").write_text(json.dumps({"decisions": [{"alias": ["Foam", "Fong", "Fo", "Fang", "Foam Xiao"], "note": "red cobra"}]}), encoding="utf-8")
-    candidates = [{"id": "p0000", "label": label, "ref_ids": ["c00s00000n000"]} for label in ["Foam", "Fong", "Fo", "Fang", "Foam Xiao"]]
+    (tmp_path / "qa-klein-team-alias-proposal.json").write_text(
+        json.dumps({"decisions": [{"alias": ["Foam", "Fong", "Fo", "Fang", "Foam Xiao"], "note": "red cobra"}]}),
+        encoding="utf-8",
+    )
+    candidates = [
+        {"id": "p0000", "label": label, "ref_ids": ["c00s00000n000"]}
+        for label in ["Foam", "Fong", "Fo", "Fang", "Foam Xiao"]
+    ]
     context = source_audited_variant_context(tmp_path, candidates)
     assert "Foam Xiao" in context and "one new owner" in context
+
 
 # ##################################################################
 # test grammatical predecessor cannot suppress a real name
@@ -506,30 +640,54 @@ def test_grammar_prefix_does_not_mark_following_name_as_suffix_only() -> None:
     labels = {candidate["label"] for candidate in candidate_coverage_ledger(units, {}, {})}
     assert {"Han", "Director"} <= labels
 
+
 # ##################################################################
 # test alias witnesses enrich only new owner preparation facts
 # carries exact source quotes from an approved new-owner alias into the prepared actor facts without touching established profiles.
 def test_new_owner_alias_witnesses_enrich_source_facts() -> None:
-    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "Foam Xiao arrived."}, {"id": "c00s00001", "chapter": "01.txt", "quote": "Foam's scarlet cobra marked his neck."}]
-    candidates = [{"id": "p0000", "label": "Foam Xiao", "ref_ids": ["c00s00000n000"]}, {"id": "p0001", "label": "Foam", "ref_ids": ["c00s00001n000"], "audited_target": "p0000"}]
-    response = {"classifications": [{"candidate_id": "p0000", "status": "new", "identity": "p0000", "evidence_unit_ids": ["c00s00000"]}, {"candidate_id": "p0001", "status": "known", "identity": "p0000", "evidence_unit_ids": ["c00s00001"]}]}
+    units = [
+        {"id": "c00s00000", "chapter": "01.txt", "quote": "Foam Xiao arrived."},
+        {"id": "c00s00001", "chapter": "01.txt", "quote": "Foam's scarlet cobra marked his neck."},
+    ]
+    candidates = [
+        {"id": "p0000", "label": "Foam Xiao", "ref_ids": ["c00s00000n000"]},
+        {"id": "p0001", "label": "Foam", "ref_ids": ["c00s00001n000"], "audited_target": "p0000"},
+    ]
+    response = {
+        "classifications": [
+            {"candidate_id": "p0000", "status": "new", "identity": "p0000", "evidence_unit_ids": ["c00s00000"]},
+            {"candidate_id": "p0001", "status": "known", "identity": "p0000", "evidence_unit_ids": ["c00s00001"]},
+        ]
+    }
     discoveries, _ = materialize_classifications(response, units, candidates, {}, {})
     foam = discoveries[0]
     assert foam["aliases"] == ["Foam"]
     assert "scarlet cobra" in foam["look_facts"]
 
+
 # ##################################################################
 # test action and group clues do not force nonentity
 # a living actor may be named in an impact or team phrase, so those source clues remain native eligibility questions rather than a blanket negative schema force.
 def test_action_and_group_clues_do_not_force_nonentity() -> None:
-    units = [{"id": "c00s00000", "chapter": "01.txt", "quote": "The impact of Han and Hammer stopped the beast. Mira team advanced."}]
+    units = [
+        {
+            "id": "c00s00000",
+            "chapter": "01.txt",
+            "quote": "The impact of Han and Hammer stopped the beast. Mira team advanced.",
+        }
+    ]
     candidates = candidate_coverage_ledger(units, {}, {})
     schema = discovery_schema([], candidates)
     branches = schema["properties"]["classifications"]["items"]["oneOf"]
     for label in ("Han", "Mira"):
         candidate = next(item for item in candidates if item["label"] == label)
-        branch = next(item for item in branches if "oneOf" in item and item["oneOf"][0]["properties"]["candidate_id"]["enum"] == [candidate["id"]])
+        branch = next(
+            item
+            for item in branches
+            if "oneOf" in item and item["oneOf"][0]["properties"]["candidate_id"]["enum"] == [candidate["id"]]
+        )
         assert branch["oneOf"][0]["properties"]["status"]["enum"] == ["new"]
+
 
 # ##################################################################
 # test historical chapter sixty carries casting facts
@@ -557,7 +715,12 @@ def test_scoped_audit_splits_young_without_global_alias() -> None:
     units = [
         {"id": "c00s00000", "chapter": "ch1.txt", "chapter_sha256": CH1, "quote": "Young Ren smiled."},
         {"id": "c00s00001", "chapter": "ch1.txt", "chapter_sha256": CH1, "quote": "Young stood up. Young left."},
-        {"id": "c00s00002", "chapter": "ch2.txt", "chapter_sha256": hashlib.sha256(b"chapter two body").hexdigest(), "quote": "Young stood up. Young left."},
+        {
+            "id": "c00s00002",
+            "chapter": "ch2.txt",
+            "chapter_sha256": hashlib.sha256(b"chapter two body").hexdigest(),
+            "quote": "Young stood up. Young left.",
+        },
     ]
     record = {
         "chapter_sha256": CH1,
@@ -599,7 +762,9 @@ def test_discover_batch_adjudicates_each_mention_and_persists_before_mapping(tmp
     from src.cast_freeze import SCOPED_AUDIT_NAME, discover_batch
 
     chapter = tmp_path / "ch1.txt"
-    chapter.write_text("Young Ren smiled. Young bowed to the king. The young fox ran. Young sold the fruit.", encoding="utf-8")
+    chapter.write_text(
+        "Young Ren smiled. Young bowed to the king. The young fox ran. Young sold the fruit.", encoding="utf-8"
+    )
     units = immutable_evidence_units([chapter])
     progress = {"registry": {"young_ren": {"name": "Young Ren"}}, "aliases": {}}
     calls: list[str] = []
@@ -613,7 +778,17 @@ def test_discover_batch_adjudicates_each_mention_and_persists_before_mapping(tmp
                 if line.startswith("m") and "mention:" in line:
                     mention_id = line.split()[0]
                     bows = "bowed" in line
-                    rows.append({"mention_id": mention_id, "refers_to_person": "yes" if bows else "no", "candidate_kind": "individual_name" if bows else "nonliving", "decision": "alias" if bows else "non_character", "canonical": "young_ren" if bows else "none", "confidence": 0.9, "reason": "context"})
+                    rows.append(
+                        {
+                            "mention_id": mention_id,
+                            "refers_to_person": "yes" if bows else "no",
+                            "candidate_kind": "individual_name" if bows else "nonliving",
+                            "decision": "alias" if bows else "non_character",
+                            "canonical": "young_ren" if bows else "none",
+                            "confidence": 0.9,
+                            "reason": "context",
+                        }
+                    )
             return json.dumps({"mentions": rows})
         out = []
         for option in schema["properties"]["classifications"]["items"]["oneOf"]:
@@ -622,7 +797,7 @@ def test_discover_batch_adjudicates_each_mention_and_persists_before_mapping(tmp
             row = next(line for line in prompt.splitlines() if line.startswith(cid + " label="))
             witness = row.split("witnesses: [")[1].split("]")[0]
             label = row.split("label='")[1].split("'")[0]
-            statuses = {b["properties"]["status"]["enum"][0]: b["properties"] for b in branches}
+            statuses = {st: b["properties"] for b in branches for st in b["properties"]["status"]["enum"]}
             if len(branches) == 1:
                 status = next(iter(statuses))
             elif label == "Young":
@@ -630,7 +805,14 @@ def test_discover_batch_adjudicates_each_mention_and_persists_before_mapping(tmp
             else:
                 status = "new"
             identity = statuses[status]["identity"]["enum"]
-            out.append({"candidate_id": cid, "status": status, "identity": "young_ren" if "young_ren" in identity else identity[0], "evidence_unit_ids": ["c00s00001" if label == "Young" and len(branches) > 1 else witness]})
+            out.append(
+                {
+                    "candidate_id": cid,
+                    "status": status,
+                    "identity": "young_ren" if "young_ren" in identity else identity[0],
+                    "evidence_unit_ids": ["c00s00001" if label == "Young" and len(branches) > 1 else witness],
+                }
+            )
         return json.dumps({"classifications": out})
 
     def cid_label(prompt: str, cid: str) -> str:
@@ -639,13 +821,17 @@ def test_discover_batch_adjudicates_each_mention_and_persists_before_mapping(tmp
                 return line.split("label=")[1].split()[0].strip("'")
         return ""
 
-    discoveries, classifications = discover_batch(tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=ask)
+    discoveries, classifications = discover_batch(
+        tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=ask
+    )
     assert discoveries == []
     records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
     assert {r["label"] for r in records} == {"Young"}
     assert {r["decision"] for r in records} == {"alias", "non_character"}
     for r in records:
-        assert len(r["chapter_sha256"]) == 64 and len(r["quote_sha256"]) == 64 and r["reason"] and r["confidence"] == 0.9
+        assert (
+            len(r["chapter_sha256"]) == 64 and len(r["quote_sha256"]) == 64 and r["reason"] and r["confidence"] == 0.9
+        )
     aliased = [r for r in records if r["decision"] == "alias"]
     assert len(aliased) == 1 and aliased[0]["canonical"] == "young_ren"
     assert aliased[0]["quote_sha256"] == hashlib.sha256(units[1]["quote"].encode()).hexdigest()
@@ -668,7 +854,13 @@ def test_discover_batch_adjudicates_second_round_darling_with_production_snapsho
     chapter = tmp_path / "ch1.txt"
     chapter.write_text("Young bowed to the king. Darling, said Mother softly.", encoding="utf-8")
     units = immutable_evidence_units([chapter])
-    progress = {"registry": {"young_ren": {"name": "Young Ren"}, "mother": {"name": "Mother", "voice_facts": "Darling is what Mother calls her child."}}, "aliases": {}}
+    progress = {
+        "registry": {
+            "young_ren": {"name": "Young Ren"},
+            "mother": {"name": "Mother", "voice_facts": "Darling is what Mother calls her child."},
+        },
+        "aliases": {},
+    }
     darling_rounds = {"count": 0}
 
     def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
@@ -678,7 +870,17 @@ def test_discover_batch_adjudicates_second_round_darling_with_production_snapsho
             for line in prompt.splitlines():
                 if line.startswith("m") and "mention:" in line:
                     darling = "Darling" in line
-                    rows.append({"mention_id": line.split()[0], "refers_to_person": "yes", "candidate_kind": "individual_name", "decision": "alias", "canonical": "mother" if darling else "young_ren", "confidence": 0.9, "reason": "context"})
+                    rows.append(
+                        {
+                            "mention_id": line.split()[0],
+                            "refers_to_person": "yes",
+                            "candidate_kind": "individual_name",
+                            "decision": "alias",
+                            "canonical": "mother" if darling else "young_ren",
+                            "confidence": 0.9,
+                            "reason": "context",
+                        }
+                    )
             return json.dumps({"mentions": rows})
         out = []
         for option in schema["properties"]["classifications"]["items"]["oneOf"]:
@@ -687,25 +889,40 @@ def test_discover_batch_adjudicates_second_round_darling_with_production_snapsho
             row = next(line for line in prompt.splitlines() if line.startswith(cid + " label="))
             witness = row.split("witnesses: [")[1].split("]")[0]
             label = row.split("label='")[1].split("'")[0]
-            statuses = {b["properties"]["status"]["enum"][0]: b["properties"] for b in branches}
+            statuses = {st: b["properties"] for b in branches for st in b["properties"]["status"]["enum"]}
             if len(branches) == 1:
                 status = next(iter(statuses))
             elif label == "Darling":
                 darling_rounds["count"] += 1
-                status = "known" if darling_rounds["count"] > 1 and "known" in statuses else "non_character" if "non_character" in statuses else next(iter(statuses))
+                status = (
+                    "known"
+                    if darling_rounds["count"] > 1 and "known" in statuses
+                    else "non_character"
+                    if "non_character" in statuses
+                    else next(iter(statuses))
+                )
             elif label == "Young":
                 status = "known" if "known" in statuses else "non_character"
             else:
                 status = "new"
             identity = statuses[status]["identity"]["enum"]
-            target = "mother" if label == "Darling" and "mother" in identity else "young_ren" if "young_ren" in identity else identity[0]
+            target = (
+                "mother"
+                if label == "Darling" and "mother" in identity
+                else "young_ren"
+                if "young_ren" in identity
+                else identity[0]
+            )
             out.append({"candidate_id": cid, "status": status, "identity": target, "evidence_unit_ids": [witness]})
         return json.dumps({"classifications": out})
 
     discover_batch(tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=ask)
     after = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
     assert all(record in after for record in records_before)
-    assert any(record["label"] == "Darling" and record["decision"] == "alias" and record["canonical"] == "mother" for record in after)
+    assert any(
+        record["label"] == "Darling" and record["decision"] == "alias" and record["canonical"] == "mother"
+        for record in after
+    )
 
 
 # ##################################################################
@@ -726,6 +943,7 @@ def run_scoped_freeze_checks(source: Path, project: Path) -> None:
         scoped_audit_attestation,
         validated_scoped_references,
     )
+
     chapters = sorted((project / "chapters").glob("*.txt"))
     units = immutable_evidence_units(chapters)
     unit = next(u for u in units if "Ron Blackfire" in u["quote"])
@@ -755,8 +973,13 @@ def run_scoped_freeze_checks(source: Path, project: Path) -> None:
     manifest_path.write_text(json.dumps({**legacy, "scoped_audit": scoped_audit_attestation(records)}))
     assert verify_frozen_cast(source, project)
     references = validated_scoped_references(source, project)
-    assert references == [{k: records[0][k] for k in ("chapter_sha256", "quote_sha256", "label", "span_start", "canonical")}]
-    assert json.loads(manifest_path.read_text())["approved_aliases"] == legacy["approved_aliases"] and "ron" not in legacy["approved_aliases"]
+    assert references == [
+        {k: records[0][k] for k in ("chapter_sha256", "quote_sha256", "label", "span_start", "canonical")}
+    ]
+    assert (
+        json.loads(manifest_path.read_text())["approved_aliases"] == legacy["approved_aliases"]
+        and "ron" not in legacy["approved_aliases"]
+    )
     reordered = list(reversed(records))
     assert scoped_audit_attestation(reordered) == scoped_audit_attestation(records)
     (project / SCOPED_AUDIT_NAME).write_text(json.dumps({"records": [records[0]]}))
@@ -786,21 +1009,58 @@ def test_adjudication_prompt_includes_prior_facts_and_bounded_scene(tmp_path: Pa
 
     chapter = tmp_path / "ch1.txt"
     filler = " ".join(f"Filler sentence number {i} about nothing." for i in range(200))
-    chapter.write_text(f"Opening remark about the harbour. Elena of the north was proud. Marta wept. Young bowed low. Later Marta said farewell. {filler}", encoding="utf-8")
+    chapter.write_text(
+        f"Opening remark about the harbour. Elena of the north was proud. Marta wept. Young bowed low. Later Marta said farewell. {filler}",
+        encoding="utf-8",
+    )
     units = immutable_evidence_units([chapter])
-    registry = {"young_ren": {"name": "Young Ren", "bio": "a boy raised by Elena of the north", "look": "freckled", "facts": {"voice": ["soft tenor"], "look": ["scar on chin"]}}}
-    candidate = {"id": "p0000", "label": "Young", "ref_ids": [r for r, ref in immutable_name_references(units).items() if ref["label"] == "Young"]}
+    registry = {
+        "young_ren": {
+            "name": "Young Ren",
+            "bio": "a boy raised by Elena of the north",
+            "look": "freckled",
+            "facts": {"voice": ["soft tenor"], "look": ["scar on chin"]},
+        }
+    }
+    candidate = {
+        "id": "p0000",
+        "label": "Young",
+        "ref_ids": [r for r, ref in immutable_name_references(units).items() if ref["label"] == "Young"],
+    }
     prompts: list[str] = []
 
     def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
         prompts.append(prompt)
-        return json.dumps({"mentions": [{"mention_id": "m0", "refers_to_person": "unclear", "candidate_kind": "unclear", "decision": "ambiguous", "canonical": "none", "confidence": 0.5, "reason": "x"}]})
+        return json.dumps(
+            {
+                "mentions": [
+                    {
+                        "mention_id": "m0",
+                        "refers_to_person": "unclear",
+                        "candidate_kind": "unclear",
+                        "decision": "ambiguous",
+                        "canonical": "none",
+                        "confidence": 0.5,
+                        "reason": "x",
+                    }
+                ]
+            }
+        )
 
     adjudicate_pending_mentions(tmp_path, [{"candidate": candidate, "proposed": "young_ren"}], units, registry, ask)
     prompt = prompts[0]
-    assert "a boy raised by Elena of the north" in prompt and "soft tenor" in prompt and "scar on chin" in prompt and "freckled" in prompt
+    assert (
+        "a boy raised by Elena of the north" in prompt
+        and "soft tenor" in prompt
+        and "scar on chin" in prompt
+        and "freckled" in prompt
+    )
     scene = prompt.split("bounded scene: ")[1].splitlines()[0]
-    assert "Opening remark about the harbour." in scene and "Marta wept." in scene and "Later Marta said farewell." in scene
+    assert (
+        "Opening remark about the harbour." in scene
+        and "Marta wept." in scene
+        and "Later Marta said farewell." in scene
+    )
     assert len(scene) <= ADJUDICATION_SCENE_CHARS + len(units[3]["quote"])
     assert "Filler sentence number 199" not in scene
 
@@ -822,7 +1082,10 @@ def test_start6_ren_dove_mom_and_third_context_readjudicate_with_history(tmp_pat
         "narrator": {"name": "Narrator"},
     }
     assert adjudication_owners("Ren Dove", registry) == ["ren"]  # component overlap, not the whole cast
-    assert adjudication_owners("Mom", registry) == ["mother", "ren"]  # no lexical match: bounded roster, label-mentioning owner first, never the narrator
+    assert adjudication_owners("Mom", registry) == [
+        "mother",
+        "ren",
+    ]  # no lexical match: bounded roster, label-mentioning owner first, never the narrator
     assert adjudication_owners("Mom", registry, proposed="ren")[0] == "ren"
     chapter_one, chapter_two = tmp_path / "ch1.txt", tmp_path / "ch2.txt"
     chapter_one.write_text("Ren Dove hid under the covers. Ren whispered, I love you, Mom.", encoding="utf-8")
@@ -832,15 +1095,29 @@ def test_start6_ren_dove_mom_and_third_context_readjudicate_with_history(tmp_pat
 
     def cached(label: str, quote: str) -> dict:
         unit = next(u for u in units if u["quote"] == quote)
-        return {"chapter_sha256": unit["chapter_sha256"], "quote_sha256": hashlib.sha256(quote.encode()).hexdigest(), "label": label, "span_start": quote.index(label), "canonical": "none", "decision": "ambiguous", "confidence": 0.5, "reason": stale_reason}
+        return {
+            "chapter_sha256": unit["chapter_sha256"],
+            "quote_sha256": hashlib.sha256(quote.encode()).hexdigest(),
+            "label": label,
+            "span_start": quote.index(label),
+            "canonical": "none",
+            "decision": "ambiguous",
+            "confidence": 0.5,
+            "reason": stale_reason,
+        }
 
     legacy = [cached("Ren Dove", units[0]["quote"]), cached("Mom", units[1]["quote"]), cached("Mom", units[2]["quote"])]
     (tmp_path / SCOPED_AUDIT_NAME).write_text(json.dumps({"records": legacy}))
     ledger = candidate_coverage_ledger(units, registry, {}, legacy)
-    assert {c["label"] for c in ledger if c.get("scoped_stale")} == {"Ren Dove", "Mom"}  # cached ambiguity is stale, not final
+    assert {c["label"] for c in ledger if c.get("scoped_stale")} == {
+        "Ren Dove",
+        "Mom",
+    }  # cached ambiguity is stale, not final
     # a record bound to other bytes or another offset is not applied at all: the source guards still decide scope
     moved = [{**legacy[1], "span_start": legacy[1]["span_start"] + 1}, {**legacy[2], "chapter_sha256": "0" * 64}]
-    assert not any(c.get("scoped_audit") for c in candidate_coverage_ledger(units, registry, {}, moved) if c["label"] == "Mom")
+    assert not any(
+        c.get("scoped_audit") for c in candidate_coverage_ledger(units, registry, {}, moved) if c["label"] == "Mom"
+    )
 
     adjudications: list[str] = []
 
@@ -854,11 +1131,31 @@ def test_start6_ren_dove_mom_and_third_context_readjudicate_with_history(tmp_pat
                 if line.startswith("m") and "mention:" in line:
                     allowed = schema["properties"]["mentions"]["items"]["properties"]["canonical"]["enum"]
                     if "shouted" in line:
-                        rows.append({"mention_id": line.split()[0], "refers_to_person": "no", "candidate_kind": "nonliving", "decision": "non_character", "canonical": "none", "confidence": 0.9, "reason": "a stranger's mom, not the cast"})
+                        rows.append(
+                            {
+                                "mention_id": line.split()[0],
+                                "refers_to_person": "no",
+                                "candidate_kind": "nonliving",
+                                "decision": "non_character",
+                                "canonical": "none",
+                                "confidence": 0.9,
+                                "reason": "a stranger's mom, not the cast",
+                            }
+                        )
                     else:
                         target = "ren" if "Dove" in line else "mother"
                         assert target in allowed
-                        rows.append({"mention_id": line.split()[0], "refers_to_person": "yes", "candidate_kind": "individual_name", "decision": "alias", "canonical": target, "confidence": 0.9, "reason": "scene and prior facts support it"})
+                        rows.append(
+                            {
+                                "mention_id": line.split()[0],
+                                "refers_to_person": "yes",
+                                "candidate_kind": "individual_name",
+                                "decision": "alias",
+                                "canonical": target,
+                                "confidence": 0.9,
+                                "reason": "scene and prior facts support it",
+                            }
+                        )
             return json.dumps({"mentions": rows})
         out = []
         for option in schema["properties"]["classifications"]["items"]["oneOf"]:
@@ -867,7 +1164,7 @@ def test_start6_ren_dove_mom_and_third_context_readjudicate_with_history(tmp_pat
             row = next(line for line in prompt.splitlines() if line.startswith(cid + " label="))
             label = row.split("label='")[1].split("'")[0]
             witness = row.split("witnesses: [")[1].split("]")[0]
-            statuses = {b["properties"]["status"]["enum"][0]: b["properties"] for b in branches}
+            statuses = {st: b["properties"] for b in branches for st in b["properties"]["status"]["enum"]}
             if len(branches) == 1:
                 status = next(iter(statuses))
             elif label in {"Ren Dove", "Mom"}:
@@ -883,7 +1180,9 @@ def test_start6_ren_dove_mom_and_third_context_readjudicate_with_history(tmp_pat
         return json.dumps({"classifications": out})
 
     progress = {"registry": registry, "aliases": {}}
-    discoveries, classifications = discover_batch(tmp_path, 0, [chapter_one, chapter_two], units, "", progress, set(), ask=ask)
+    discoveries, classifications = discover_batch(
+        tmp_path, 0, [chapter_one, chapter_two], units, "", progress, set(), ask=ask
+    )
     assert discoveries == [] and adjudications
     records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
     assert len(records) == 3  # replaced in place of the cached records, never duplicated
@@ -892,16 +1191,38 @@ def test_start6_ren_dove_mom_and_third_context_readjudicate_with_history(tmp_pat
     mom_vocative = by_quote[("Mom", hashlib.sha256(units[1]["quote"].encode()).hexdigest())]
     mom_third = by_quote[("Mom", hashlib.sha256(units[2]["quote"].encode()).hexdigest())]
     assert (dove["decision"], dove["canonical"], dove["owners"]) == ("alias", "ren", ["ren"])
-    assert (mom_vocative["decision"], mom_vocative["canonical"]) == ("alias", "mother") and set(mom_vocative["owners"]) == {"mother", "ren"}
-    assert (mom_third["decision"], mom_third["canonical"]) == ("non_character", "none")  # the same label elsewhere is decided on its own scene
+    assert (mom_vocative["decision"], mom_vocative["canonical"]) == ("alias", "mother") and set(
+        mom_vocative["owners"]
+    ) == {"mother", "ren"}
+    assert (mom_third["decision"], mom_third["canonical"]) == (
+        "non_character",
+        "none",
+    )  # the same label elsewhere is decided on its own scene
     for record in (dove, mom_vocative, mom_third):
-        assert record["history"] == [{"decision": "ambiguous", "canonical": "none", "confidence": 0.5, "reason": stale_reason}]
-    assert any(c["status"] == "known" and c["identity"] == "ren" for c in classifications) and any(c["identity"] == "mother" for c in classifications)
+        assert record["history"] == [
+            {"decision": "ambiguous", "canonical": "none", "confidence": 0.5, "reason": stale_reason}
+        ]
+    assert any(c["status"] == "known" and c["identity"] == "ren" for c in classifications) and any(
+        c["identity"] == "mother" for c in classifications
+    )
     # idempotent: decisions that already saw every plausible owner are never re-asked
     calls = len(adjudications)
     candidates = candidate_coverage_ledger(units, registry, {}, records)
     assert not any(c.get("scoped_stale") for c in candidates)
-    adjudicate_pending_mentions(tmp_path, [{"candidate": next(c for c in candidates if c["label"] == "Mom" and c["scoped_audit"]["decision"] == "alias"), "proposed": "mother"}], units, registry, ask)
+    adjudicate_pending_mentions(
+        tmp_path,
+        [
+            {
+                "candidate": next(
+                    c for c in candidates if c["label"] == "Mom" and c["scoped_audit"]["decision"] == "alias"
+                ),
+                "proposed": "mother",
+            }
+        ],
+        units,
+        registry,
+        ask,
+    )
     assert len(adjudications) == calls
     # an ambiguous answer that already saw every owner stays final with its reason; it is not re-asked
     stuck = {**records[0], "decision": "ambiguous", "canonical": "none", "owners": ["ren", "mother"]}
@@ -925,18 +1246,46 @@ def test_adjudication_rejects_verdict_contradicting_person_answer(tmp_path: Path
     def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
         prompts.append(prompt)
         if response_schema and "mentions" not in response_schema["properties"]:
-            return json.dumps({"semantic_type": "prose_fragment", "witness_unit_ids": ["c00s00000"], "reason": "the capitalized continuation is prose"})
+            return json.dumps(
+                {
+                    "semantic_type": "prose_fragment",
+                    "witness_unit_ids": ["c00s00000"],
+                    "reason": "the capitalized continuation is prose",
+                }
+            )
         person, decision, canonical = next(answers)
-        return json.dumps({"mentions": [{"mention_id": "m0", "refers_to_person": person, "candidate_kind": "individual_name", "decision": decision, "canonical": canonical, "confidence": 0.95, "reason": "he is Ren's parent"}]})
+        return json.dumps(
+            {
+                "mentions": [
+                    {
+                        "mention_id": "m0",
+                        "refers_to_person": person,
+                        "candidate_kind": "individual_name",
+                        "decision": decision,
+                        "canonical": canonical,
+                        "confidence": 0.95,
+                        "reason": "he is Ren's parent",
+                    }
+                ]
+            }
+        )
 
     for label in ("Ren Dove", "Mom"):
         candidate = next(c for c in ledger if c["label"] == label)
         candidate = {**candidate, "ref_ids": candidate["ref_ids"][:1]}
         adjudicate_pending_mentions(tmp_path, [{"candidate": candidate, "proposed": None}], units, registry, ask)
     records = json.loads((tmp_path / "mention-scoped-audit.json").read_text())["records"]
-    assert [(r["label"], r["decision"], r["canonical"]) for r in records] == [("Ren Dove", "non_character", "none"), ("Mom", "ambiguous", "none")]
-    assert records[0]["raw_adjudication"]["decision"] == "non_character" and records[0]["raw_adjudication"]["refers_to_person"] == "yes"
-    assert any("refers_to_person" in prompt and "candidate_kind" in prompt and "endearment" in prompt for prompt in prompts)
+    assert [(r["label"], r["decision"], r["canonical"]) for r in records] == [
+        ("Ren Dove", "non_character", "none"),
+        ("Mom", "ambiguous", "none"),
+    ]
+    assert (
+        records[0]["raw_adjudication"]["decision"] == "non_character"
+        and records[0]["raw_adjudication"]["refers_to_person"] == "yes"
+    )
+    assert any(
+        "refers_to_person" in prompt and "candidate_kind" in prompt and "endearment" in prompt for prompt in prompts
+    )
     assert any("semantic_type" in prompt and "Do not output a decision" in prompt for prompt in prompts)
 
 
@@ -955,14 +1304,28 @@ def test_known_owner_candidate_chain_resolves_to_canonical_and_adjudicates() -> 
     assert owned["id"] not in targets and '"louu"' in targets
     for _ in range(3):
         pending: list[dict] = []
-        record = {"candidate_id": other["id"], "status": "known", "identity": owned["id"], "evidence_unit_ids": ["c00s00000"]}
+        record = {
+            "candidate_id": other["id"],
+            "status": "known",
+            "identity": owned["id"],
+            "evidence_unit_ids": ["c00s00000"],
+        }
         fixed = {"candidate_id": owned["id"], "status": "known", "identity": "louu", "evidence_unit_ids": ["c00s00000"]}
-        out = validate_classification_chunk({"classifications": [dict(record), fixed]}, [other, owned], registry, aliases, candidates, units, pending)
+        out = validate_classification_chunk(
+            {"classifications": [dict(record), fixed]}, [other, owned], registry, aliases, candidates, units, pending
+        )
         assert out[0]["identity"] == "louu"
         assert [item["proposed"] for item in pending] == ["louu"] and pending[0]["candidate"] is other
-    genuine = {"candidate_id": other["id"], "status": "known", "identity": other["id"], "evidence_unit_ids": ["c00s00000"]}
+    genuine = {
+        "candidate_id": other["id"],
+        "status": "known",
+        "identity": other["id"],
+        "evidence_unit_ids": ["c00s00000"],
+    }
     with pytest.raises(ValueError):
-        validate_classification_chunk({"classifications": [genuine, fixed]}, [other, owned], registry, aliases, candidates, units, [])
+        validate_classification_chunk(
+            {"classifications": [genuine, fixed]}, [other, owned], registry, aliases, candidates, units, []
+        )
 
 
 # ##################################################################
@@ -988,7 +1351,9 @@ def test_title_vocative_followed_by_attribution_verb_is_not_full_name(tmp_path: 
 # ##################################################################
 # proposed-new identity review with a production-like scene
 # a hesitation-merged name, a misspelled registered name, a verb-bearing fragment and a letter-prefixed vocative are redirected or refused before acceptance, while a genuinely new person survives; uncertainty fails closed and raw provenance is persisted.
-def new_identity_ask(verdict_for, calls: list[str]):
+def new_identity_ask(
+    verdict_for, calls: list[str], primary_status: str | None = None, adjudication: dict | None = None
+):
     def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
         calls.append(prompt)
         schema = response_schema or {}
@@ -1000,7 +1365,11 @@ def new_identity_ask(verdict_for, calls: list[str]):
                 witnesses[line[1:10]] = line
             rows = []
             for identity in ids:
-                name = next(part.split("name='")[1].split("'")[0] for part in prompt.split("Proposed identities: ")[1].splitlines()[0].split("; ") if part.startswith(identity + " "))
+                name = next(
+                    part.split("name='")[1].split("'")[0]
+                    for part in prompt.split("Proposed identities: ")[1].splitlines()[0].split("; ")
+                    if part.startswith(identity + " ")
+                )
                 unit = next(key for key, line in witnesses.items() if name in line)
                 rows.append({"id": identity, "eligibility": "living", "evidence_unit_ids": [unit]})
             return json.dumps({"entities": rows})
@@ -1009,22 +1378,57 @@ def new_identity_ask(verdict_for, calls: list[str]):
             rows = []
             lines = prompt.split("MENTIONS:\n", 1)[1].splitlines()
             label = prompt.split("label ", 1)[1].split(" was proposed")[0].strip("'")
-            owners = [option[len("existing:") :] for option in item["verdict"]["enum"] if option.startswith("existing:")]
+            owners = [
+                option[len("existing:") :] for option in item["verdict"]["enum"] if option.startswith("existing:")
+            ]
             for index, line in enumerate(lines):
                 if "mention:" in line:
                     unit_id = line.split("unit ")[1].split()[0]
-                    rows.append({"mention_id": line.split()[0], "verdict": verdict_for(label, owners, line), "witness_unit_ids": [unit_id], "confidence": 0.9, "reason": "scene shows it"})
+                    rows.append(
+                        {
+                            "mention_id": line.split()[0],
+                            "verdict": verdict_for(label, owners, line),
+                            "witness_unit_ids": [unit_id],
+                            "confidence": 0.9,
+                            "reason": "scene shows it",
+                        }
+                    )
             return json.dumps({"mentions": rows})
         if "refers_to_person" in item:
-            return json.dumps({"mentions": [{"mention_id": line.split()[0], "refers_to_person": "no", "candidate_kind": "nonliving", "decision": "non_character", "canonical": "none", "confidence": 0.9, "reason": "none"} for line in prompt.splitlines() if line.startswith("m") and "mention:" in line]})
+            return json.dumps(
+                {
+                    "mentions": [
+                        {
+                            "mention_id": line.split()[0],
+                            "refers_to_person": "no",
+                            "candidate_kind": "nonliving",
+                            "decision": "non_character",
+                            "canonical": "none",
+                            "confidence": 0.9,
+                            "reason": "none",
+                            **(adjudication or {}),
+                        }
+                        for line in prompt.splitlines()
+                        if line.startswith("m") and "mention:" in line
+                    ]
+                }
+            )
         out = []
         for option in schema["properties"]["classifications"]["items"]["oneOf"]:
             branches = option.get("oneOf", [option])
             cid = branches[0]["properties"]["candidate_id"]["enum"][0]
             row = next(line for line in prompt.splitlines() if line.startswith(cid + " label="))
             witness = row.split("witnesses: [")[1].split("]")[0].split(",")[0].strip("' ")
-            statuses = {b["properties"]["status"]["enum"][0]: b["properties"] for b in branches}
-            status = "new" if "new" in statuses else "known" if "known" in statuses else next(iter(statuses))
+            statuses = {st: b["properties"] for b in branches for st in b["properties"]["status"]["enum"]}
+            status = (
+                primary_status
+                if primary_status in statuses
+                else "new"
+                if "new" in statuses
+                else "known"
+                if "known" in statuses
+                else next(iter(statuses))
+            )
             identity = statuses[status]["identity"]["enum"][0]
             out.append({"candidate_id": cid, "status": status, "identity": identity, "evidence_unit_ids": [witness]})
         return json.dumps({"classifications": out})
@@ -1034,14 +1438,25 @@ def new_identity_ask(verdict_for, calls: list[str]):
 
 def new_identity_fixture(tmp_path: Path) -> tuple[Path, list[dict], dict]:
     chapter = tmp_path / "ch1.txt"
-    chapter.write_text("Um Taro rubbed his eyes in the dim hall. Lou stood beside the window and Lu frowned. Lou Arched a brow at the door. \"E Lou, wait for us!\" shouted Taro. Han stepped from the crowd, a stranger who had never met them.", encoding="utf-8")
-    progress = {"registry": {"taro": {"name": "Taro", "bio": "A teacher.", "look": ""}, "lu": {"name": "Lu", "bio": "Sister of Taro, sometimes called Lou by neighbours.", "look": ""}}, "aliases": {"lou": "lu"}}
+    chapter.write_text(
+        'Um Taro rubbed his eyes in the dim hall. Lou stood beside the window and Lu frowned. Lou Arched a brow at the door. "E Lou, wait for us!" shouted Taro. Han stepped from the crowd, a stranger who had never met them.',
+        encoding="utf-8",
+    )
+    progress = {
+        "registry": {
+            "taro": {"name": "Taro", "bio": "A teacher.", "look": ""},
+            "lu": {"name": "Lu", "bio": "Sister of Taro, sometimes called Lou by neighbours.", "look": ""},
+        },
+        "aliases": {"lou": "lu"},
+    }
     return chapter, immutable_evidence_units([chapter]), progress
 
 
 def structural_verdict(label: str, owners: list[str], line: str) -> str:
     words = label.split()
-    if len(words) == 1 and re.search(rf"(?:\b[A-Z][a-z]* {label}\b|\b{label} [A-Z][a-z]*\b)", line.split("mention:", 1)[1].split("bounded scene")[0]):
+    if len(words) == 1 and re.search(
+        rf"(?:\b[A-Z][a-z]* {label}\b|\b{label} [A-Z][a-z]*\b)", line.split("mention:", 1)[1].split("bounded scene")[0]
+    ):
         return "nonidentity_fragment"
     if words[0] in {"Um", "E"} and len(words) == 2 and normalized_owner(words[1], owners):
         return f"existing:{normalized_owner(words[1], owners)}"
@@ -1065,28 +1480,148 @@ def test_new_identity_review_redirects_fragments_and_keeps_genuine_new(tmp_path:
 
     chapter, units, progress = new_identity_fixture(tmp_path)
     calls: list[str] = []
-    discoveries, classifications = discover_batch(tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=new_identity_ask(structural_verdict, calls))
+    discoveries, classifications = discover_batch(
+        tmp_path,
+        0,
+        [chapter],
+        units,
+        chapter.read_text(),
+        progress,
+        set(),
+        ask=new_identity_ask(structural_verdict, calls),
+    )
     assert [item["id"] for item in discoveries] == ["han"]
     audit = json.loads((tmp_path / NEW_IDENTITY_AUDIT_NAME).read_text())["records"]
     by_label = {record["label"]: record for record in audit}
     assert by_label["Han"]["verdict"] == "distinct_living_identity"
-    assert by_label["Um Taro"]["verdict"] == "existing:taro" and by_label["Lou Arched"]["verdict"] == "nonidentity_fragment"
+    assert (
+        by_label["Um Taro"]["verdict"] == "existing:taro"
+        and by_label["Lou Arched"]["verdict"] == "nonidentity_fragment"
+    )
     for record in audit:
-        assert len(record["chapter_sha256"]) == 64 and len(record["quote_sha256"]) == 64 and record["witness_unit_ids"] and record["raw_review"]["reason"]
+        assert (
+            len(record["chapter_sha256"]) == 64
+            and len(record["quote_sha256"]) == 64
+            and record["witness_unit_ids"]
+            and record["raw_review"]["reason"]
+        )
     scoped = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
-    assert {(r["label"], r["decision"], r["canonical"]) for r in scoped} >= {("Um Taro", "alias", "taro"), ("Lou Arched", "non_character", "none")}
+    assert {(r["label"], r["decision"], r["canonical"]) for r in scoped} >= {
+        ("Um Taro", "alias", "taro"),
+        ("Lou Arched", "non_character", "none"),
+    }
     assert any("bounded scene" in call and "Canonical prior facts" in call for call in calls)
-    assert {c["status"] for c in classifications} <= {"known", "new", "non_character"} and sum(c["status"] == "new" for c in classifications) == 1
+    assert {c["status"] for c in classifications} <= {"known", "new", "non_character"} and sum(
+        c["status"] == "new" for c in classifications
+    ) == 1
 
 
-def test_new_identity_review_fails_closed_on_uncertain_and_wrong_witness(tmp_path: Path) -> None:
-    from src.cast_freeze import NEW_IDENTITY_AUDIT_NAME, discover_batch
+def pending_rows_of(project: Path, code: str) -> list[dict]:
+    from src.data_recovery import RecoveryLedger
+
+    return [row for row in RecoveryLedger(project).open_pending("cast") if row["code"] == code]
+
+
+def test_new_identity_review_uncertain_is_typed_pending_not_fatal(tmp_path: Path) -> None:
+    from src.cast_freeze import NEW_IDENTITY_AUDIT_NAME, PROPOSALS_NAME, discover_batch
 
     chapter, units, progress = new_identity_fixture(tmp_path)
-    with pytest.raises(RuntimeError, match="uncertain for at least one mention"):
-        discover_batch(tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=new_identity_ask(lambda label, owners, line: "uncertain", []))
+    before = json.dumps(progress, sort_keys=True)
+    discoveries, classifications = discover_batch(
+        tmp_path,
+        0,
+        [chapter],
+        units,
+        chapter.read_text(),
+        progress,
+        set(),
+        ask=new_identity_ask(lambda label, owners, line: "uncertain", []),
+    )
     audit = json.loads((tmp_path / NEW_IDENTITY_AUDIT_NAME).read_text())["records"]
     assert audit and all(record["verdict"] == "uncertain" for record in audit)
+    # nothing is registered, aliased or merged; every held candidate is non_character
+    assert discoveries == [] and json.dumps(progress, sort_keys=True) == before
+    assert "new" not in {item["status"] for item in classifications}
+    assert all(item["identity"] in progress["registry"] for item in classifications if item["status"] == "known")
+    rows = pending_rows_of(tmp_path, "pending_uncertain_living")
+    assert rows and {row["severity"] for row in rows} == {"pending"}
+    source = chapter.read_text()
+    proposals = [json.loads(line) for line in (tmp_path / PROPOSALS_NAME).read_text().splitlines()]
+    assert {entry["type"] for entry in proposals} == {"uncertain_living"}
+    for entry in proposals:
+        # literal mentions: the exact quote, label span and unit survive verbatim, with the recorded verdict
+        for mention in entry["mentions"]:
+            assert mention["quote"] in source
+            assert mention["quote"][mention["span_start"] :].startswith(mention["label"])
+            assert mention["verdict"] == "uncertain" and mention["unit_id"]
+        assert entry["facts"] and all(fact in source for fact in entry["facts"])
+    for row in rows:
+        assert row["evidence"]["source"] == [chapter.name] and row["evidence"]["proposal_sha256"]
+
+
+def test_ambiguous_named_person_is_new_identity_pending_not_forced_or_fatal(tmp_path: Path) -> None:
+    from src.cast_freeze import PROPOSALS_NAME, SCOPED_AUDIT_NAME, discover_batch
+
+    chapter = tmp_path / "ch1.txt"
+    chapter.write_text("Zed stepped into the hall and greeted Lu. Lu smiled back.", encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    progress = {"registry": {"lu": {"name": "Lu", "bio": "A teacher.", "look": ""}}, "aliases": {}}
+    before = json.dumps(progress, sort_keys=True)
+    adjudication = {
+        "refers_to_person": "yes",
+        "candidate_kind": "individual_name",
+        "decision": "ambiguous",
+        "reason": "a named person no listed owner is shown to be",
+    }
+    prompts: list[str] = []
+    discoveries, classifications = discover_batch(
+        tmp_path,
+        0,
+        [chapter],
+        units,
+        chapter.read_text(),
+        progress,
+        set(),
+        ask=new_identity_ask(
+            lambda label, owners, line: "uncertain", prompts, primary_status="ambiguous", adjudication=adjudication
+        ),
+    )
+    rows = pending_rows_of(tmp_path, "pending_new_identity")
+    assert len(rows) == 1 and rows[0]["evidence"]["label"] == "Zed"
+    assert discoveries == [] and json.dumps(progress, sort_keys=True) == before
+    held = next(item for item in classifications if item["status"] == "non_character")
+    assert held["identity"] == "none"
+    # the scoped audit keeps the exact ambiguous decision (no alias, no owner forced)
+    scoped = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert [(r["decision"], r["canonical"]) for r in scoped] == [("ambiguous", "none")]
+    entry = json.loads((tmp_path / PROPOSALS_NAME).read_text().splitlines()[0])
+    assert (
+        entry["type"] == "new_identity" and entry["mentions"][0]["quote"] == "Zed stepped into the hall and greeted Lu."
+    )
+    assert any("never force an owner" in prompt for prompt in prompts)
+
+
+def test_uncertain_after_invalid_existing_owner_is_unapproved_alias_pending(tmp_path: Path) -> None:
+    from src.cast_freeze import discover_batch
+
+    chapter = tmp_path / "ch1.txt"
+    chapter.write_text("Lou frowned at the quiet door. Rin watched from the stair.", encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    progress = {"registry": {"lu": {"name": "Lu", "bio": "A teacher.", "look": ""}}, "aliases": {}}
+
+    def verdict(label: str, owners: list[str], line: str) -> str:
+        # claims the owner while it is offered (the source gives it no support), withdraws once it is removed
+        return f"existing:{owners[0]}" if owners else "uncertain"
+
+    calls: list[str] = []
+    discoveries, classifications = discover_batch(
+        tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=new_identity_ask(verdict, calls)
+    )
+    rows = pending_rows_of(tmp_path, "pending_unapproved_alias")
+    assert rows and not any(item["status"] == "known" for item in classifications)
+    assert progress["aliases"] == {} and discoveries == []
+    assert all(row["evidence"]["type"] == "unapproved_alias" for row in rows)
+    assert any("previous answer" in call for call in calls)
 
 
 # ##################################################################
@@ -1094,7 +1629,10 @@ def test_new_identity_review_fails_closed_on_uncertain_and_wrong_witness(tmp_pat
 # a variant of another proposed-new name is linked to that provisional identity during review, before materialization could refuse it; a link to a target that is not independently introduced fails closed.
 def provisional_fixture(tmp_path: Path) -> tuple[Path, list[dict], dict]:
     chapter = tmp_path / "ch1.txt"
-    chapter.write_text("Jun raised a shield beside the gate. Taro watched while Jun grinned. Jun that is June nodded at the gate, and soon June ran home.", encoding="utf-8")
+    chapter.write_text(
+        "Jun raised a shield beside the gate. Taro watched while Jun grinned. Jun that is June nodded at the gate, and soon June ran home.",
+        encoding="utf-8",
+    )
     progress = {"registry": {"taro": {"name": "Taro", "bio": "A teacher.", "look": ""}}, "aliases": {}}
     return chapter, immutable_evidence_units([chapter]), progress
 
@@ -1110,7 +1648,20 @@ def provisional_ask(verdicts: dict[str, str], calls: list[str]):
             for row in response["mentions"]:
                 if row["verdict"] == "same_provisional":
                     row["verdict"] = next(option for option in options if option.startswith("same_provisional:"))
-                    row["witness_unit_ids"] = [next(line.split("unit ")[1].split()[0] for line in prompt.splitlines() if "mention:" in line and label in line.split("mention:")[1] and "June" in line and "Jun " in line)] if label == "June" else row["witness_unit_ids"]
+                    row["witness_unit_ids"] = (
+                        [
+                            next(
+                                line.split("unit ")[1].split()[0]
+                                for line in prompt.splitlines()
+                                if "mention:" in line
+                                and label in line.split("mention:")[1]
+                                and "June" in line
+                                and "Jun " in line
+                            )
+                        ]
+                        if label == "June"
+                        else row["witness_unit_ids"]
+                    )
         return json.dumps(response)
 
     return ask
@@ -1120,19 +1671,108 @@ def test_variant_resolves_via_same_provisional_before_materialization(tmp_path: 
     from src.cast_freeze import discover_batch
 
     chapter, units, progress = provisional_fixture(tmp_path)
-    discoveries, classifications = discover_batch(tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=provisional_ask({"June": "same_provisional"}, []))
+    discoveries, classifications = discover_batch(
+        tmp_path,
+        0,
+        [chapter],
+        units,
+        chapter.read_text(),
+        progress,
+        set(),
+        ask=provisional_ask({"June": "same_provisional"}, []),
+    )
     assert [item["id"] for item in discoveries] == ["jun"]
     by_label = {item["candidate_id"]: item for item in classifications}
-    assert by_label["p0001"]["status"] == "known" and by_label["p0001"]["identity"] == "p0000" and by_label["p0000"]["status"] == "new"
+    assert (
+        by_label["p0001"]["status"] == "known"
+        and by_label["p0001"]["identity"] == "p0000"
+        and by_label["p0000"]["status"] == "new"
+    )
     assert discoveries[0]["aliases"] == ["June"]
 
 
-def test_same_provisional_to_non_introduced_target_fails_closed(tmp_path: Path) -> None:
+def provisional_review_inputs(tmp_path: Path) -> tuple[list[dict], list[dict], list[dict], dict]:
+    from src.cast_freeze import candidate_coverage_ledger
+
+    _chapter, units, progress = provisional_fixture(tmp_path)
+    candidates = candidate_coverage_ledger(units, progress["registry"], progress["aliases"])
+    records = [
+        {
+            "candidate_id": candidate["id"],
+            "status": "new",
+            "identity": candidate["id"],
+            "evidence_unit_ids": [candidate["ref_ids"][0].rsplit("n", 1)[0]],
+        }
+        for candidate in candidates
+        if candidate["label"].startswith("Jun")
+    ]
+    return units, records, candidates, progress
+
+
+def test_same_provisional_to_non_introduced_target_is_garbled_variant_pending(tmp_path: Path) -> None:
+    from src.cast_freeze import (
+        PENDING_IDENTITY_TYPES,
+        demote_deferred,
+        review_proposed_identities,
+    )
+
+    units, records, candidates, progress = provisional_review_inputs(tmp_path)
+    ask = provisional_ask({"June": "same_provisional", "Jun": "nonidentity_fragment"}, [])
+    # strict mode (no pending lane) still fails closed
+    with pytest.raises(RuntimeError, match="independently introduced"):
+        review_proposed_identities(tmp_path, units, [dict(r) for r in records], candidates, progress, ask)
+    deferred: list[dict] = []
+    review_proposed_identities(tmp_path, units, records, candidates, progress, ask, deferred)
+    assert [entry["label"] for entry in deferred] == ["June"] and deferred[0]["type"] in PENDING_IDENTITY_TYPES
+    entry = deferred[0]
+    assert entry["type"] == "garbled_variant" and "independently introduced" in entry["reason"]
+    source = " ".join(unit["quote"] for unit in units)
+    for mention in entry["mentions"]:
+        assert (
+            mention["quote"] in source and mention["verdict"].startswith("same_provisional:") and mention["witnesses"]
+        )
+        assert all(w["quote"] in source for w in mention["witnesses"])
+    # the held variant is never linked to a target or merged
+    demote_deferred(records, candidates, units, deferred)
+    june = next(item for item in records if item["candidate_id"] == entry["candidate_id"])
+    assert (june["status"], june["identity"]) == ("non_character", "none") and progress["aliases"] == {}
+
+
+def test_demote_deferred_cascades_to_candidates_linked_to_a_pending_one(tmp_path: Path) -> None:
+    from src.cast_freeze import demote_deferred, pending_identity_entry
+    from src.cast_freeze import immutable_name_references as references_of
+
+    units, records, candidates, _ = provisional_review_inputs(tmp_path)
+    by_label = {candidate["label"]: candidate for candidate in candidates}
+    root, linked = by_label["June"], by_label["Jun"]
+    for item in records:
+        if item["candidate_id"] == linked["id"]:
+            item["status"], item["identity"] = "known", root["id"]
+    deferred = [pending_identity_entry(root, "uncertain_living", "open", units, references_of(units))]
+    demote_deferred(records, candidates, units, deferred)
+    assert {item["status"] for item in records} == {"non_character"}
+    assert [entry["type"] for entry in deferred] == ["uncertain_living", "garbled_variant"]
+    assert deferred[1]["label"] == linked["label"] and "pending identity" in deferred[1]["reason"]
+
+
+def test_failed_provisional_link_converges_to_a_clean_batch(tmp_path: Path) -> None:
     from src.cast_freeze import discover_batch
 
     chapter, units, progress = provisional_fixture(tmp_path)
-    with pytest.raises(RuntimeError, match="independently introduced"):
-        discover_batch(tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=provisional_ask({"June": "same_provisional", "Jun": "nonidentity_fragment"}, []))
+    base = provisional_ask({"June": "same_provisional", "Jun": "nonidentity_fragment"}, [])
+
+    def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
+        # once the fragment is bound there is no provisional target to offer; the model then keeps June as its own identity
+        offered = json.dumps(response_schema or {})
+        if "label 'June' was proposed" in prompt and "same_provisional:" not in offered:
+            return new_identity_ask(lambda label, owners, line: "distinct_living_identity", [])(
+                prompt, max_tokens, max_attempts, response_schema
+            )
+        return base(prompt, max_tokens, max_attempts, response_schema)
+
+    discoveries, _ = discover_batch(tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=ask)
+    assert [item["id"] for item in discoveries] == ["june"]
+    assert pending_rows_of(tmp_path, "pending_garbled_variant") == []
 
 
 # bounded correction of invalid proposed-new review results
@@ -1140,7 +1780,11 @@ def test_same_provisional_to_non_introduced_target_fails_closed(tmp_path: Path) 
 def test_provisional_plausibility_keeps_lou_lu_and_rejects_han_sora() -> None:
     from src.cast_freeze import provisional_plausible
 
-    assert provisional_plausible("Lou", "Lu") and provisional_plausible("Jun", "June") and provisional_plausible("Mom", "Mother")
+    assert (
+        provisional_plausible("Lou", "Lu")
+        and provisional_plausible("Jun", "June")
+        and provisional_plausible("Mom", "Mother")
+    )
     assert not provisional_plausible("Mom", "Lu") and not provisional_plausible("Han", "Sora")
     # Han no Father/Mother
     assert not provisional_plausible("Han", "Father") and not provisional_plausible("Han", "Mother")
@@ -1154,18 +1798,31 @@ def test_existing_target_needs_own_mention_and_rejects_scene_participant() -> No
     registry = {"sora": {"name": "Sora"}}
     units = {"u1": {"id": "u1", "quote": "Han spoke to Sora."}, "u2": {"id": "u2", "quote": "Sora smiled."}}
     candidate = {"ref_ids": ["u1n0"]}
-    assert review_verdict_error("Han", "existing:sora", ["u1"], candidate, {}, registry, {}, units, units["u1"]) == "new-identity review maps to 'sora', a distinct participant of the same scene"
-    assert "own-label witness" in review_verdict_error("Han", "existing:sora", ["u2"], candidate, {}, registry, {}, units, units["u1"])
+    assert (
+        review_verdict_error("Han", "existing:sora", ["u1"], candidate, {}, registry, {}, units, units["u1"])
+        == "new-identity review maps to 'sora', a distinct participant of the same scene"
+    )
+    assert "own-label witness" in review_verdict_error(
+        "Han", "existing:sora", ["u2"], candidate, {}, registry, {}, units, units["u1"]
+    )
 
     # Jun/Ren own unit reject
     jun_ren_units = {"u1": {"id": "u1", "quote": "Jun stepped past Ren."}}
     ren_registry = {"ren": {"name": "Ren"}}
-    assert review_verdict_error("Jun", "existing:ren", ["u1"], candidate, {}, ren_registry, {}, jun_ren_units, jun_ren_units["u1"]) == "new-identity review maps to 'ren', a distinct participant of the same scene"
+    assert (
+        review_verdict_error(
+            "Jun", "existing:ren", ["u1"], candidate, {}, ren_registry, {}, jun_ren_units, jun_ren_units["u1"]
+        )
+        == "new-identity review maps to 'ren', a distinct participant of the same scene"
+    )
 
     # disjoint Lou/Lu reject
     lone_disjoint = {"u3": {"id": "u3", "quote": "Lou smiled."}}
     lu = {"lu": {"name": "Lu", "facts": {"look": ["Tall quiet student with a nightbat companion."]}}}
-    assert review_verdict_error("Lou", "existing:lu", ["u3"], candidate, {}, lu, {}, lone_disjoint, lone_disjoint["u3"]) == "new-identity review lacks source/registry support for existing 'lu'"
+    assert (
+        review_verdict_error("Lou", "existing:lu", ["u3"], candidate, {}, lu, {}, lone_disjoint, lone_disjoint["u3"])
+        == "new-identity review lacks source/registry support for existing 'lu'"
+    )
 
     # nightbat anchor accept
     lone = {"u3": {"id": "u3", "quote": "Lou's nightbat watched."}}
@@ -1181,12 +1838,24 @@ def test_same_provisional_rejects_enumerated_distinct_actors_and_chaining() -> N
     enum_units = {"u1": {"id": "u1", "quote": "Jun and June nodded at the gate."}}
 
     # reject enumerated distinct actors
-    err = review_verdict_error("Jun", "same_provisional:p0002", ["u1"], cand_jun, plausible, {}, {}, enum_units, enum_units["u1"])
+    err = review_verdict_error(
+        "Jun", "same_provisional:p0002", ["u1"], cand_jun, plausible, {}, {}, enum_units, enum_units["u1"]
+    )
     assert err is not None and "enumerated distinct actors" in err
 
     # no chain into existing
     cand_june_known = {"id": "p0002", "label": "June", "ref_ids": ["u1n1"], "known_owner": "taro"}
-    err_chain = review_verdict_error("Jun", "same_provisional:p0002", ["u1"], cand_jun, {"p0002": cand_june_known}, {}, {}, enum_units, enum_units["u1"])
+    err_chain = review_verdict_error(
+        "Jun",
+        "same_provisional:p0002",
+        ["u1"],
+        cand_jun,
+        {"p0002": cand_june_known},
+        {},
+        {},
+        enum_units,
+        enum_units["u1"],
+    )
     assert err_chain is not None and "cannot chain" in err_chain
 
 
@@ -1219,14 +1888,26 @@ def test_invalid_existing_target_is_reasked_without_it(tmp_path: Path) -> None:
 # the mention's own unit is deterministic input attached with provenance, never a model choice, so an exact nonidentity verdict needs no repeated own ID among all batch units.
 def review_override_ask(base, decide):
     def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
-        item = response_schema["properties"].get("mentions", {}).get("items", {}).get("properties", {}) if response_schema else {}
+        item = (
+            response_schema["properties"].get("mentions", {}).get("items", {}).get("properties", {})
+            if response_schema
+            else {}
+        )
         if "verdict" not in item:
             return base(prompt, max_tokens, max_attempts, response_schema)
         rows = []
         for line in prompt.split("MENTIONS:\n", 1)[1].splitlines():
             if "mention:" in line:
                 verdict, witnesses = decide(prompt, line.split("unit ")[1].split()[0], item["verdict"]["enum"])
-                rows.append({"mention_id": line.split()[0], "verdict": verdict, "witness_unit_ids": witnesses, "confidence": 0.9, "reason": "scene shows it"})
+                rows.append(
+                    {
+                        "mention_id": line.split()[0],
+                        "verdict": verdict,
+                        "witness_unit_ids": witnesses,
+                        "confidence": 0.9,
+                        "reason": "scene shows it",
+                    }
+                )
         return json.dumps({"mentions": rows})
 
     return ask
@@ -1236,17 +1917,30 @@ def test_nonidentity_review_accepts_zero_cited_witnesses_and_records_own_source(
     from src.cast_freeze import NEW_IDENTITY_AUDIT_NAME, discover_batch
 
     chapter = tmp_path / "ch1.txt"
-    chapter.write_text("The wind rose over the hills. Kyestus rubbed his hands near the fire. The kettle began to sing.", encoding="utf-8")
+    chapter.write_text(
+        "The wind rose over the hills. Kyestus rubbed his hands near the fire. The kettle began to sing.",
+        encoding="utf-8",
+    )
     units = immutable_evidence_units([chapter])
     progress = {"registry": {"taro": {"name": "Taro", "bio": "A teacher.", "look": ""}}, "aliases": {}}
-    ask = review_override_ask(new_identity_ask(lambda label, owners, line: "distinct_living_identity", []), lambda prompt, unit_id, options: ("nonidentity_fragment", []))
+    ask = review_override_ask(
+        new_identity_ask(lambda label, owners, line: "distinct_living_identity", []),
+        lambda prompt, unit_id, options: ("nonidentity_fragment", []),
+    )
     discoveries, _ = discover_batch(tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=ask)
     assert discoveries == []
-    record = next(r for r in json.loads((tmp_path / NEW_IDENTITY_AUDIT_NAME).read_text())["records"] if r["label"] == "Kyestus")
+    record = next(
+        r for r in json.loads((tmp_path / NEW_IDENTITY_AUDIT_NAME).read_text())["records"] if r["label"] == "Kyestus"
+    )
     own_unit = next(u for u in units if "Kyestus" in u["quote"])
     own = own_unit["id"]
     assert record["verdict"] == "nonidentity_fragment" and record["witness_unit_ids"] == [own]
-    assert record["own_source_witness"] == {"unit_id": own, "provenance": "immutable_candidate_reference", "label": "Kyestus", "span_start": own_unit["quote"].index("Kyestus")}
+    assert record["own_source_witness"] == {
+        "unit_id": own,
+        "provenance": "immutable_candidate_reference",
+        "label": "Kyestus",
+        "span_start": own_unit["quote"].index("Kyestus"),
+    }
     assert record["raw_review"]["witness_unit_ids"] == []
 
 
@@ -1262,7 +1956,9 @@ def test_many_conflicting_scopes_reviewed_once_over_compact_episodes(tmp_path: P
 
     chapter = tmp_path / "ch1.txt"
     count = NEW_IDENTITY_MENTIONS_PER_CALL * 2 + 1
-    chapter.write_text("Lu waited by the gate. " + " ".join(f"Lou nodded at post {index}." for index in range(count)), encoding="utf-8")
+    chapter.write_text(
+        "Lu waited by the gate. " + " ".join(f"Lou nodded at post {index}." for index in range(count)), encoding="utf-8"
+    )
     units = immutable_evidence_units([chapter])
     progress = {"registry": {"lu": {"name": "Lu", "bio": "Sister of Taro.", "look": ""}}, "aliases": {}}
     anchor = units[0]["id"]
@@ -1282,7 +1978,9 @@ def test_many_conflicting_scopes_reviewed_once_over_compact_episodes(tmp_path: P
     episodes = seen[0].split("CONTINUOUS SOURCE EPISODES", 1)[1].split("MENTIONS:", 1)[0]
     assert all(episodes.count(f"[{unit['id']}]") == 1 for unit in units)
     records = json.loads((tmp_path / NEW_IDENTITY_AUDIT_NAME).read_text())["records"]
-    assert len([r for r in records if r["label"] == "Lou"]) == count and all(r["verdict"] == "existing:lu" and r.get("reconciled") for r in records if r["label"] == "Lou")
+    assert len([r for r in records if r["label"] == "Lou"]) == count and all(
+        r["verdict"] == "existing:lu" and r.get("reconciled") for r in records if r["label"] == "Lou"
+    )
 
 
 # ##################################################################
@@ -1310,8 +2008,16 @@ def test_consistency_review_reasks_invalid_same_provisional_with_option_removed(
 
     ask = review_override_ask(new_identity_ask(lambda label, owners, line: "distinct_living_identity", []), decide)
     discover_batch(tmp_path, 0, [chapter], units, chapter.read_text(), progress, set(), ask=ask)
-    assert len(reasks) == 1 and "CONSISTENCY REVIEW" in reasks[0][0] and not any(option.startswith("same_provisional:") for option in reasks[0][1])
-    records = {r["witness_unit_ids"][0]: r for r in json.loads((tmp_path / NEW_IDENTITY_AUDIT_NAME).read_text())["records"] if r["label"] == "Jun"}
+    assert (
+        len(reasks) == 1
+        and "CONSISTENCY REVIEW" in reasks[0][0]
+        and not any(option.startswith("same_provisional:") for option in reasks[0][1])
+    )
+    records = {
+        r["witness_unit_ids"][0]: r
+        for r in json.loads((tmp_path / NEW_IDENTITY_AUDIT_NAME).read_text())["records"]
+        if r["label"] == "Jun"
+    }
     assert records[first_unit]["verdict"] == "distinct_living_identity" and records[first_unit]["reconciled"]
     assert records[first_unit]["history"][-1]["verdict"] == "distinct_living_identity"
 
@@ -1323,7 +2029,10 @@ def variant_fixture(tmp_path: Path):
     from src.cast_freeze import candidate_coverage_ledger, immutable_evidence_units
 
     chapter = tmp_path / "ch1.txt"
-    chapter.write_text("Kyle raised a shield beside the gate. Taro watched while Ky grinned. Kyle nodded at the gate.", encoding="utf-8")
+    chapter.write_text(
+        "Kyle raised a shield beside the gate. Taro watched while Ky grinned. Kyle nodded at the gate.",
+        encoding="utf-8",
+    )
     units = immutable_evidence_units([chapter])
     candidates = candidate_coverage_ledger(units, {"taro": {"name": "Taro", "bio": "A teacher.", "look": ""}}, {})
     by_label = {candidate["label"]: candidate for candidate in candidates}
@@ -1337,15 +2046,29 @@ def test_variant_refs_follow_known_to_new_root_with_guards(tmp_path: Path) -> No
     units_by_id = {unit["id"]: unit for unit in units}
     references = immutable_name_references(units)
     root, short = by_label["Kyle"], by_label["Ky"]
-    records = [{"candidate_id": root["id"], "status": "new", "identity": root["id"], "evidence_unit_ids": ["x"]}, {"candidate_id": short["id"], "status": "known", "identity": root["id"], "evidence_unit_ids": ["x"]}]
+    records = [
+        {"candidate_id": root["id"], "status": "new", "identity": root["id"], "evidence_unit_ids": ["x"]},
+        {"candidate_id": short["id"], "status": "known", "identity": root["id"], "evidence_unit_ids": ["x"]},
+    ]
     variants = provisional_variant_refs(candidates, records, references, units_by_id)
     assert [v["candidate"]["id"] for v in variants[root["id"]]] == [short["id"]]
     # cycle: the root pointing back at its variant yields no root at all
     cyclic = [{**records[0], "status": "known", "identity": short["id"]}, records[1]]
     assert provisional_variant_refs(candidates, cyclic, references, units_by_id) == {}
     # a root that is not a living new identity (or a registry-bound short form) is no provisional root
-    assert provisional_variant_refs(candidates, [{**records[0], "status": "non_character", "identity": "none"}, records[1]], references, units_by_id) == {}
-    assert provisional_variant_refs(candidates, [records[0], {**records[1], "identity": "taro"}], references, units_by_id) == {}
+    assert (
+        provisional_variant_refs(
+            candidates,
+            [{**records[0], "status": "non_character", "identity": "none"}, records[1]],
+            references,
+            units_by_id,
+        )
+        == {}
+    )
+    assert (
+        provisional_variant_refs(candidates, [records[0], {**records[1], "identity": "taro"}], references, units_by_id)
+        == {}
+    )
     # literal guard: a reference whose label bytes are not at its recorded span is dropped
     forged = {ref_id: {**reference, "start": reference["start"] + 1} for ref_id, reference in references.items()}
     assert provisional_variant_refs(candidates, records, forged, units_by_id) == {}
@@ -1369,7 +2092,10 @@ def test_new_root_review_prompt_carries_variant_refs_and_distinct_guidance(tmp_p
     assert "SOURCE-PROVISIONAL VARIANT REFS" in review and "label 'Ky' (" + short["id"] + ")" in review
     episodes = review.split("CONTINUOUS SOURCE EPISODES", 1)[1].split("SOURCE-PROVISIONAL VARIANT REFS", 1)[0]
     assert episodes.count(f"[{units[1]['id']}]") == 1 and "scene: episode E1" in review
-    assert "No existing match is NOT the same as nonliving or uncertain" in review and "supports distinct_living_identity" in review
+    assert (
+        "No existing match is NOT the same as nonliving or uncertain" in review
+        and "supports distinct_living_identity" in review
+    )
 
 
 # ##################################################################
@@ -1385,11 +2111,21 @@ def test_episode_anchor_supports_owner_without_literal_name_or_citation(tmp_path
     units = {"u3": {"id": "u3", "quote": "Lou smiled."}, "u4": {"id": "u4", "quote": "A nightbat watched."}}
     lu = {"lu": {"name": "Lu", "facts": {"look": ["Tall quiet student with a nightbat companion."]}}}
     candidate = {"ref_ids": ["u3n0"]}
-    assert review_verdict_error("Lou", "existing:lu", ["u3"], candidate, {}, lu, {}, units, units["u3"]) == "new-identity review lacks source/registry support for existing 'lu'"
-    assert review_verdict_error("Lou", "existing:lu", ["u3"], candidate, {}, lu, {}, units, units["u3"], [units["u3"], units["u4"]]) is None
+    assert (
+        review_verdict_error("Lou", "existing:lu", ["u3"], candidate, {}, lu, {}, units, units["u3"])
+        == "new-identity review lacks source/registry support for existing 'lu'"
+    )
+    assert (
+        review_verdict_error(
+            "Lou", "existing:lu", ["u3"], candidate, {}, lu, {}, units, units["u3"], [units["u3"], units["u4"]]
+        )
+        is None
+    )
 
     chapter = tmp_path / "ch1.txt"
-    chapter.write_text("The nightbat circled the gate. Lou nodded at the post. Lou grinned by the post later.", encoding="utf-8")
+    chapter.write_text(
+        "The nightbat circled the gate. Lou nodded at the post. Lou grinned by the post later.", encoding="utf-8"
+    )
     source_units = immutable_evidence_units([chapter])
     anchor = source_units[0]["id"]
     progress = {"registry": {"lu": {"name": "Lu", "bio": "A student.", "look": "Owns a nightbat."}}, "aliases": {}}
@@ -1402,32 +2138,51 @@ def test_episode_anchor_supports_owner_without_literal_name_or_citation(tmp_path
     ask = review_override_ask(new_identity_ask(lambda label, owners, line: "distinct_living_identity", []), decide)
     discoveries, _ = discover_batch(tmp_path, 0, [chapter], source_units, chapter.read_text(), progress, set(), ask=ask)
     assert discoveries == []
-    records = [r for r in json.loads((tmp_path / NEW_IDENTITY_AUDIT_NAME).read_text())["records"] if r["label"] == "Lou"]
+    records = [
+        r for r in json.loads((tmp_path / NEW_IDENTITY_AUDIT_NAME).read_text())["records"] if r["label"] == "Lou"
+    ]
     assert records and all(r["verdict"] == "existing:lu" for r in records)
     reconciled = next(r for r in records if r["witness_unit_ids"][0] == source_units[2]["id"])
-    assert reconciled["provenance"]["witness_unit_id"] == anchor == reconciled["episode_support_unit_id"] and anchor in reconciled["witness_unit_ids"]
-    assert reconciled["own_source_witness"]["unit_id"] == source_units[2]["id"] and reconciled["raw_review"]["witness_unit_ids"] == []
+    assert (
+        reconciled["provenance"]["witness_unit_id"] == anchor == reconciled["episode_support_unit_id"]
+        and anchor in reconciled["witness_unit_ids"]
+    )
+    assert (
+        reconciled["own_source_witness"]["unit_id"] == source_units[2]["id"]
+        and reconciled["raw_review"]["witness_unit_ids"] == []
+    )
 
 
 def test_root_is_offered_through_its_variant_refs_label(tmp_path: Path) -> None:
     from src.cast_freeze import candidate_coverage_ledger, review_proposed_identities
 
     chapter = tmp_path / "ch1.txt"
-    chapter.write_text("Sparrow Tail drew a bow beside the gate. Jun grinned at the gate. Junn cheered at the gate.", encoding="utf-8")
+    chapter.write_text(
+        "Sparrow Tail drew a bow beside the gate. Jun grinned at the gate. Junn cheered at the gate.", encoding="utf-8"
+    )
     units = immutable_evidence_units([chapter])
     candidates = candidate_coverage_ledger(units, {}, {})
     by_label = {candidate["label"]: candidate for candidate in candidates}
     root, variant, typo = by_label["Sparrow Tail"], by_label["Jun"], by_label["Junn"]
     records = [
         {"candidate_id": root["id"], "status": "new", "identity": root["id"], "evidence_unit_ids": [units[0]["id"]]},
-        {"candidate_id": variant["id"], "status": "known", "identity": root["id"], "evidence_unit_ids": [units[1]["id"]]},
+        {
+            "candidate_id": variant["id"],
+            "status": "known",
+            "identity": root["id"],
+            "evidence_unit_ids": [units[1]["id"]],
+        },
         {"candidate_id": typo["id"], "status": "new", "identity": typo["id"], "evidence_unit_ids": [units[2]["id"]]},
     ]
     options: dict[str, list[str]] = {}
     base = new_identity_ask(lambda label, owners, line: "distinct_living_identity", [])
 
     def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
-        item = response_schema["properties"].get("mentions", {}).get("items", {}).get("properties", {}) if response_schema else {}
+        item = (
+            response_schema["properties"].get("mentions", {}).get("items", {}).get("properties", {})
+            if response_schema
+            else {}
+        )
         if "verdict" in item:
             options[prompt.split("label ", 1)[1].split(" was proposed")[0].strip("'")] = item["verdict"]["enum"]
         return base(prompt, max_tokens, max_attempts, response_schema)

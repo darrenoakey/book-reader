@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from src.audio_synth import concat_wavs, split_long_text, synthesize_chapter
+from src.data_recovery import DataIssue, RecoveryLedger
 
 
 # ##################################################################
@@ -111,7 +112,7 @@ def test_synthesize_chapter_idempotent() -> None:
 
 # ##################################################################
 # test synthesize chapter unknown speaker
-# a line for an unknown speaker with no narrator fallback is a hard error
+# a line for an unknown speaker with no narrator fallback is quarantined with evidence; a chapter with no usable line is a typed data issue
 def test_synthesize_chapter_unknown_speaker() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -120,5 +121,9 @@ def test_synthesize_chapter_unknown_speaker() -> None:
         audio_dir.mkdir()
         script_path = tmp / "02-test.jsonl"
         script_path.write_text('{"ghost": "boo"}\n')
-        with pytest.raises(ValueError):
+        with pytest.raises(DataIssue) as caught:
             synthesize_chapter(script_path, audio_dir, voices_dir, {"alice"})
+        assert caught.value.code == "script_no_usable_lines"
+        recorded = RecoveryLedger(tmp).entries()
+        assert [r["code"] for r in recorded] == ["script_speaker_unknown"]
+        assert recorded[0]["evidence"]["line"] == 1

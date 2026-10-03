@@ -17,6 +17,7 @@ from src.cast_freeze import (
     CONTEXT_RESOLUTION_V2_CONTRACT,
     CONTEXT_RESOLUTION_V2_NAME,
     CONTEXT_V2_STAGE,
+    DISTINCT_VERDICT,
     MANIFEST_NAME,
     REJECTIONS_NAME,
     SCOPED_AUDIT_NAME,
@@ -37,12 +38,15 @@ from src.cast_freeze import (
     materialize_classifications,
     memoized_model_ask,
     partition_classification_chunk,
+    proposal_sha,
     record_rejected_discovery,
     refresh_alias_audit,
     restore_cached_model_records,
     source_label_present,
     validate_classification_chunk,
     validate_preparation_coverage,
+    variant_draft_actor,
+    variant_root_approval_gate,
     verify_frozen_cast,
 )
 from src.data_recovery import OperationalError, RecoveryLedger
@@ -1407,7 +1411,34 @@ def v2_row(chapters: list[Path], chapter: int, label: str, decision: str, target
     }
 
 
-def v2_payload(rows: list[dict], sha: str = V2_SOURCE_SHA) -> dict:
+def v2_witness(chapters: list[Path], chapter: int, index: int) -> dict:
+    unit = immutable_evidence_units([chapters[chapter]])[index]
+    return {
+        "chapter_file": chapters[chapter].name,
+        "chapter_sha256": unit["chapter_sha256"],
+        "unit_id": unit["id"],
+        "unit_quote": unit["quote"],
+        "unit_quote_sha256": hashlib.sha256(unit["quote"].encode()).hexdigest(),
+    }
+
+
+def v2_draft(chapters: list[Path], actor_id: str = "zed", name: str = "Zed", cited: bool = True) -> dict:
+    """A draft shaped like the caretaker's: bio/look text plus (when cited) per-field source citations."""
+    draft = {
+        "actor_id": actor_id,
+        "name": name,
+        "kind": "person",
+        "bio": "Appears at the gate and later carries a lantern.",
+        "look": "Carries a lantern.",
+        "status": "DRAFT - not approved",
+        "witnesses": [v2_witness(chapters, 0, 3), v2_witness(chapters, 1, 0)],
+    }
+    if cited:
+        draft["citations"] = {"bio": [v2_witness(chapters, 0, 3), v2_witness(chapters, 1, 0)], "look": [v2_witness(chapters, 1, 0)]}
+    return draft
+
+
+def v2_payload(rows: list[dict], sha: str = V2_SOURCE_SHA, drafts: list[dict] | None = None) -> dict:
     return {
         "contract": CONTEXT_RESOLUTION_V2_CONTRACT,
         "source_book_sha256": sha,
@@ -1416,7 +1447,7 @@ def v2_payload(rows: list[dict], sha: str = V2_SOURCE_SHA) -> dict:
         "rows": rows,
         "unhandled_labels": [],
         "actor_quality_flags": [{"registry_id": "ana", "proposal": "ignored"}],
-        "new_actor_drafts": [{"actor_id": "zed", "status": "DRAFT - not approved"}],
+        "new_actor_drafts": drafts or [],
         "summary": {},
     }
 
@@ -1528,6 +1559,414 @@ def test_context_resolution_v2_source_violations_fail_closed(tmp_path: Path) -> 
     with pytest.raises(OperationalError):
         ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, {}, RecoveryLedger(tmp_path))
     assert not (tmp_path / SCOPED_AUDIT_NAME).exists()
+
+
+def _write_v2(tmp_path: Path, rows: list[dict], drafts: list[dict]) -> bytes:
+    (tmp_path / CONTEXT_RESOLUTION_V2_NAME).write_text(json.dumps(v2_payload(rows, drafts=drafts)), encoding="utf-8")
+    return (tmp_path / CONTEXT_RESOLUTION_V2_NAME).read_bytes()
+
+
+def _draft_rows(chapters: list[Path]) -> list[dict]:
+    rows = [
+        v2_row(chapters, 0, "Zed", "new_actor", "zed", 1),
+        v2_row(chapters, 1, "Zed", "new_actor", "zed", 0),
+        v2_row(chapters, 0, "Professor", "new_actor", "zed", 0),  # a title variant of the same draft
+    ]
+    rows[2]["provenance"] = {"author": "caretaker", "method": "variant"}
+    return rows
+
+
+def _draft_pending(open_rows: list[dict]) -> list[dict]:
+    return [row for row in open_rows if row["item"].startswith("variant_draft:")]
+
+
+def test_variant_draft_becomes_one_pending_root_with_per_scope_provenance(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    before_input = _write_v2(tmp_path, _draft_rows(chapters), [v2_draft(chapters)])
+    aliases = {"ana": "ana"}
+    recovery = RecoveryLedger(tmp_path)
+
+    open_rows = ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, aliases, recovery)
+
+    roots = _draft_pending(open_rows)
+    assert [row["code"] for row in roots] == ["context_variant_draft_root"]
+    assert sorted(row["code"] for row in open_rows if row not in roots) == ["context_new_actor"] * 3  # still block freeze
+    stored = [json.loads(line) for line in (tmp_path / "cast_pending_proposals.jsonl").read_text().splitlines()]
+    assert len(stored) == 1
+    root = stored[0]
+    assert root["status"] == "pending_proposal_not_approved" and root["actor_id"] == "zed"
+    assert roots[0]["evidence"]["proposal_sha256"] == proposal_sha(root)
+    assert roots[0]["evidence"]["proposal_sha256"] == hashlib.sha256(
+        (tmp_path / "cast_pending_proposals.jsonl").read_text().splitlines()[0].encode()
+    ).hexdigest()
+    assert sorted(variant["label"] for variant in root["variants"]) == ["Professor", "Zed"]
+    zed = next(variant for variant in root["variants"] if variant["label"] == "Zed")
+    assert len(zed["scopes"]) == 2
+    professor = next(variant for variant in root["variants"] if variant["label"] == "Professor")
+    assert professor["scopes"][0]["provenance"] == {"author": "caretaker", "method": "variant"}
+    for variant in root["variants"]:
+        for scope in variant["scopes"]:
+            assert scope["scope"]["chapter_sha256"] and scope["scope"]["quote_sha256"] and scope["witnesses"]
+    # complete citations travel with the draft, each with its exact source quote
+    assert root["citations"]["bio"] and root["citations"]["look"]
+    assert all(c["unit_quote"] and c["unit_quote_sha256"] for c in root["citations"]["bio"] + root["citations"]["look"])
+    # every included mention carries its validated linkage: here each shares an immutable unit with the draft's facts
+    for variant in root["variants"]:
+        for scope in variant["scopes"]:
+            assert scope["link"]["kind"] == "shared_immutable_unit" and scope["link"]["units"]
+    assert roots[0]["evidence"]["unlinked_excluded"] == [] and roots[0]["evidence"]["scope_count"] == 3
+    assert "source_clusters" not in root
+    # nothing was approved: input, registry, aliases and scoped audit are untouched; replay is idempotent
+    assert (tmp_path / CONTEXT_RESOLUTION_V2_NAME).read_bytes() == before_input
+    assert registry == {"ana": {"name": "Ana", "bio": "a scout"}} and aliases == {"ana": "ana"}
+    assert not (tmp_path / SCOPED_AUDIT_NAME).exists()
+    size = len(recovery.entries())
+    again = ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, aliases, recovery)
+    assert len(again) == len(open_rows) and len(recovery.entries()) == size
+    assert len((tmp_path / "cast_pending_proposals.jsonl").read_text().splitlines()) == 1
+
+
+def test_variant_draft_without_full_bio_look_citations_never_becomes_a_root(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    rows = _draft_rows(chapters)
+
+    def stage(draft: dict) -> list[dict]:
+        result = adapt_context_resolution_v2(
+            v2_payload(rows, drafts=[draft]), V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, []
+        )
+        draft_rows = [p for p in result["pending"] if p["item"].startswith("variant_draft:")]
+        assert bool(result["roots"]) == (draft_rows[0]["code"] == "context_variant_draft_root")
+        return draft_rows
+
+    uncited = stage(v2_draft(chapters, cited=False))  # the legacy shape: witnesses only, no per-field citations
+    assert [p["code"] for p in uncited] == ["context_variant_draft_incomplete"]
+    assert uncited[0]["missing"] == ["bio has no source citations", "look has no source citations"]
+    only_bio = v2_draft(chapters)
+    only_bio["citations"]["look"] = []
+    assert stage(only_bio)[0]["missing"] == ["look has no source citations"]
+    only_look = v2_draft(chapters)
+    only_look["citations"]["bio"] = []
+    assert stage(only_look)[0]["missing"] == ["bio has no source citations"]
+    # the explicit no-visual-details sentinel is the only look that needs no citation
+    sentinel = v2_draft(chapters)
+    sentinel["look"] = "no visual details given"
+    sentinel["citations"]["look"] = []
+    assert [p["code"] for p in stage(sentinel)] == ["context_variant_draft_root"]
+    empty = v2_draft(chapters)
+    empty["bio"] = " "
+    assert stage(empty)[0]["missing"] == ["bio text is empty"]
+    # a draft with no new_actor mention has no per-scope provenance, so it is not a root either
+    lone = adapt_context_resolution_v2(
+        v2_payload([], drafts=[v2_draft(chapters)]), V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, []
+    )
+    assert lone["roots"] == [] and [p["code"] for p in lone["pending"]] == ["context_variant_draft_no_mentions"]
+
+
+def test_variant_draft_never_mints_a_duplicate(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    rows = _draft_rows(chapters)
+
+    def codes(drafts: list[dict], reg: dict, aliases: dict, with_rows: list[dict] = rows) -> dict[str, str]:
+        result = adapt_context_resolution_v2(v2_payload(with_rows, drafts=drafts), V2_SOURCE_SHA, chapters, reg, aliases, [])
+        return {
+            f"variant_draft:{variant_draft_actor(p['item'])}": p["code"]
+            for p in result["pending"]
+            if p["item"].startswith("variant_draft:")
+        } | {"roots": str(len(result["roots"]))}
+
+    assert codes([v2_draft(chapters)], registry, {"ana": "ana"}) == {"variant_draft:zed": "context_variant_draft_root", "roots": "1"}
+    # already registered, already an alias, or sharing a name word with a registered actor
+    assert codes([v2_draft(chapters)], {**registry, "zed": {"name": "Zed"}}, {"zed": "zed"})["roots"] == "0"
+    assert codes([v2_draft(chapters)], registry, {"ana": "ana", "zed": "ana"}) == {
+        "variant_draft:zed": "context_variant_draft_duplicate",
+        "roots": "0",
+    }
+    named = v2_draft(chapters, actor_id="lord_ana", name="Lord Ana")
+    assert codes([named], registry, {"ana": "ana"}, [v2_row(chapters, 0, "Zed", "new_actor", "lord_ana", 1)]) == {
+        "variant_draft:lord_ana": "context_variant_draft_duplicate",
+        "roots": "0",
+    }
+    # two drafts with the same name, or both claiming one label variant, block each other
+    twin = v2_draft(chapters, actor_id="zed_two", name="Zed")
+    assert codes([v2_draft(chapters), twin], registry, {"ana": "ana"}) == {
+        "variant_draft:zed": "context_variant_draft_duplicate",
+        "variant_draft:zed_two": "context_variant_draft_duplicate",
+        "roots": "0",
+    }
+    contested = [rows[0], v2_row(chapters, 1, "Zed", "new_actor", "zephyr", 0)]  # the spelling "Zed" is offered to both
+    assert codes([v2_draft(chapters), v2_draft(chapters, "zephyr", "Zephyr")], registry, {"ana": "ana"}, contested) == {
+        "variant_draft:zed": "context_variant_draft_duplicate",
+        "variant_draft:zephyr": "context_variant_draft_duplicate",
+        "roots": "0",
+    }
+    # duplicate draft ids are an invalid file, not a silent merge
+    with pytest.raises(OperationalError):
+        codes([v2_draft(chapters), v2_draft(chapters)], registry, {"ana": "ana"})
+
+
+def test_variant_draft_source_and_approval_violations_fail_closed(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    rows = _draft_rows(chapters)
+
+    def adapt(draft: object) -> dict:
+        return adapt_context_resolution_v2(
+            {**v2_payload(rows), "new_actor_drafts": [draft]}, V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, []
+        )
+
+    assert len(adapt(v2_draft(chapters))["roots"]) == 1
+    mutate = [
+        ("approved", lambda d: d.update(status="APPROVED")),
+        ("bad id", lambda d: d.update(actor_id="Bad Id")),
+        ("no name", lambda d: d.update(name=" ")),
+        ("missing key", lambda d: d.pop("bio")),
+        ("bio citation quote", lambda d: d["citations"]["bio"][0].update(unit_quote="invented")),
+        ("look citation sha", lambda d: d["citations"]["look"][0].update(chapter_sha256="0" * 64)),
+        ("witness unit", lambda d: d["witnesses"][0].update(unit_id="c00s99999")),
+        ("citation field", lambda d: d["citations"].update(voice=[])),
+        ("citations type", lambda d: d.update(citations=[])),
+    ]
+    for _name, change in mutate:
+        draft = json.loads(json.dumps(v2_draft(chapters)))
+        change(draft)
+        with pytest.raises(OperationalError):
+            adapt(draft)
+    with pytest.raises(OperationalError):
+        adapt("not a draft")
+    with pytest.raises(OperationalError):
+        adapt_context_resolution_v2(
+            {**v2_payload(rows), "new_actor_drafts": "x"}, V2_SOURCE_SHA, chapters, registry, {}, []
+        )
+
+
+def test_variant_draft_pending_rows_close_only_on_real_state_change(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    rows = _draft_rows(chapters)
+    recovery = RecoveryLedger(tmp_path)
+
+    def ingest(drafts: list[dict], reg: dict, use: list[dict] = rows) -> list[dict]:
+        _write_v2(tmp_path, use, drafts)
+        return _draft_pending(ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, reg, {"ana": "ana"}, recovery))
+
+    assert [r["code"] for r in ingest([v2_draft(chapters, cited=False)], registry)] == ["context_variant_draft_incomplete"]
+    # citations arrive: the incomplete row is superseded by an appended resolution and the root is pending
+    assert [r["code"] for r in ingest([v2_draft(chapters)], registry)] == ["context_variant_draft_root"]
+    assert [e["severity"] for e in recovery.entries() if variant_draft_actor(e["item"]) == "zed"] == ["pending", "pending", "resolved"]
+    # omitting the draft while its new_actor mentions remain never resolves it
+    assert [r["code"] for r in ingest([], registry)] == ["context_variant_draft_root"]
+    # once nothing in the file names the draft, the draft-level row closes (each mention row has its own pending/resolution)
+    assert ingest([], registry, []) == []
+    # a root whose actor was registered through the real registry path is closed, never minted here
+    assert [r["code"] for r in ingest([v2_draft(chapters, "zed2", "Zed Two")], registry, [v2_row(chapters, 0, "Zed", "new_actor", "zed2", 1)])] == [
+        "context_variant_draft_root"
+    ]
+    registered = {**registry, "zed2": {"name": "Zed Two"}}
+    assert [r["code"] for r in ingest([], registered, [v2_row(chapters, 0, "Zed", "new_actor", "zed2", 1)])] == []
+    assert registered["zed2"] == {"name": "Zed Two"}
+
+
+def kin_fixture(tmp_path: Path) -> list[Path]:
+    path = tmp_path / "01-part_01.txt"
+    path.write_text(
+        "Zed appeared at the gate. The hall was quiet. Auntie waved from the porch. Auntie is the sister of Zed. "
+        "Rain fell on the roof. Dust blew.",
+        encoding="utf-8",
+    )
+    other = tmp_path / "02-part_02.txt"
+    other.write_text("Zed left. Auntie is the sister of Zed.", encoding="utf-8")
+    return [path, other]
+
+
+def kin_row(chapters: list[Path], label: str, chapter: int, index: int, witness_index: int) -> dict:
+    unit = immutable_evidence_units([chapters[chapter]])[index]
+    row = v2_row(chapters, chapter, label, "new_actor", "zed", chapter)
+    witness = v2_witness(chapters, chapter, witness_index)
+    row.update(
+        main_unit_id=unit["id"],
+        main_unit_quote=unit["quote"],
+        main_unit_quote_sha256=hashlib.sha256(unit["quote"].encode()).hexdigest(),
+        span_start=unit["quote"].index(label),
+        witnesses=[{**witness, "role": "preceding_unit"}],
+    )
+    return row
+
+
+def kin_link(chapters: list[Path], kind: str, witnesses: list[tuple[int, int]], chapter: int = 0, index: int = 2) -> dict:
+    unit = immutable_evidence_units([chapters[chapter]])[index]
+    return {
+        "kind": kind,
+        "chapter_file": chapters[chapter].name,
+        "chapter_sha256": unit["chapter_sha256"],
+        "main_unit_id": unit["id"],
+        "label": "Auntie",
+        "span_start": unit["quote"].index("Auntie"),
+        "witnesses": [v2_witness(chapters, c, i) for c, i in witnesses],
+    }
+
+
+def stage_kin(chapters: list[Path], registry: dict, links: list[dict]) -> dict:
+    draft = {**v2_draft(chapters), "variant_links": links}
+    draft["witnesses"] = draft["citations"]["bio"] = [v2_witness(chapters, 0, 0)]
+    draft["citations"]["look"] = [v2_witness(chapters, 0, 0)]
+    rows = [kin_row(chapters, "Zed", 0, 0, 0), kin_row(chapters, "Auntie", 0, 2, 1)]
+    return adapt_context_resolution_v2(v2_payload(rows, drafts=[draft]), V2_SOURCE_SHA, chapters, registry, {}, [])
+
+
+def test_variant_root_includes_only_mentions_with_validated_linkage(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    linked = _draft_rows(chapters)
+    # "Mom" shares no immutable unit with the draft's facts (its neighbour names Professor, not the draft) and has no link
+    stray = v2_row(chapters, 0, "Mom", "new_actor", "zed", 0)
+    result = adapt_context_resolution_v2(
+        v2_payload([*linked, stray], drafts=[v2_draft(chapters)]), V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, []
+    )
+    (root,) = result["roots"]
+    assert sorted(variant["label"] for variant in root["variants"]) == ["Professor", "Zed"]
+    row = next(item for item in result["pending"] if item["code"] == "context_variant_draft_root")
+    assert row["scope_count"] == 3
+    assert [(item["scope"]["label"], item["why"]) for item in row["unlinked_excluded"]] == [
+        ("Mom", "no shared immutable unit with the draft facts and no explicit link")
+    ]
+    # the stray mention itself stays its own pending context_new_actor row and is never silently merged
+    assert [item["code"] for item in result["pending"] if item["item"].startswith("context:") and "Mom" in item["item"]] == [
+        "context_new_actor"
+    ]
+    # with no linked mention at all there is no root, only a typed unlinked gap
+    only = adapt_context_resolution_v2(
+        v2_payload([stray], drafts=[v2_draft(chapters)]), V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, []
+    )
+    assert only["roots"] == [] and [p["code"] for p in only["pending"] if p["item"].startswith("variant_draft:")] == [
+        "context_variant_draft_unlinked"
+    ]
+    # a shared unit counts only when it literally carries the mention's label or the draft's name
+    off_topic = v2_draft(chapters)
+    off_topic["witnesses"] = off_topic["citations"]["bio"] = off_topic["citations"]["look"] = [v2_witness(chapters, 0, 0)]
+    quiet = adapt_context_resolution_v2(
+        v2_payload([stray], drafts=[off_topic]), V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, []
+    )
+    assert quiet["roots"] == []
+
+
+def test_variant_root_accepts_explicit_source_validated_kinship_and_participant_links(tmp_path: Path) -> None:
+    chapters = kin_fixture(tmp_path)
+    registry = {"ana": {"name": "Ana", "bio": "a scout"}}
+    # without a link the Auntie mention is excluded; Zed alone still forms the root
+    bare = stage_kin(chapters, registry, [])
+    assert [v["label"] for v in bare["roots"][0]["variants"]] == ["Zed"]
+    kin = stage_kin(chapters, registry, [kin_link(chapters, "kinship", [(0, 3)])])
+    auntie = next(v for v in kin["roots"][0]["variants"] if v["label"] == "Auntie")
+    assert auntie["scopes"][0]["link"]["kind"] == "kinship" and auntie["scopes"][0]["link"]["witnesses"]
+    scene = stage_kin(chapters, registry, [kin_link(chapters, "continuous_participant", [(0, 2), (0, 0)])])
+    auntie = next(v for v in scene["roots"][0]["variants"] if v["label"] == "Auntie")
+    assert auntie["scopes"][0]["link"]["kind"] == "continuous_participant"
+    # a link whose witnesses do not prove it leaves the mention excluded, never merged
+    for links in (
+        [kin_link(chapters, "kinship", [(0, 1)])],  # real unit, but names neither Auntie nor Zed
+        [kin_link(chapters, "kinship", [(0, 0)])],  # names Zed but not the mention's label
+        [kin_link(chapters, "kinship", [(1, 1)])],  # names both, but in another chapter: outside this mention's scene
+        [kin_link(chapters, "continuous_participant", [(0, 2)])],  # label but no draft name in the scene
+        [kin_link(chapters, "continuous_participant", [(1, 1), (0, 0)])],  # the label unit is outside the mention's scene
+    ):
+        staged = stage_kin(chapters, registry, links)
+        assert [v["label"] for v in staged["roots"][0]["variants"]] == ["Zed"]
+    # source-invalid or foreign links fail the whole file closed
+    forged = kin_link(chapters, "kinship", [(0, 3)])
+    forged["witnesses"][0]["unit_quote"] = "invented"
+    with pytest.raises(OperationalError):
+        stage_kin(chapters, registry, [forged])
+    for bad in (
+        {**kin_link(chapters, "kinship", [(0, 3)]), "kind": "friendship"},
+        {**kin_link(chapters, "kinship", [(0, 3)]), "witnesses": []},
+        {**kin_link(chapters, "kinship", [(0, 3)]), "span_start": 3},
+        {**kin_link(chapters, "kinship", [(0, 3)]), "extra": 1},
+        kin_link(chapters, "kinship", [(0, 3)], index=3),  # an exact span, but not one of this draft's mentions
+    ):
+        with pytest.raises(OperationalError):
+            stage_kin(chapters, registry, [bad])
+
+
+def test_variant_root_serializes_to_the_pending_proposal_file_without_overwrite_or_replay_duplicates(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    existing = {"type": "new_identity", "id": "someone", "mentions": []}  # a line the demoted-identity lane already stored
+    (tmp_path / "cast_pending_proposals.jsonl").write_text(json.dumps(existing, sort_keys=True) + "\n", encoding="utf-8")
+    recovery = RecoveryLedger(tmp_path)
+    rows = _draft_rows(chapters)
+    _write_v2(tmp_path, rows, [v2_draft(chapters)])
+    first = _draft_pending(ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, recovery))
+    lines = (tmp_path / "cast_pending_proposals.jsonl").read_text().splitlines()
+    assert len(lines) == 2 and json.loads(lines[0]) == existing  # appended, the prior proposal is untouched
+    for _ in range(3):  # replays neither duplicate the proposal nor the ledger row
+        ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, recovery)
+    assert (tmp_path / "cast_pending_proposals.jsonl").read_text().splitlines() == lines
+    assert len([e for e in recovery.entries() if e["item"].startswith("variant_draft:")]) == 1
+    # a changed root (a new mention is added) is a NEW proposal line and a NEW ledger row; the old row is superseded
+    more = [*rows, v2_row(chapters, 0, "Mom", "new_actor", "zed", 0)]
+    more[-1]["witnesses"] = [{**v2_witness(chapters, 0, 3), "role": "keyword_witness:Zed"}]
+    _write_v2(tmp_path, more, [v2_draft(chapters)])
+    second = _draft_pending(ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, registry, {"ana": "ana"}, recovery))
+    after = (tmp_path / "cast_pending_proposals.jsonl").read_text().splitlines()
+    assert len(after) == 3 and after[:2] == lines
+    assert [r["evidence"]["proposal_sha256"] for r in first] != [r["evidence"]["proposal_sha256"] for r in second]
+    assert second[0]["evidence"]["proposal_sha256"] == hashlib.sha256(after[2].encode()).hexdigest()
+    assert len(second) == 1  # the superseded row is closed, only the current root stays pending
+
+
+def _review_records(root: dict) -> list[dict]:
+    return [
+        {
+            "chapter_sha256": item["scope"]["chapter_sha256"],
+            "quote_sha256": item["scope"]["quote_sha256"],
+            "label": item["scope"]["label"],
+            "span_start": item["scope"]["span_start"],
+            "verdict": DISTINCT_VERDICT,
+            "own_source_witness": {
+                "unit_id": item["scope"]["unit_id"],
+                "provenance": "immutable_candidate_reference",
+                "label": item["scope"]["label"],
+                "span_start": item["scope"]["span_start"],
+            },
+            "confidence": 0.0,  # confidence is never evidence in either direction
+        }
+        for variant in root["variants"]
+        for item in variant["scopes"]
+    ]
+
+
+def test_variant_root_approval_gate_needs_strong_facts_and_never_changes_the_registry(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    aliases = {"ana": "ana"}
+    result = adapt_context_resolution_v2(
+        v2_payload(_draft_rows(chapters), drafts=[v2_draft(chapters)]), V2_SOURCE_SHA, chapters, registry, aliases, []
+    )
+    (root,) = result["roots"]
+    reviews = _review_records(root)
+    snapshot = json.loads(json.dumps([registry, aliases, root, reviews]))
+
+    assert variant_root_approval_gate(root, registry, aliases, reviews) == []  # positive: spelling/confidence play no part
+
+    def blockers(changed: dict | None = None, reg: dict | None = None, ali: dict | None = None, revs: list | None = None) -> list[str]:
+        return variant_root_approval_gate(
+            {**root, **(changed or {})}, registry if reg is None else reg, aliases if ali is None else ali, reviews if revs is None else revs
+        )
+
+    assert any("kind" in b for b in blockers({"kind": "creature"}))
+    assert any("unapproved" in b for b in blockers({"status": "approved"}))
+    assert blockers({"type": "other"}) == ["not a variant draft root"]
+    assert any("already registered" in b for b in blockers(reg={**registry, "zed": {"name": "Zed"}}))
+    assert any("alias" in b for b in blockers(ali={**aliases, "zed": "ana"}))
+    assert any("shares a name" in b for b in blockers({"actor_id": "zed_two", "name": "Ana Zed"}))
+    assert any("bio citation" in b for b in blockers({"citations": {**root["citations"], "bio": [root["citations"]["look"][0] | {"unit_quote": "Unrelated."}]}}))
+    assert any("look is not cited" in b for b in blockers({"citations": {**root["citations"], "look": []}}))
+    # every included mention needs its own exact-scope distinct-living verdict; a high-confidence wrong verdict is no help
+    assert any("lacks an exact-scope" in b for b in blockers(revs=reviews[1:]))
+    uncertain = [{**reviews[0], "verdict": "uncertain", "confidence": 1.0}, *reviews[1:]]
+    assert any("lacks an exact-scope" in b for b in blockers(revs=uncertain))
+    existing = [{**reviews[0], "verdict": "existing:ana"}, *reviews[1:]]
+    assert any("lacks an exact-scope" in b for b in blockers(revs=existing))
+    moved = [{**reviews[0], "own_source_witness": {**reviews[0]["own_source_witness"], "unit_id": "c00s99999"}}, *reviews[1:]]
+    assert any("lacks an exact-scope" in b for b in blockers(revs=moved))
+    assert "root has no mentions" in blockers({"variants": []})
+    # the gate is pure: nothing it saw was modified
+    assert [registry, aliases, root, reviews] == snapshot
 
 
 # ##################################################################

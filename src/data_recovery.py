@@ -333,7 +333,9 @@ class RecoveryLedger:
         return self.record(
             row["stage"],
             row["item"],
-            f"{row['severity']}_resolved",
+            # The resolved code is part of the row identity: two codes pending on one item and source must each
+            # be closable, otherwise the second resolution is dropped as a duplicate of the first.
+            f"{row['severity']}_resolved:{row['code']}",
             f"{row['severity']} {row['code']} resolved: {outcome}",
             severity="resolved",
             evidence={

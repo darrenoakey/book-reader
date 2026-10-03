@@ -222,6 +222,18 @@ def test_pending_rows_resolve_durably_without_rewriting_history(tmp_path: Path) 
     assert len((tmp_path / "data_recovery.jsonl").read_text().splitlines()) == 3
 
 
+def test_each_code_pending_on_one_item_and_scope_resolves_independently(tmp_path: Path) -> None:
+    ledger = RecoveryLedger(tmp_path)
+    scope = {"source": ["01-a.txt"], "source_hash": {"01-a.txt": "h1"}}
+    ledger.record("cast", "draft:x", "first_code", "pending", severity="pending", evidence=scope)
+    ledger.record("cast", "draft:x", "second_code", "pending", severity="pending", evidence=scope)
+    first, second = ledger.open_pending("cast")
+    ledger.resolve(first, "superseded")
+    assert [r["code"] for r in RecoveryLedger(tmp_path).open_pending("cast")] == ["second_code"]
+    ledger.resolve(second, "closed")
+    assert RecoveryLedger(tmp_path).open_pending("cast") == []
+
+
 def test_replay_resolves_only_exact_scope_and_leaves_cursor(tmp_path: Path) -> None:
     from src.cast_freeze import file_digest, replay_pending, semantic_coverage
 

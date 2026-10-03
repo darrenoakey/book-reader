@@ -4766,6 +4766,7 @@ def adapt_context_resolution_v2(
     applied: list[dict] = []
     pending: list[dict] = []
     proven: list[str] = []
+    new_actor_rows: list[dict] = []
     for row in rows:
         if not isinstance(row, dict) or not CONTEXT_V2_ROW_FIELDS <= set(row):
             raise _context_v2_invalid("row has an invalid schema")
@@ -4854,6 +4855,14 @@ def adapt_context_resolution_v2(
             "witnesses": checked,
         }
 
+        if decision == "new_actor":
+            new_actor_rows.append(
+                {
+                    **base,
+                    "main_quote": unit["quote"],
+                    "provenance": row["provenance"] if isinstance(row.get("provenance"), dict) else {},
+                }
+            )
         if decision in {"new_actor", "hold"}:
             pending.append(
                 _context_pending(
@@ -4959,7 +4968,432 @@ def adapt_context_resolution_v2(
                 **binding,
             }
         )
-    return {"applied": applied, "pending": pending, "proven": proven}
+    roots, draft_pending = stage_variant_drafts(
+        payload.get("new_actor_drafts", []), new_actor_rows, source, registry, aliases
+    )
+    return {
+        "applied": applied,
+        "pending": [*pending, *draft_pending],
+        "proven": proven,
+        "roots": roots,
+        "new_actor_targets": sorted({row["canonical_target"] for row in new_actor_rows}),
+    }
+
+
+# ##################################################################
+# variant draft pending roots
+# A v2 file may carry new_actor drafts (a proposed identity with bio/look) beside many per-mention new_actor rows whose
+# labels are spelling/title variants of that identity. Generic and open-world: nothing here names an actor and a
+# spelling or a confidence is never evidence. Rows are grouped under their draft by canonical_target; a mention joins the
+# root only through validated linkage to the draft's own source facts: it shares an immutable unit with them that
+# literally carries the mention's label or the draft's name, or the draft carries an explicit source-validated
+# kinship / continuous-participant link for exactly that mention. Unlinked mentions are excluded and listed, never
+# merged. The draft becomes ONE pending proposed root only when every bio/look claim has source-validated citations,
+# at least one mention is linked, and it duplicates nothing (no registered/aliased actor, no other draft, no label
+# claimed by two drafts). Anything else is a typed pending gap. A root is a proposal only: registry, aliases and
+# the scoped audit are never written from it, and materialization is a separate gated step
+# (variant_root_approval_gate) that this module never performs.
+VARIANT_DRAFT_ITEM = "variant_draft:"
+VARIANT_DRAFT_ROOT = "context_variant_draft_root"
+VARIANT_DRAFT_INCOMPLETE = "context_variant_draft_incomplete"
+VARIANT_DRAFT_DUPLICATE = "context_variant_draft_duplicate"
+VARIANT_DRAFT_NO_MENTIONS = "context_variant_draft_no_mentions"
+VARIANT_DRAFT_UNLINKED = "context_variant_draft_unlinked"
+VARIANT_DRAFT_CODES = frozenset(
+    {
+        VARIANT_DRAFT_ROOT,
+        VARIANT_DRAFT_INCOMPLETE,
+        VARIANT_DRAFT_DUPLICATE,
+        VARIANT_DRAFT_NO_MENTIONS,
+        VARIANT_DRAFT_UNLINKED,
+    }
+)
+VARIANT_DRAFT_FIELDS = frozenset({"actor_id", "name", "kind", "bio", "look", "status", "witnesses"})
+VARIANT_CITATION_FIELDS = ("bio", "look")
+VARIANT_LINK_KINDS = frozenset({"kinship", "continuous_participant"})
+VARIANT_LINK_FIELDS = frozenset(
+    {"kind", "chapter_file", "chapter_sha256", "main_unit_id", "label", "span_start", "witnesses"}
+)
+VARIANT_LIVING_KINDS = frozenset({"person"})
+NO_VISUAL_DETAILS = "no visual details given"
+
+
+def _exact_cited_witnesses(source: _ChapterSource, value: object, what: str) -> list[dict]:
+    """Source-validate a list of witnesses (each an exact immutable unit); a repeated unit is one witness."""
+    if not isinstance(value, list):
+        raise _context_v2_invalid(f"{what} must be a list")
+    seen: set[tuple[str, str]] = set()
+    checked: list[dict] = []
+    for witness in value:
+        if not isinstance(witness, dict) or not CONTEXT_V2_WITNESS_FIELDS <= set(witness):
+            raise _context_v2_invalid(f"{what} has an invalid witness schema")
+        exact = source.exact_unit(
+            witness["chapter_file"],
+            witness["chapter_sha256"],
+            witness["unit_id"],
+            witness["unit_quote"],
+            witness["unit_quote_sha256"],
+            what,
+        )
+        key = (exact["chapter_sha256"], exact["id"])
+        if key not in seen:
+            seen.add(key)
+            checked.append({field: witness[field] for field in sorted(CONTEXT_V2_WITNESS_FIELDS)})
+    return checked
+
+
+def _unit_key(witness: dict) -> tuple[str, str]:
+    return witness["chapter_sha256"], witness["unit_id"]
+
+
+def _scope_key(scope: dict) -> tuple[str, str, str, int]:
+    return scope["chapter_sha256"], scope["unit_id"], scope["label"], scope["span_start"]
+
+
+def _names_word(word: str, text: str) -> bool:
+    return bool(word.strip()) and re.search(rf"(?<!\w){re.escape(word.strip())}(?!\w)", text, re.IGNORECASE) is not None
+
+
+def _name_words(name: str) -> list[str]:
+    """The words of a draft name that can identify it: no titles, roles or grammar words."""
+    return [
+        word
+        for word in re.findall(r"\w+", name)
+        if len(word) > 1 and word.casefold() not in TITLE_ROLE_TOKENS and word.casefold() not in NON_NAME_COMPOUND_WORDS
+    ]
+
+
+def _validated_variant_links(source: _ChapterSource, draft: dict) -> list[dict]:
+    links = draft.get("variant_links", [])
+    if not isinstance(links, list):
+        raise _context_v2_invalid("new_actor draft variant_links must be a list")
+    checked = []
+    for link in links:
+        if not isinstance(link, dict) or set(link) != VARIANT_LINK_FIELDS:
+            raise _context_v2_invalid("new_actor draft link has an invalid schema")
+        if (
+            link["kind"] not in VARIANT_LINK_KINDS
+            or not isinstance(link["label"], str)
+            or not link["label"]
+            or type(link["span_start"]) is not int
+        ):
+            raise _context_v2_invalid("new_actor draft link has invalid values")
+        path = source.resolve(link["chapter_file"], link["chapter_sha256"], "link mention")
+        unit = source.units(path)[1].get(link["main_unit_id"])
+        label, span = link["label"], link["span_start"]
+        if unit is None or unit["quote"][span : span + len(label)] != label or span < 0:
+            raise _context_v2_invalid("new_actor draft link mention is not an exact immutable span")
+        witnesses = _exact_cited_witnesses(source, link["witnesses"], "draft link witness")
+        if not witnesses:
+            raise _context_v2_invalid("new_actor draft link requires source witnesses")
+        checked.append(
+            {
+                "kind": link["kind"],
+                "scope": (unit["chapter_sha256"], unit["id"], label, span),
+                "chapter_sha256": unit["chapter_sha256"],
+                "witnesses": witnesses,
+            }
+        )
+    return checked
+
+
+def _validated_variant_draft(source: _ChapterSource, draft: object) -> dict:
+    if not isinstance(draft, dict) or not VARIANT_DRAFT_FIELDS <= set(draft):
+        raise _context_v2_invalid("new_actor draft has an invalid schema")
+    actor_id, name, kind, bio, look, status = (draft[key] for key in ("actor_id", "name", "kind", "bio", "look", "status"))
+    if (
+        not all(isinstance(item, str) for item in (actor_id, name, kind, bio, look, status))
+        or not IDENTIFIER.match(actor_id)
+        or not name.strip()
+        or not kind.strip()
+        or normalized_id(name) == ""
+        or not status.casefold().startswith("draft")
+    ):
+        raise _context_v2_invalid("new_actor draft has invalid values or claims approval")
+    citations = draft.get("citations", {})
+    if not isinstance(citations, dict) or set(citations) - set(VARIANT_CITATION_FIELDS):
+        raise _context_v2_invalid("new_actor draft citations have an invalid schema")
+    return {
+        "actor_id": actor_id,
+        "name": name,
+        "kind": kind,
+        "bio": bio,
+        "look": look,
+        "status": status,
+        "witnesses": _exact_cited_witnesses(source, draft["witnesses"], f"draft {actor_id} witness"),
+        "citations": {
+            field: _exact_cited_witnesses(source, citations.get(field, []), f"draft {actor_id} {field} citation")
+            for field in VARIANT_CITATION_FIELDS
+        },
+        "links": _validated_variant_links(source, draft),
+    }
+
+
+def _citation_gaps(draft: dict) -> list[str]:
+    """Every bio/look claim needs its own citations; only the explicit no-visual-details sentinel needs none."""
+    gaps = []
+    if not draft["bio"].strip():
+        gaps.append("bio text is empty")
+    elif not draft["citations"]["bio"]:
+        gaps.append("bio has no source citations")
+    look = draft["look"].strip()
+    if not look:
+        gaps.append("look text is empty")
+    elif look.rstrip(".").casefold() != NO_VISUAL_DETAILS and not draft["citations"]["look"]:
+        gaps.append("look has no source citations")
+    return gaps
+
+
+def _identity_duplicates(actor_id: str, name: str, registry: dict, aliases: dict) -> list[str]:
+    """Why a proposed identity would duplicate an actor that already exists: same id/name, an alias, or a shared name word."""
+    duplicates = []
+    known_ids = {normalized_id(key): value for key, value in aliases.items()}
+    for candidate in (actor_id, name):
+        key = normalized_id(candidate)
+        if key in registry and key != "narrator":
+            duplicates.append(f"{candidate!r} is already registered as {key}")
+        elif key in known_ids:
+            duplicates.append(f"{candidate!r} is already an alias of {known_ids[key]}")
+    for owner in adjudication_owners(name, registry, aliases):
+        if owner_relevance(name, owner, registry[owner], aliases) >= 3:
+            duplicates.append(f"name {name!r} shares a name with registered actor {owner}")
+    return duplicates
+
+
+def _mention_link(row: dict, draft: dict, source: _ChapterSource, fact_units: dict[tuple[str, str], dict]) -> tuple[dict | None, str]:
+    """Validated linkage of one mention to the draft's source facts, or (None, why not)."""
+    scope = row["scope"]
+    label, words = scope["label"], _name_words(draft["name"])
+    mention_units = {(scope["chapter_sha256"], scope["unit_id"]): row["main_quote"]}
+    mention_units.update({_unit_key(w): w["unit_quote"] for w in row["witnesses"]})
+    shared = sorted(
+        key
+        for key, quote in mention_units.items()
+        if key in fact_units and (_names_word(label, quote) or any(_names_word(word, quote) for word in words))
+    )
+    if shared:
+        return {"kind": "shared_immutable_unit", "units": [{"chapter_sha256": c, "unit_id": u} for c, u in shared]}, ""
+    link = next((item for item in draft["links"] if item["scope"] == _scope_key(scope)), None)
+    if link is None:
+        return None, "no shared immutable unit with the draft facts and no explicit link"
+    # Both link kinds are proven only from witnesses inside this mention's own bounded scene, never from elsewhere in the book.
+    path = source.resolve(scope["chapter"], scope["chapter_sha256"], "link mention")
+    ordered, by_id = source.units(path)
+    order = [item["id"] for item in ordered]
+    scene = {item["id"] for item in scene_units_at(by_id, order, order.index(scope["unit_id"]))}
+    within = [w["unit_quote"] for w in link["witnesses"] if w["chapter_sha256"] == scope["chapter_sha256"] and w["unit_id"] in scene]
+    names_label = [_names_word(label, quote) for quote in within]
+    names_draft = [any(_names_word(word, quote) for word in words) for quote in within]
+    if link["kind"] == "kinship":
+        # one source sentence ties this label to the draft identity (e.g. a relation stated in the scene)
+        proven = any(a and b for a, b in zip(names_label, names_draft, strict=True))
+    else:
+        proven = any(names_label) and any(names_draft)
+    if not proven:
+        return None, f"explicit {link['kind']} link is not proven by its witnesses"
+    return {"kind": link["kind"], "witnesses": link["witnesses"]}, ""
+
+
+def _root_variants(linked: list[tuple[dict, dict]]) -> list[dict]:
+    by_label: dict[str, list[dict]] = {}
+    for row, link in sorted(linked, key=lambda pair: (pair[0]["scope"]["chapter"], pair[0]["scope"]["unit_id"], pair[0]["scope"]["span_start"])):
+        by_label.setdefault(row["scope"]["label"], []).append(
+            {
+                "scope": row["scope"],
+                "decision": row["decision"],
+                "reason": row["reason"],
+                "provenance": row["provenance"],
+                "witnesses": row["witnesses"],
+                "link": link,
+            }
+        )
+    return [{"label": label, "scopes": by_label[label]} for label in sorted(by_label)]
+
+
+def _pending_material_item(actor_id: str, material: object) -> str:
+    return f"{VARIANT_DRAFT_ITEM}{actor_id}:{payload_hash(material)[:16]}"
+
+
+def variant_draft_actor(item: str) -> str:
+    return item.removeprefix(VARIANT_DRAFT_ITEM).split(":", 1)[0]
+
+
+def stage_variant_drafts(
+    drafts: object, new_actor_rows: list[dict], source: _ChapterSource, registry: dict, aliases: dict
+) -> tuple[list[dict], list[dict]]:
+    """Return (pending proposed roots, typed pending rows): one pending row per draft, a root only when complete, linked and duplicate-free."""
+    if not isinstance(drafts, list):
+        raise _context_v2_invalid("new_actor_drafts must be a list")
+    validated = [_validated_variant_draft(source, draft) for draft in drafts]
+    ids = [draft["actor_id"] for draft in validated]
+    if len(set(ids)) != len(ids):
+        raise _context_v2_invalid("duplicate new_actor draft actor_id")
+    rows_by_target: dict[str, list[dict]] = {}
+    for row in new_actor_rows:
+        rows_by_target.setdefault(row["canonical_target"], []).append(row)
+    for draft in validated:
+        mentions = {_scope_key(row["scope"]) for row in rows_by_target.get(draft["actor_id"], [])}
+        if any(link["scope"] not in mentions for link in draft["links"]):
+            raise _context_v2_invalid("new_actor draft link names a mention that is not one of its own")
+    # A label (exact spelling) offered as a variant by two different drafts cannot be minted for either.
+    labels_by_draft = {
+        draft["actor_id"]: {row["scope"]["label"].casefold() for row in rows_by_target.get(draft["actor_id"], [])}
+        for draft in validated
+    }
+    roots: list[dict] = []
+    pending: list[dict] = []
+    for draft in validated:
+        actor_id = draft["actor_id"]
+        rows = rows_by_target.get(actor_id, [])
+        facts = [*draft["witnesses"], *draft["citations"]["bio"], *draft["citations"]["look"]]
+        fact_units = {_unit_key(w): w for w in facts}
+        duplicates = _identity_duplicates(actor_id, draft["name"], registry, aliases)
+        for other in validated:
+            if other["actor_id"] == actor_id:
+                continue
+            if normalized_id(other["name"]) == normalized_id(draft["name"]):
+                duplicates.append(f"draft {other['actor_id']} has the same name")
+            shared = sorted(labels_by_draft[actor_id] & labels_by_draft[other["actor_id"]])
+            if shared:
+                duplicates.append(f"variants {shared} are also claimed by draft {other['actor_id']}")
+        linked: list[tuple[dict, dict]] = []
+        unlinked: list[dict] = []
+        for row in rows:
+            link, why = _mention_link(row, draft, source, fact_units)
+            if link:
+                linked.append((row, link))
+            else:
+                unlinked.append({"scope": row["scope"], "why": why})
+        evidence_names: dict[str, str] = {w["chapter_file"]: w["chapter_sha256"] for w in facts}
+        for row, _link in linked:
+            evidence_names.update(row["source_hash"])
+        gaps = _citation_gaps(draft)
+        base = {
+            "source": sorted(evidence_names),
+            "source_hash": dict(sorted(evidence_names.items())),
+            "draft": {key: draft[key] for key in ("actor_id", "name", "kind", "status")},
+        }
+
+        def gap(code: str, why: str, detail: dict, base=base, actor_id=actor_id) -> dict:
+            material = {"code": code, "draft": base["draft"], "source_hash": base["source_hash"], **detail}
+            return _context_pending({**base, "item": _pending_material_item(actor_id, material)}, code, why) | detail
+
+        if duplicates:
+            found = sorted(set(duplicates))
+            pending.append(gap(VARIANT_DRAFT_DUPLICATE, "; ".join(found), {"duplicates": found}))
+        elif gaps:
+            pending.append(gap(VARIANT_DRAFT_INCOMPLETE, "; ".join(gaps), {"missing": gaps}))
+        elif not rows:
+            pending.append(
+                gap(VARIANT_DRAFT_NO_MENTIONS, "no new_actor mention names this draft, so no per-scope provenance exists", {})
+            )
+        elif not linked:
+            pending.append(
+                gap(
+                    VARIANT_DRAFT_UNLINKED,
+                    "no mention is linked to the draft's source facts by a shared immutable unit or an explicit link",
+                    {"unlinked": unlinked},
+                )
+            )
+        else:
+            root = {
+                "type": "variant_draft_root",
+                "status": "pending_proposal_not_approved",
+                "actor_id": actor_id,
+                "name": draft["name"],
+                "kind": draft["kind"],
+                "bio": draft["bio"],
+                "look": draft["look"],
+                "citations": draft["citations"],
+                "source_facts": draft["witnesses"],
+                "variants": _root_variants(linked),
+            }
+            roots.append(root)
+            sha = proposal_sha(root)
+            pending.append(
+                _context_pending({**base, "item": f"{VARIANT_DRAFT_ITEM}{actor_id}:{sha[:16]}"}, VARIANT_DRAFT_ROOT,
+                    "complete, linked, duplicate-free draft held as a pending proposed root; never approved or registered here")
+                | {
+                    "proposal_sha256": sha,
+                    "proposal_file": PROPOSALS_NAME,
+                    "variant_labels": [variant["label"] for variant in root["variants"]],
+                    "scope_count": len(linked),
+                    "unlinked_excluded": unlinked,
+                }
+            )
+    return roots, pending
+
+
+# ##################################################################
+# variant root approval gate
+# The only way a pending root may ever become a registered actor is a SEPARATE, explicit approval step that passes this
+# gate. It is pure: it returns the blockers and never touches registry, aliases or any file, and it admits nothing on
+# spelling or confidence. A root qualifies only if (a) it is still an unapproved root of a living-capable kind, (b) it
+# still duplicates nothing in the CURRENT registry/aliases, (c) its bio is cited by a source unit that literally names
+# the identity, its look is cited (or explicitly absent), and (d) every included mention has an exact-scope
+# distinct_living_identity verdict in the new-identity review audit whose own-source witness is that very mention.
+def variant_root_approval_gate(root: dict, registry: dict, aliases: dict, review_records: list[dict]) -> list[str]:
+    blockers: list[str] = []
+    if not isinstance(root, dict) or root.get("type") != "variant_draft_root":
+        return ["not a variant draft root"]
+    if root.get("status") != "pending_proposal_not_approved":
+        blockers.append("root is not a pending unapproved proposal")
+    if root.get("kind") not in VARIANT_LIVING_KINDS:
+        blockers.append(f"kind {root.get('kind')!r} is not a living-capable kind")
+    actor_id, name = str(root.get("actor_id", "")), str(root.get("name", ""))
+    blockers.extend(_identity_duplicates(actor_id, name, registry, aliases))
+    variants = root.get("variants") if isinstance(root.get("variants"), list) else []
+    labels = [str(variant.get("label", "")) for variant in variants if isinstance(variant, dict)]
+    citations = root.get("citations") if isinstance(root.get("citations"), dict) else {}
+    bio_quotes = [str(c.get("unit_quote", "")) for c in citations.get("bio", []) if isinstance(c, dict)]
+    if not any(_names_word(word, quote) for quote in bio_quotes for word in [*_name_words(name), *labels]):
+        blockers.append("no bio citation literally names the identity")
+    look = str(root.get("look", "")).strip()
+    if not look or (look.rstrip(".").casefold() != NO_VISUAL_DETAILS and not citations.get("look")):
+        blockers.append("look is not cited")
+    reviews = {
+        (r.get("chapter_sha256"), r.get("quote_sha256"), r.get("label"), r.get("span_start")): r
+        for r in review_records
+        if isinstance(r, dict)
+    }
+    mentions = [scope for variant in variants for scope in variant.get("scopes", [])]
+    if not mentions:
+        blockers.append("root has no mentions")
+    for item in mentions:
+        scope = item["scope"]
+        record = reviews.get((scope["chapter_sha256"], scope["quote_sha256"], scope["label"], scope["span_start"]))
+        witness = record.get("own_source_witness") if record else None
+        if (
+            not record
+            or record.get("verdict") != DISTINCT_VERDICT
+            or not isinstance(witness, dict)
+            or witness.get("unit_id") != scope["unit_id"]
+            or witness.get("label") != scope["label"]
+            or witness.get("span_start") != scope["span_start"]
+        ):
+            blockers.append(f"mention {scope['label']!r}@{scope['span_start']} lacks an exact-scope distinct living-identity review")
+    return blockers
+
+
+def variant_draft_resolution(
+    row: dict, current: dict[str, tuple[str, str]], mention_targets: set[str], registry: dict
+) -> str | None:
+    """Outcome that durably closes an open draft-level row, or None to keep it open (a draft is never resolved by omission alone).
+
+    A draft row's item carries a digest of its exact material, so any change in the draft, its mentions, its gaps or its
+    stored proposal is a new row and the older one is superseded; an unchanged state stays open until the identity is
+    registered through the registry or no new_actor mention names it any more.
+    """
+    actor_id = variant_draft_actor(row["item"])
+    now = current.get(actor_id)
+    if now is not None:
+        return "variant_draft_state_superseded" if now != (row["item"], row["code"]) else None
+    if row["code"] == VARIANT_DRAFT_ROOT and actor_id in registry:
+        return "variant_draft_registered_through_registry"
+    if actor_id not in mention_targets:
+        # No new_actor mention names it any more: each of those mentions was resolved or re-decided on its own row.
+        return "variant_draft_no_longer_asserted"
+    return None
 
 
 def ingest_context_resolution_v2(
@@ -4984,6 +5418,9 @@ def ingest_context_resolution_v2(
         payload, source_sha, chapters, registry, aliases, records
     )
     input_sha = payload_hash(payload)
+    # The exact root proposals (full bio/look citations, per-scope provenance) are durable before any row refers to them.
+    for root in result["roots"]:
+        save_pending_proposal(project, root)
     for item in result["pending"]:
         recovery.record(
             CONTEXT_V2_STAGE,
@@ -5012,27 +5449,47 @@ def ingest_context_resolution_v2(
             )
         mention_scoped_audit_index(records)
         atomic_json(project / SCOPED_AUDIT_NAME, {"records": records})
+    current_draft_codes = {
+        variant_draft_actor(item["item"]): (item["item"], item["code"])
+        for item in result["pending"]
+        if item["code"] in VARIANT_DRAFT_CODES
+    }
     for row in recovery.open_pending(CONTEXT_V2_STAGE):
         if row["item"] in result["proven"]:
             recovery.resolve(
                 row, "caretaker_context_resolution_proven", {"input_sha256": input_sha}
             )
+        elif row["item"].startswith(VARIANT_DRAFT_ITEM):
+            outcome = variant_draft_resolution(
+                row, current_draft_codes, set(result["new_actor_targets"]), registry
+            )
+            if outcome:
+                recovery.resolve(row, outcome, {"input_sha256": input_sha})
     return recovery.open_pending(CONTEXT_V2_STAGE)
 
 
 # ##################################################################
 # save pending proposal
 # persists the exact demoted identity proposal so a pending row's evidence is reproducible; the same exact proposal (same scope, mentions and evidence bytes) is stored once however often a replay or round re-presents it.
+def proposal_line(proposal: dict) -> str:
+    return json.dumps(proposal, ensure_ascii=False, sort_keys=True)
+
+
+def proposal_sha(proposal: dict) -> str:
+    """The identity a pending row cites for its stored proposal: sha256 of the exact stored line."""
+    return hashlib.sha256(proposal_line(proposal).encode("utf-8")).hexdigest()
+
+
 def save_pending_proposal(project: Path, proposal: dict) -> str:
-    line = json.dumps(proposal, ensure_ascii=False, sort_keys=True)
+    line = proposal_line(proposal)
     path = project / PROPOSALS_NAME
     if path.is_file() and line in path.read_text(encoding="utf-8").splitlines():
-        return hashlib.sha256(line.encode("utf-8")).hexdigest()
+        return proposal_sha(proposal)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(line + "\n")
         stream.flush()
         os.fsync(stream.fileno())
-    return hashlib.sha256(line.encode("utf-8")).hexdigest()
+    return proposal_sha(proposal)
 
 
 # ##################################################################

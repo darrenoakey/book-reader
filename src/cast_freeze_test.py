@@ -4346,3 +4346,219 @@ def test_prepare_cast_reads_the_retirement_input_at_the_batch_boundary_and_fails
         assert not (project / MANIFEST_NAME).exists()
     finally:
         shutil.rmtree(project, ignore_errors=True)
+
+
+# ##################################################################
+# scoped adjudication row recovery
+# A model response that omits, duplicates or malforms the row for ONE exact mention must never quarantine the chapter or lose
+# its valid neighbours: valid unique rows go through every existing proof, the raw response is archived by hash, and only the
+# damaged mention is held as a typed exact-scope pending record.
+ROW_RECOVERY_TEXT = (
+    "Once Venmont rode north. The gate stood open. Valdres waited at the gate. "
+    "Later Valdres wept in the rain. Valdres left at dawn."
+)
+
+
+def adjudication_row(mention_id: str, decision: str = "non_character", **overrides: object) -> dict:
+    row = {
+        "mention_id": mention_id,
+        "refers_to_person": "no",
+        "candidate_kind": "prose_fragment",
+        "decision": decision,
+        "canonical": "none",
+        "confidence": 0.9,
+        "reason": "fragment of narration, not an actor",
+    }
+    return {**row, **overrides}
+
+
+def valdres_candidate(tmp_path: Path) -> tuple[list[dict], dict]:
+    chapter = tmp_path / "ch1.txt"
+    chapter.write_text(ROW_RECOVERY_TEXT, encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    candidate = next(c for c in candidate_coverage_ledger(units, {}, {}) if c["label"] == "Valdres")
+    assert len(candidate["ref_ids"]) == 3
+    return units, candidate
+
+
+@pytest.mark.parametrize(
+    ("kind", "response"),
+    [
+        ("omitted", {"mentions": [adjudication_row("m0"), adjudication_row("m2")]}),
+        (
+            "duplicate",
+            {
+                "mentions": [
+                    adjudication_row("m0"),
+                    adjudication_row("m1"),
+                    adjudication_row("m1"),
+                    adjudication_row("m2"),
+                ]
+            },
+        ),
+        (
+            "malformed",
+            {
+                "mentions": [
+                    adjudication_row("m0"),
+                    adjudication_row("m1", confidence="very high"),
+                    adjudication_row("m2"),
+                ]
+            },
+        ),
+        ("malformed", {"mentions": [adjudication_row("m0"), {"mention_id": "m1"}, adjudication_row("m2")]}),
+        (
+            "malformed",
+            {"mentions": [adjudication_row("m0"), adjudication_row("m1", decision="alias"), adjudication_row("m2")]},
+        ),
+    ],
+)
+def test_scoped_adjudication_row_defect_pends_only_that_mention(tmp_path: Path, kind: str, response: dict) -> None:
+    from src.cast_freeze import SCOPED_AUDIT_NAME, adjudicate_pending_mentions
+
+    units, candidate = valdres_candidate(tmp_path)
+    raw = json.dumps(response)
+    calls: list[str] = []
+
+    def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
+        calls.append(prompt)
+        return raw
+
+    adjudicate_pending_mentions(tmp_path, [{"candidate": candidate, "proposed": None}], units, {}, ask)
+    assert len(calls) == 1  # no rerun, no bisection
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert len(records) == 3
+    refs = immutable_name_references(units)
+    units_by_id = {unit["id"]: unit for unit in units}
+    first, middle, last = (
+        next(
+            r
+            for r in records
+            if r["quote_sha256"] == hashlib.sha256(units_by_id[refs[ref_id]["unit_id"]]["quote"].encode()).hexdigest()
+        )
+        for ref_id in candidate["ref_ids"]
+    )
+    for neighbour in (first, last):
+        assert neighbour["decision"] == "non_character" and "invalid_row" not in neighbour
+    assert middle["decision"] == "ambiguous" and middle["canonical"] == "none" and middle["confidence"] == 0.0
+    invalid = middle["invalid_row"]
+    assert invalid["kind"] == kind
+    assert invalid["response_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    archived = (tmp_path / REJECTIONS_NAME).read_text(encoding="utf-8").splitlines()
+    assert len(archived) == 1
+    archive = json.loads(archived[0])
+    assert archive["response"] == raw and archive["response_sha256"] == invalid["response_sha256"]
+    assert (
+        invalid["archive"]["line"] == 0
+        and invalid["archive"]["sha256"] == hashlib.sha256(archived[0].encode()).hexdigest()
+    )
+    assert archive["defects"] == {"m1": {"kind": kind, "detail": invalid["detail"]}}
+    # the damaged scope is terminal pending evidence: replay neither re-asks it nor its accepted neighbours
+    adjudicate_pending_mentions(tmp_path, [{"candidate": candidate, "proposed": None}], units, {}, ask)
+    assert len(calls) == 1
+
+
+def test_scoped_adjudication_unparseable_response_pends_every_mention_without_raising(tmp_path: Path) -> None:
+    from src.cast_freeze import SCOPED_AUDIT_NAME, adjudicate_pending_mentions
+
+    units, candidate = valdres_candidate(tmp_path)
+
+    def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
+        return "the model rambled instead of returning JSON"
+
+    adjudicate_pending_mentions(tmp_path, [{"candidate": candidate, "proposed": None}], units, {}, ask)
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert len(records) == 3 and all(
+        r["decision"] == "ambiguous" and r["invalid_row"]["kind"] == "malformed" for r in records
+    )
+    assert json.loads((tmp_path / REJECTIONS_NAME).read_text().splitlines()[0])["response"].startswith(
+        "the model rambled"
+    )
+
+
+def test_scoped_adjudication_omission_keeps_identity_guards_for_valid_neighbours(tmp_path: Path) -> None:
+    from src.cast_freeze import SCOPED_AUDIT_NAME, adjudicate_pending_mentions
+
+    units, candidate = valdres_candidate(tmp_path)
+    registry = {"valdres_ward": {"name": "Valdres Ward"}}
+    owner_row = {
+        "refers_to_person": "yes",
+        "candidate_kind": "individual_name",
+        "decision": "alias",
+        "canonical": "valdres_ward",
+    }
+
+    def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
+        # m1 is omitted; m0 claims an alias the scene cannot prove mechanically, m2 is a plain non-character
+        return json.dumps({"mentions": [adjudication_row("m0", **owner_row), adjudication_row("m2")]})
+
+    adjudicate_pending_mentions(tmp_path, [{"candidate": candidate, "proposed": "valdres_ward"}], units, registry, ask)
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert len(records) == 3
+    # no record is ever an alias without the existing source proof, and nothing was approved automatically
+    for record in records:
+        assert record["decision"] != "alias" or record.get("proof")
+    assert sum(1 for r in records if r.get("invalid_row", {}).get("kind") == "omitted") == 1
+
+
+def test_discover_batch_omitted_once_venmont_and_valdres_rows_pend_without_quarantine(tmp_path: Path) -> None:
+    from src.cast_freeze import SCOPED_AUDIT_NAME, discover_batch
+    from src.data_recovery import LEDGER_NAME
+
+    chapter = tmp_path / "ch1.txt"
+    chapter.write_text(ROW_RECOVERY_TEXT, encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    registry = {"narrator": {"name": "Narrator"}}
+    adjudications: dict[str, int] = {}
+
+    def ask(prompt: str, max_tokens: int = 0, max_attempts: int = 1, response_schema: dict | None = None) -> str:
+        schema = response_schema or {}
+        if "mentions" in schema["properties"]:
+            ids = schema["properties"]["mentions"]["items"]["properties"]["mention_id"]["enum"]
+            label = prompt.split("label ")[1].split(",")[0].strip("'")
+            adjudications[label] = adjudications.get(label, 0) + 1
+            if label == "Once Venmont":
+                return json.dumps({"mentions": []})  # the whole generic-label row is omitted
+            rows = [adjudication_row(mid) for mid in ids if mid != "m2"]  # Valdres: last (standalone) mention omitted
+            return json.dumps({"mentions": rows})
+        out = []
+        for option in schema["properties"]["classifications"]["items"]["oneOf"]:
+            branches = option.get("oneOf", [option])
+            cid = branches[0]["properties"]["candidate_id"]["enum"][0]
+            row = next(line for line in prompt.splitlines() if line.startswith(cid + " label="))
+            label = row.split("label='")[1].split("'")[0]
+            witness = row.split("witnesses: [")[1].split("]")[0]
+            statuses = {st: b["properties"] for b in branches for st in b["properties"]["status"]["enum"]}
+            if len(branches) == 1:
+                status = next(iter(statuses))
+            elif label in {"Once Venmont", "Valdres"}:
+                status = "ambiguous" if "ambiguous" in statuses else next(iter(statuses))
+            else:
+                status = "non_character"
+            out.append(
+                {
+                    "candidate_id": cid,
+                    "status": status,
+                    "identity": statuses[status]["identity"]["enum"][0],
+                    "evidence_unit_ids": [witness],
+                }
+            )
+        return json.dumps({"classifications": out})
+
+    progress = {"registry": registry, "aliases": {}}
+    discoveries, classifications = discover_batch(tmp_path, 0, [chapter], units, "", progress, set(), ask=ask)
+    assert discoveries == []
+    assert adjudications == {"Once Venmont": 1, "Valdres": 1}  # one call per candidate, never re-run or bisected
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    venmont = [r for r in records if r["label"] == "Once Venmont"]
+    valdres = [r for r in records if r["label"] == "Valdres"]
+    assert [r["invalid_row"]["kind"] for r in venmont] == ["omitted"]
+    assert sorted(r["decision"] for r in valdres) == ["ambiguous", "non_character", "non_character"]
+    assert sum(1 for r in valdres if "invalid_row" in r) == 1
+    ledger = [json.loads(line) for line in (tmp_path / LEDGER_NAME).read_text().splitlines()]
+    pending = [row for row in ledger if row["code"] == "pending_invalid_classification"]
+    assert {row["evidence"]["label"] for row in pending} >= {"Once Venmont", "Valdres"}
+    for row in pending:
+        assert row["severity"] == "pending" and len(row["evidence"]["mentions"]) == 1
+    assert not [row for row in ledger if row["severity"] == "quarantine"]
+    assert any(c["status"] == "non_character" for c in classifications)

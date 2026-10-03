@@ -543,7 +543,8 @@ def candidate_coverage_ledger(
         unit = units_by_id[reference["unit_id"]]
         record = scoped.get(mention_scope(unit, reference)) if scoped else None
         if record:
-            key = f"{key}@{record['decision']}:{record['canonical']}"
+            # a row the model never usably answered is a distinct, exact-scope group: it can never merge into a real decision
+            key = f"{key}@{record['decision']}:{record['canonical']}{'!invalid_row' if record.get('invalid_row') else ''}"
         candidate = grouped.setdefault(
             key,
             {
@@ -2460,6 +2461,16 @@ def defer_ambiguous_candidates(
                 candidate.get("scoped_audit"),
             )
             candidate_with_audit = {**candidate, "scoped_audit": audit} if audit else candidate
+            invalid_row = (audit or {}).get("invalid_row")
+            if invalid_row:
+                # the model never produced a usable decision row for these exact mentions: typed pending, never a guessed owner
+                entry = pending_identity_entry(
+                    candidate_with_audit, "invalid_classification", audit["reason"], units, references
+                )
+                entry["rejection_archive"] = invalid_row["archive"]
+                entry["invalid_row"] = {key: invalid_row[key] for key in ("kind", "detail", "response_sha256")}
+                deferred.append(entry)
+                continue
             deferred.append(
                 pending_identity_entry(
                     candidate_with_audit,
@@ -3271,6 +3282,97 @@ def supersede_scoped_record(records: list[dict], known: dict, scope: tuple, reco
     known[scope] = record
 
 
+ADJUDICATION_ROW_FIELDS = (
+    "mention_id",
+    "refers_to_person",
+    "candidate_kind",
+    "decision",
+    "canonical",
+    "confidence",
+    "reason",
+)
+ADJUDICATION_PERSON_ANSWERS = frozenset({"yes", "no", "unclear"})
+ADJUDICATION_KINDS = frozenset(
+    {"individual_name", "specific_role", "endearment", "prose_fragment", "nonliving", "unclear"}
+)
+
+
+def adjudication_row_defect(row: object, decisions: list[str], owners: list[str]) -> str | None:
+    """Why one scoped-adjudication row cannot be trusted as written (None when it is schema-clean)."""
+    if not isinstance(row, dict):
+        return "row is not an object"
+    missing = [field for field in ADJUDICATION_ROW_FIELDS if field not in row]
+    if missing:
+        return f"row lacks {', '.join(missing)}"
+    confidence = row["confidence"]
+    if (
+        row["refers_to_person"] not in ADJUDICATION_PERSON_ANSWERS
+        or row["candidate_kind"] not in ADJUDICATION_KINDS
+        or row["decision"] not in decisions
+        or row["canonical"] not in [*owners, "none"]
+        or isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not 0 <= confidence <= 1
+        or not isinstance(row["reason"], str)
+        or not row["reason"].strip()
+    ):
+        return "row has an invalid field value"
+    return None
+
+
+def partition_adjudication_rows(
+    response: object, ids: list[str], decisions: list[str], owners: list[str]
+) -> tuple[list[dict], dict[str, tuple[str, str]]]:
+    """Split one scoped-adjudication response into the schema-clean rows owning exactly one expected mention id, and a defect (kind, detail) for every expected id that has no such row.
+    Nothing is repaired or chosen between duplicates: every row of a duplicated id is untrusted."""
+    try:
+        value = json.loads(response)
+    except (ValueError, TypeError, RecursionError):
+        return [], {mention_id: ("malformed", "response is not valid JSON") for mention_id in ids}
+    rows = value.get("mentions") if isinstance(value, dict) else None
+    if not isinstance(rows, list):
+        return [], {mention_id: ("malformed", "response has no mentions array") for mention_id in ids}
+    by_id: dict[str, list[object]] = {mention_id: [] for mention_id in ids}
+    for row in rows:
+        mention_id = row.get("mention_id") if isinstance(row, dict) else None
+        if isinstance(mention_id, str) and mention_id in by_id:
+            by_id[mention_id].append(row)
+    clean: list[dict] = []
+    defects: dict[str, tuple[str, str]] = {}
+    for mention_id in ids:
+        found = by_id[mention_id]
+        if not found:
+            defects[mention_id] = ("omitted", "model returned no row for this mention")
+        elif len(found) > 1:
+            defects[mention_id] = ("duplicate", f"model returned {len(found)} rows for this mention")
+        elif (why := adjudication_row_defect(found[0], decisions, owners)) is not None:
+            defects[mention_id] = ("malformed", why)
+        else:
+            clean.append(found[0])
+    return clean, defects
+
+
+def archive_adjudication_response(
+    project: Path, label: str, response: object, defects: dict[str, tuple[str, str]], units: list[dict]
+) -> dict:
+    """Append the exact raw irregular scoped-adjudication response (with its SHA-256) to the rejection archive and return its line reference."""
+    text = response if isinstance(response, str) else repr(response)
+    return append_rejection_payload(
+        project,
+        {
+            "kind": "scoped_adjudication_rows",
+            "code": "scoped_adjudication_rows_rejected",
+            "chapters": sorted({unit["chapter"] for unit in units}),
+            "label": label,
+            "error": "scoped adjudication response omitted, duplicated or malformed mention rows",
+            "defects": {mention_id: {"kind": kind, "detail": detail} for mention_id, (kind, detail) in defects.items()},
+            "mention_units": [unit["id"] for unit in units],
+            "response_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "response": text,
+        },
+    )
+
+
 def adjudicate_pending_mentions(
     project: Path,
     pending: list[dict],
@@ -3417,21 +3519,45 @@ def adjudicate_pending_mentions(
                 raise CastDataIssue(
                     f"scoped adjudication prompt exceeds native context budget for {candidate['label']!r}"
                 )
-            value = model_object(
-                ask(prompt, max_tokens=1500, max_attempts=1, response_schema=schema),
-                f"scoped adjudication for {candidate['label']!r}",
-            )
-            returned = value.get("mentions")
-            if (
-                not isinstance(returned, list)
-                or {r.get("mention_id") for r in returned if isinstance(r, dict)} != set(ids)
-                or len(returned) != len(ids)
-                or not all(
-                    {"decision", "canonical", "refers_to_person", "reason", "candidate_kind"} <= set(r)
-                    for r in returned
+            response = ask(prompt, max_tokens=1500, max_attempts=1, response_schema=schema)
+            # Row-level recovery: a valid, unique, schema-clean row is applied below through every existing validation/proof;
+            # an omitted, duplicated or malformed row only pends its own exact mention (raw response archived by hash).
+            returned, defects = partition_adjudication_rows(response, ids, decisions, owners)
+            if defects or len(returned) != len(ids):
+                archive = archive_adjudication_response(
+                    project, candidate["label"], response, defects, [mentions[scope] for scope in chunk]
                 )
-            ):
-                raise CastDataIssue(f"scoped adjudication omitted or duplicated mentions for {candidate['label']!r}")
+                response_sha256 = hashlib.sha256(str(response).encode("utf-8")).hexdigest()
+                for mention_id, (defect_kind, detail) in defects.items():
+                    scope = chunk[ids.index(mention_id)]
+                    prior_reason = (known.get(scope) or {}).get("reason", "")
+                    supersede_scoped_record(
+                        records,
+                        known,
+                        scope,
+                        {
+                            "chapter_sha256": scope[0],
+                            "quote_sha256": scope[1],
+                            "label": candidate["label"],
+                            "span_start": scope[3],
+                            "canonical": "none",
+                            "decision": "ambiguous",
+                            "confidence": 0.0,
+                            "reason": bounded(
+                                f"[scoped adjudication row {defect_kind}: {detail}; raw response archived at line {archive['line']} sha256 {archive['sha256'][:16]}]"
+                                + (f" {prior_reason}" if prior_reason else ""),
+                                300,
+                            ),
+                            "owners": list(owners),
+                            "invalid_row": {
+                                "kind": defect_kind,
+                                "detail": detail,
+                                "archive": archive,
+                                "response_sha256": response_sha256,
+                            },
+                        },
+                    )
+                    written += 1
             for result in returned:
                 scope = chunk[ids.index(result["mention_id"])]
                 decision, canonical = result["decision"], result["canonical"]
@@ -3895,6 +4021,13 @@ def record_rejected_discovery(
         "evidence_units": units,
         "response": response,
     }
+    return append_rejection_payload(project, payload)
+
+
+# ##################################################################
+# append rejection payload
+# the single durable append-only writer of the raw rejection archive; returns the line reference every pending row cites.
+def append_rejection_payload(project: Path, payload: dict) -> dict:
     path = project / REJECTIONS_NAME
     line = json.dumps(payload, ensure_ascii=False)
     line_number = sum(1 for _ in path.open(encoding="utf-8")) if path.is_file() else 0

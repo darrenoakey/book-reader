@@ -686,3 +686,132 @@ def test_invented_marker_paragraph_id_is_schema_blocked_and_locally_rejected(
 def test_chunk_without_shown_paragraphs_schema_allows_no_facts() -> None:
     schema = chunk_schema(Chunk("k9999", 0, 3, ()))
     assert schema["properties"]["facts"] == {"type": "array", "maxItems": 0}
+
+
+# ##################################################################
+# provider shapes
+# a real local HTTP server answers with each provider's real response shape; the generic transport must parse both.
+@pytest.fixture
+def provider_server():
+    import http.server
+    import threading
+
+    seen = []
+    reply = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            seen.append((self.path, json.loads(self.rfile.read(length))))
+            body = json.dumps(reply["body"]).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", seen, reply
+    server.shutdown()
+    server.server_close()
+
+
+OPENAI_BODY = {
+    "model": "proof-model:1",
+    "choices": [
+        {"message": {"role": "assistant", "content": '{"facts": []}'}, "finish_reason": "length"}
+    ],
+    "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+}
+OLLAMA_BODY = {
+    "model": "proof-model:1",
+    "message": {"role": "assistant", "content": '{"facts": []}'},
+    "done_reason": "length",
+    "prompt_eval_count": 11,
+    "eval_count": 7,
+}
+PARSED = {
+    "model": "proof-model:1",
+    "done_reason": "length",
+    "prompt_eval_count": 11,
+    "eval_count": 7,
+    "content": '{"facts": []}',
+}
+
+
+def test_chat_transport_parses_both_provider_shapes(provider_server) -> None:
+    from src.wide_bio import chat_transport
+
+    base, _seen, reply = provider_server
+    for body in (OPENAI_BODY, OLLAMA_BODY):
+        reply["body"] = body
+        assert chat_transport(base + "/x", b"{}", 5) == PARSED
+    reply["body"] = {"unexpected": 1}
+    parsed = chat_transport(base + "/x", b"{}", 5)
+    assert parsed["model"] is None and parsed["content"] == ""
+    reply["body"] = {"model": "m", "choices": [], "usage": None}
+    assert chat_transport(base + "/x", b"{}", 5)["content"] == ""
+
+
+def test_openai_proof_config_loads_and_stays_strict(world) -> None:
+    root, _, digest, *_ = world
+    config = load_proof_config(
+        make_config(root, digest, llm={"primary_style": "openai"})
+    )
+    assert (
+        config.backend.style == "openai"
+        and config.backend.num_ctx == 262144
+        and config.input_budget == 262144 - 2048 - 1024
+    )
+    for llm, code in (
+        ({"primary_style": "vllm"}, "config_invalid"),
+        ({"primary_style": "openai", "primary_num_ctx": 32768}, "config_wrong_context"),
+        (
+            {"primary_style": "openai", "primary_url": "http://localhost:8000"},
+            "config_is_fallback",
+        ),
+        ({"primary_style": "openai", "primary_model": "x-8b"}, "config_is_fallback"),
+    ):
+        with pytest.raises(ContractError) as error:
+            load_proof_config(make_config(root, digest, llm=llm))
+        assert error.value.code == code
+
+
+def test_openai_run_uses_chat_completions_and_rejects_fallback(
+    world, provider_server
+) -> None:
+    from src.wide_bio import chat_transport
+
+    root, _, digest, *_ = world
+    base, seen, reply = provider_server
+    openai_path = make_config(root, digest, llm={"primary_style": "openai"})
+    config = load_proof_config(openai_path)
+    _, plan, chapters = one_chunk(world)
+    cal = calibration(config, config.tokenizer_sha256)
+
+    def transport(url: str, payload: bytes, timeout: float) -> dict:
+        assert url.endswith("/v1/chat/completions")
+        return chat_transport(base + "/v1/chat/completions", payload, timeout)
+
+    reply["body"] = OPENAI_BODY | {
+        "choices": [
+            {"message": {"content": '{"facts": []}'}, "finish_reason": "stop"}
+        ]
+    }
+    out = root / "oa"
+    summary = run_extraction(chapters, config, plan, out, transport, cal)
+    assert summary["state"] == "ready"
+    assert seen and seen[0][0] == "/v1/chat/completions"
+    assert "options" not in seen[0][1] and seen[0][1]["model"] == "proof-model:1"
+    meta = json.loads((out / "raw" / "k0000.meta.json").read_text())
+    assert meta["prompt_eval_count"] == 11 and meta["eval_count"] == 7
+    count = len(seen)
+    reply["body"] = OPENAI_BODY | {"model": "qwen3:8b"}
+    with pytest.raises(ContractError) as error:
+        run_extraction(chapters, config, plan, root / "oafb", transport, cal)
+    assert error.value.code == "fallback_route"
+    assert len(seen) == count + 1

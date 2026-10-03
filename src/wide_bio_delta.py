@@ -61,9 +61,9 @@ from src.wide_bio import (
     Transport,
     build_counter,
     canonical_json,
+    chat_transport,
     check_output_dir,
     load_proof_config,
-    ollama_transport,
     pack_source,
     padded,
     project_chapters,
@@ -1548,7 +1548,7 @@ class WideBioHook:
     settings: DeltaSettings
     calibration_path: Path | None = None
     live: bool = False
-    transport: Transport = ollama_transport
+    transport: Transport = chat_transport
     soft_s: float = SOFT_DEADLINE_S
     hard_s: float = HARD_DEADLINE_S
 
@@ -1663,8 +1663,8 @@ class WideBioHook:
 
 # ##################################################################
 # main
-# plan/validate are offline; run needs --execute and a calibration record. Exit 0 = ready, 3 = not_ready (durable summary written), 2 = refused before any request. `transport` is injectable only for tests; the default is the single-route ollama transport.
-def main(argv: list[str] | None = None, transport: Transport = ollama_transport) -> int:
+# plan/validate are offline; run needs --execute and a calibration record. Exit 0 = ready, 3 = not_ready (durable summary written), 2 = refused before any request. `transport` is injectable only for tests; the default is the single-route chat transport.
+def main(argv: list[str] | None = None, transport: Transport = chat_transport) -> int:
     parser = argparse.ArgumentParser(
         description="Resumable delta runner for wide-context biography extraction (offline unless `--execute`)"
     )

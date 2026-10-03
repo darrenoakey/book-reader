@@ -273,6 +273,10 @@ def provider_integer(data: dict, field: str) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def first_integer(*values: int | None) -> int | None:
+    return next((value for value in values if value is not None), None)
+
+
 # ##################################################################
 # emit call telemetry
 # write a JSON-line made solely of request sizes, route identity, and provider counters so operations can measure latency without persisting prompts or source text.
@@ -294,6 +298,7 @@ def emit_call_telemetry(
         reported_thinking_tokens = provider_integer(message, "thinking_tokens")
     if reported_thinking_tokens is None:
         reported_thinking_tokens = provider_integer(data, "thinking_tokens")
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     scope = _CALL_SCOPE.get()
     event = {
         "event": "book_reader_llm_call",
@@ -316,10 +321,10 @@ def emit_call_telemetry(
         "client_duration_ns": elapsed_ns,
         "total_duration_ns": provider_integer(data, "total_duration"),
         "load_duration_ns": provider_integer(data, "load_duration"),
-        "prompt_eval_count": provider_integer(data, "prompt_eval_count"),
+        "prompt_eval_count": first_integer(provider_integer(data, "prompt_eval_count"), provider_integer(usage, "prompt_tokens")),
         "prompt_eval_cached_count": provider_integer(data, "prompt_eval_cached_count"),
         "prompt_eval_duration_ns": provider_integer(data, "prompt_eval_duration"),
-        "eval_count": provider_integer(data, "eval_count"),
+        "eval_count": first_integer(provider_integer(data, "eval_count"), provider_integer(usage, "completion_tokens")),
         "eval_duration_ns": provider_integer(data, "eval_duration"),
     }
     print(json.dumps(event, sort_keys=True), flush=True)

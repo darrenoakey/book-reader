@@ -176,3 +176,19 @@ def test_ask_async_real() -> None:
         return await ask_async("Reply with exactly one word: PONG", max_tokens=32)
 
     assert "pong" in asyncio.run(go()).lower()
+
+
+# ##################################################################
+# test openai usage telemetry
+# OpenAI `usage` token counts populate the same numeric telemetry fields as ollama counters.
+def test_openai_usage_populates_call_telemetry(capsys: pytest.CaptureFixture[str]) -> None:
+    from src.llm import emit_call_telemetry
+
+    backend = Backend("http://example.invalid", "example.invalid", "m", "openai", 262144, False)
+    data = {"usage": {"prompt_tokens": 12, "completion_tokens": 5}}
+    emit_call_telemetry(backend, data, [{"content": "hi"}], b"{}", 10, "ok", 1, 1, None)
+    call = json.loads(capsys.readouterr().out)
+    assert call["style"] == "openai" and call["prompt_eval_count"] == 12 and call["eval_count"] == 5
+    emit_call_telemetry(backend, {"prompt_eval_count": 3, "eval_count": 4}, [], b"{}", 1, "", 1, 1, None)
+    call = json.loads(capsys.readouterr().out)
+    assert call["prompt_eval_count"] == 3 and call["eval_count"] == 4

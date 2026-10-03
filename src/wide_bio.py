@@ -175,9 +175,9 @@ def load_proof_config(path: Path) -> ProofConfig:
     url = str(llm.get("primary_url", "")).rstrip("/")
     model = str(llm.get("primary_model", ""))
     style = str(llm.get("primary_style", "ollama")).lower()
-    if not url.startswith(("http://", "https://")) or not model or style != "ollama":
+    if not url.startswith(("http://", "https://")) or not model or style not in {"ollama", "openai"}:
         raise ContractError(
-            "proof config needs an ollama primary_url and primary_model",
+            "proof config needs an ollama or openai primary_url and primary_model",
             "config_invalid",
         )
     if (
@@ -234,7 +234,7 @@ def load_proof_config(path: Path) -> ProofConfig:
         url,
         str(llm.get("primary_ping_host", "")),
         model,
-        "ollama",
+        style,
         PROOF_NUM_CTX,
         bool(llm.get("primary_think", False)),
     )
@@ -743,14 +743,45 @@ Transport = Callable[[str, bytes, float], dict]
 
 
 # ##################################################################
-# ollama transport
-# the only network call: one POST of the prepared payload to the explicit primary URL with the remaining time as its timeout. No retries, no backup route, no router. Returns content plus the server's own accounting.
-def ollama_transport(url: str, payload: bytes, timeout: float) -> dict:
+# chat transport
+# the only network call: one POST of the prepared payload to the explicit primary URL with the remaining time as its timeout. No retries, no backup route, no router. The response is read with a hard size cap and parsed by its own shape: ollama (`message`, `prompt_eval_count`, `eval_count`, `done_reason`) or OpenAI chat completions (`choices[0].message.content`, `finish_reason`, `usage.prompt_tokens/completion_tokens`). Anything else yields no content and no model, which the caller rejects.
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
+
+def chat_transport(url: str, payload: bytes, timeout: float) -> dict:
     request = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        data = json.loads(response.read().decode("utf-8"))
+        body = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise ValueError("response exceeds the size cap")
+    return parse_chat_response(json.loads(body.decode("utf-8")))
+
+
+def parse_chat_response(data) -> dict:
+    if not isinstance(data, dict):
+        return {
+            "model": None,
+            "done_reason": None,
+            "prompt_eval_count": None,
+            "eval_count": None,
+            "content": "",
+        }
+    if isinstance(data.get("choices"), list):
+        choices = data["choices"]
+        choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        message = choice.get("message")
+        usage = data.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        content = message.get("content") if isinstance(message, dict) else None
+        return {
+            "model": data.get("model"),
+            "done_reason": choice.get("finish_reason"),
+            "prompt_eval_count": usage.get("prompt_tokens"),
+            "eval_count": usage.get("completion_tokens"),
+            "content": content if isinstance(content, str) else "",
+        }
     return {
         key: data.get(key)
         for key in ("model", "done_reason", "prompt_eval_count", "eval_count")
@@ -1027,7 +1058,7 @@ def main(argv: list[str] | None = None) -> int:
         pid_file, exit_file = args.out / "run.pid", args.out / "run.exit"
         write_atomic(pid_file, str(os.getpid()))
         summary = run_extraction(
-            chapters, config, plan, args.out, ollama_transport, calibration
+            chapters, config, plan, args.out, chat_transport, calibration
         )
         write_atomic(exit_file, "0")
         print(json.dumps(summary, sort_keys=True))

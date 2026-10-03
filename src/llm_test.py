@@ -108,10 +108,16 @@ def test_live_native_telemetry_is_metadata_only(capsys: pytest.CaptureFixture[st
     assert call["batch_start"] == 7 and call["batch_end"] == 8 and call["phase_call"] == 1
     assert call["model"] == BACKUP.model and call["think_requested"] is False
     assert call["input_chars"] == len(prompt) and call["output_chars"] == len('{"ok":true}')
+    assert len(call["request_sha256"]) == 64 and all(char in "0123456789abcdef" for char in call["request_sha256"])
     assert call["total_duration_ns"] is not None and call["prompt_eval_count"] is not None and call["eval_count"] is not None
     assert call["thinking_tokens_reported"] is None
     assert "CAST_SOURCE_SECRET" not in json.dumps(call)
-    assert phase["calls_started"] == 1 and phase["outcome"] == "ok" and phase["wall_duration_ns"] > 0
+    assert (
+        phase["calls_started"] == 1
+        and phase["outcome"] == "ok"
+        and phase["error_code"] is None
+        and phase["wall_duration_ns"] > 0
+    )
 
 
 # ##################################################################

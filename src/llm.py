@@ -8,6 +8,7 @@ reachable primary never cause a backend switch.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import subprocess
@@ -234,10 +235,13 @@ def telemetry_scope(phase: str, batch_start: int, batch_end: int, window_index: 
     }
     token = _CALL_SCOPE.set(scope)
     outcome = "ok"
+    error_code = None
     try:
         yield
-    except BaseException:
+    except BaseException as error:
         outcome = "error"
+        code = getattr(error, "code", None)
+        error_code = code if isinstance(code, str) else type(error).__name__
         raise
     finally:
         elapsed_ns = time.perf_counter_ns() - int(scope["started_ns"])
@@ -252,6 +256,7 @@ def telemetry_scope(phase: str, batch_start: int, batch_end: int, window_index: 
                     "calls_started": scope["calls_started"],
                     "wall_duration_ns": elapsed_ns,
                     "outcome": outcome,
+                    "error_code": error_code,
                 },
                 sort_keys=True,
             ),
@@ -303,6 +308,7 @@ def emit_call_telemetry(
         "think_requested": backend.think,
         "input_chars": sum(len(str(message.get("content", ""))) for message in messages),
         "request_bytes": len(payload),
+        "request_sha256": hashlib.sha256(payload).hexdigest(),
         "output_chars": len(content),
         "response_bytes": response_bytes,
         "thinking_chars": len(thinking) if isinstance(thinking, str) else None,

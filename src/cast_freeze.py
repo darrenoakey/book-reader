@@ -2114,19 +2114,32 @@ def ambiguous_pending_kind(candidate: dict) -> str:
 
 
 def defer_ambiguous_candidates(
-    records: list[dict], candidates: list[dict], units: list[dict], deferred: list[dict]
+    project: Path, records: list[dict], candidates: list[dict], units: list[dict], deferred: list[dict]
 ) -> None:
     """Move every still-ambiguous candidate into the pending lane."""
     references = immutable_name_references(units)
+    units_by_id = {unit["id"]: unit for unit in units}
+    scoped = mention_scoped_audit_index(load_scoped_audit(project))
     candidate_by_id = {candidate["id"]: candidate for candidate in candidates}
     already = {entry["candidate_id"] for entry in deferred}
     for item in records:
         if item["status"] == "ambiguous" and item["candidate_id"] not in already:
             candidate = candidate_by_id[item["candidate_id"]]
+            # The exact-mention review just wrote its audit record. Read that binding directly instead of re-running
+            # the complete classification merely to repopulate candidate_coverage_ledger with the same scope.
+            audit = next(
+                (
+                    scoped.get(mention_scope(units_by_id[references[ref_id]["unit_id"]], references[ref_id]))
+                    for ref_id in candidate["ref_ids"]
+                    if scoped.get(mention_scope(units_by_id[references[ref_id]["unit_id"]], references[ref_id]))
+                ),
+                candidate.get("scoped_audit"),
+            )
+            candidate_with_audit = {**candidate, "scoped_audit": audit} if audit else candidate
             deferred.append(
                 pending_identity_entry(
-                    candidate,
-                    ambiguous_pending_kind(candidate),
+                    candidate_with_audit,
+                    ambiguous_pending_kind(candidate_with_audit),
                     "source leaves this named span unresolved after exact-mention adjudication",
                     units,
                     references,
@@ -2935,10 +2948,17 @@ def supersede_scoped_record(records: list[dict], known: dict, scope: tuple, reco
 
 
 def adjudicate_pending_mentions(
-    project: Path, pending: list[dict], units: list[dict], registry: dict, ask, aliases: dict | None = None
-) -> int:
-    """Adjudicate every pending mention lacking a binding decision; returns the number of audit records written (0 means no new context)."""
-    written = 0
+    project: Path,
+    pending: list[dict],
+    units: list[dict],
+    registry: dict,
+    ask,
+    aliases: dict | None = None,
+    *,
+    binding_progress_only: bool = False,
+) -> int | bool:
+    """Adjudicate every pending mention. Normal callers receive the audit-write count; a classifier retry asks only whether a new source-proven alias/non-character binding was produced, because an ambiguous record is terminal pending evidence rather than new classification context."""
+    written = binding_written = 0
     references = immutable_name_references(units)
     units_by_id = {unit["id"]: unit for unit in units}
     order = [unit["id"] for unit in units]
@@ -3238,9 +3258,11 @@ def adjudicate_pending_mentions(
                 }
                 supersede_scoped_record(records, known, scope, record)
                 written += 1
+                if decision in {"alias", "non_character"}:
+                    binding_written += 1
             mention_scoped_audit_index(records)
             atomic_json(project / SCOPED_AUDIT_NAME, {"records": records})
-    return written
+    return bool(binding_written) if binding_progress_only else written
 
 
 # ##################################################################
@@ -3268,7 +3290,7 @@ def discover_batch(
             break
         if review_round == 1:
             raise CastDataIssue("proposed-new identity review did not converge")
-    defer_ambiguous_candidates(records, candidates, batch_units, deferred)
+    defer_ambiguous_candidates(project, records, candidates, batch_units, deferred)
     demote_deferred(records, candidates, batch_units, deferred)
     resolve_provisional_chains_before_materialize(records, candidates, progress["registry"])
     discoveries, classifications = materialize_classifications(
@@ -3416,9 +3438,15 @@ def collect_classifications(
                     )
         if not pending:
             break
-        # monotonic: only mentions without a binding decision are adjudicated, so a round that writes nothing has no new context and cannot change the next classification
+        # A typed ambiguous/owner-absent record is terminal evidence for this source scope: it must be deferred below, not treated as fresh context that re-asks the whole classification chunk. Only a newly source-proven alias/non-character binding can make the next classification round materially different.
         if not adjudicate_pending_mentions(
-            project, pending, batch_units, progress["registry"], ask, progress["aliases"]
+            project,
+            pending,
+            batch_units,
+            progress["registry"],
+            ask,
+            progress["aliases"],
+            binding_progress_only=True,
         ):
             break
         if adjudication_round == ADJUDICATION_MAX_ROUNDS - 1:

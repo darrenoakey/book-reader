@@ -1266,7 +1266,10 @@ def test_adjudication_rejects_verdict_contradicting_person_answer(tmp_path: Path
     for label in ("Ren Dove", "Mom"):
         candidate = next(c for c in ledger if c["label"] == label)
         candidate = {**candidate, "ref_ids": candidate["ref_ids"][:1]}
-        adjudicate_pending_mentions(tmp_path, [{"candidate": candidate, "proposed": None}], units, registry, ask)
+        progressed = adjudicate_pending_mentions(
+            tmp_path, [{"candidate": candidate, "proposed": None}], units, registry, ask, binding_progress_only=True
+        )
+        assert progressed is (label == "Ren Dove")
     records = json.loads((tmp_path / "mention-scoped-audit.json").read_text())["records"]
     assert [(r["label"], r["decision"], r["canonical"]) for r in records] == [
         ("Ren Dove", "non_character", "none"),

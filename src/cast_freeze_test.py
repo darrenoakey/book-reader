@@ -3814,6 +3814,114 @@ def test_alias_proof_requires_literal_tie_continuity_and_no_contradiction() -> N
     assert "continuity" in proof("Ana Reed", "ana", "Ana Reed shouted.")[1]
 
 
+# scoped source bridge: a role label with no profile tie is accepted only on one explicit continuous literal predicate in the cited scene
+@pytest.mark.parametrize(
+    ("label", "owner", "scene", "ok"),
+    [
+        ("Master", "chen", "Master Chen bowed. Rain fell. Master, said Ana.", True),
+        ("Teacher", "lu", "Lu, the Teacher, smiled. Teacher, said Ana.", True),
+        (
+            "Director",
+            "vega",
+            "Vega was the Director. Ana waited. Director, said Ana.",
+            True,
+        ),
+        ("Director", "vega", "Vega (the Director) arrived. Director, said Ana.", True),
+        # co-occurrence alone, bare title, wrong role
+        ("Master", "chen", "Chen and Ana walked. Rain fell. Master, said Ana.", False),
+        ("Master", "chen", "Rain fell. Master, said Ana.", False),
+        ("Master", "chen", "Chen was the Teacher. Master, said Ana.", False),
+        # second participant of the same role
+        (
+            "Master",
+            "chen",
+            "Master Chen bowed. Master Wu bowed. Master, said Ana.",
+            False,
+        ),
+        (
+            "Teacher",
+            "lu",
+            "Lu, the Teacher, smiled. Ana, the Teacher, frowned. Teacher, said Bo.",
+            False,
+        ),
+        # enumerated distinct actors
+        ("Master", "chen", "Master and Chen fought. Master, said Ana.", False),
+    ],
+)
+def test_source_bridge_alias_requires_explicit_predicate(
+    tmp_path: Path, label: str, owner: str, scene: str, ok: bool
+) -> None:
+    from src.cast_freeze import scoped_alias_proof
+
+    chapter = tmp_path / "ch1.txt"
+    chapter.write_text(scene, encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    registry = {
+        "chen": {"name": "Chen", "bio": "a sect elder"},
+        "lu": {"name": "Lu", "bio": "a scholar"},
+        "vega": {"name": "Vega", "bio": "runs the studio"},
+        "ana": {"name": "Ana", "bio": "a scout"},
+    }
+    mention = next(
+        u for u in reversed(units) if re.search(rf"(?<!\w){label},", u["quote"])
+    )
+    proof, why = scoped_alias_proof(label, owner, mention, units, registry, {})
+    if ok:
+        assert (
+            why is None
+            and proof["literal"] == "source_bridge"
+            and proof["continuity"]["type"] == "source_bridge"
+        )
+    else:
+        assert proof is None and why
+
+
+def test_source_bridge_ignores_generic_role_mentions_in_other_profiles(tmp_path: Path) -> None:
+    from src.cast_freeze import scoped_alias_proof
+
+    chapter = tmp_path / "ch1.txt"
+    chapter.write_text("Master Yang bowed. Rain fell. Master, said Ana.", encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    registry = {
+        "professor_yang": {"name": "Yang", "bio": "a sect elder"},
+        "lin": {"bio": "a scholar"},
+        "jared": {"name": "Patender", "bio": "served Master Jared; Teacher Dorothy's rival"},
+        "ana": {"name": "Ana", "bio": "a scout"},
+    }
+    proof, why = scoped_alias_proof("Master", "professor_yang", units[-1], units, registry, {})
+    assert why is None and proof["literal"] == "source_bridge"
+    # registry entries without a name fall back to the lower-case actor id: matching is case-insensitive
+    chapter.write_text("Teacher Lin bowed. Teacher, said Ana.", encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    proof, why = scoped_alias_proof("Teacher", "lin", units[-1], units, registry, {})
+    assert why is None and proof["literal"] == "source_bridge"
+
+
+def test_source_bridge_keeps_existing_negatives_and_never_global(
+    tmp_path: Path,
+) -> None:
+    from src.cast_freeze import scoped_alias_proof
+
+    chapter = tmp_path / "ch1.txt"
+    chapter.write_text("Luna Reed sat. Lynn, said Ana.", encoding="utf-8")
+    units = immutable_evidence_units([chapter])
+    registry = {
+        "luna": {"name": "Luna Reed"},
+        "father": {"name": "Father"},
+        "ana": {"name": "Ana"},
+    }
+    aliases: dict = {}
+    assert (
+        scoped_alias_proof("Lynn", "luna", units[-1], units, registry, aliases)[0]
+        is None
+    )
+    assert (
+        scoped_alias_proof("Fang", "father", units[-1], units, registry, aliases)[0]
+        is None
+    )
+    assert aliases == {} and "Master" not in registry
+
+
 def test_adjudication_withholds_unproven_alias_and_keeps_raw_binding(tmp_path: Path) -> None:
     from src.cast_freeze import (
         SCOPED_AUDIT_NAME,

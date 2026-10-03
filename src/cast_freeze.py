@@ -2063,6 +2063,107 @@ def mask_label(quote: str, label: str, protected: list[str]) -> str:
     return out
 
 
+BRIDGE_DETERMINERS = r"(?:the|our|their|his|her|my)"
+BRIDGE_COPULA = r"(?:is|was|became|remained|served as|is known as|was known as|is called|was called)"
+
+
+def source_bridge_predicate(
+    label: str,
+    owner: str,
+    scene_units: list[dict],
+    registry: dict,
+    aliases: dict,
+    common_noun_only: bool = False,
+) -> dict | None:
+    """Explicit source evidence that a role or title label is this owner, from the cited immutable scene units alone.
+
+    Accepted only as one continuous literal predicate inside a single unit: role+known-name ("Master Chen"), name apposition
+    ("Chen, the Master" / "Chen (the Master)" / "Master (Chen)" / "Master, Chen"), or a copula ("Chen was the Master").
+    Co-occurrence of the label and the name, a bare title, a second participant of the same role (another cast member
+    carrying the label, or the label followed by a different name) and a name shared with another cast member all yield None.
+    common_noun_only (a label that is not a known title word) additionally demands the determiner-introduced forms, so a bare name never binds."""
+    lab = re.escape(label.strip())
+    if not label.strip():
+        return None
+    others = [other for other in registry if other not in {owner, "narrator"}]
+    other_tokens = (
+        set().union(*(owner_name_tokens(other, registry, aliases) for other in others))
+        if others
+        else set()
+    )
+    own_tokens = owner_name_tokens(owner, registry, aliases)
+    names = set(owner_name_forms(owner, registry, aliases))
+    names |= {
+        word
+        for form in list(names)
+        for word in re.findall(r"[A-Za-z]+", form)
+        if len(word) > 2 and normalized_id(word) not in TITLE_ROLE_TOKENS
+    }
+    names = {
+        name
+        for name in names
+        if not label_components(name) & other_tokens
+        or label_components(name) >= own_tokens
+    }
+    other_forms = [form for other in others for form in owner_name_forms(other, registry, aliases)]
+    for unit in scene_units:
+        quote = unit["quote"]
+        if not re.search(lab, quote, re.IGNORECASE):
+            continue
+        for form in other_forms:
+            if is_apposition_mention(quote, label, form) or re.search(
+                rf"(?<!\w){re.escape(form)}\s*,?\s*(?:{BRIDGE_DETERMINERS}\s+)?{lab}\b",
+                quote,
+                re.IGNORECASE,
+            ):
+                return None
+        for match in re.finditer(rf"(?<!\w){lab}\s+((?-i:[A-Z][A-Za-z]+))", quote, re.IGNORECASE):
+            if normalized_id(match.group(1)) not in own_tokens:
+                return None
+    for unit in scene_units:
+        quote = unit["quote"]
+        if not re.search(lab, quote, re.IGNORECASE):
+            continue
+        for name in sorted(names, key=len, reverse=True):
+            if are_enumerated_distinct_actors(quote, label, name):
+                continue
+            nm = re.escape(name)
+            for kind, pattern in (
+                ("role_plus_name", rf"(?<!\w){lab}\s+{nm}(?!\w)"),
+                (
+                    "name_apposition",
+                    rf"(?<!\w){nm}\s*,\s*{BRIDGE_DETERMINERS}\s+{lab}(?!\w)",
+                ),
+                (
+                    "name_apposition",
+                    rf"(?<!\w){nm}\s*\(\s*(?:{BRIDGE_DETERMINERS}\s+)?{lab}\s*\)",
+                ),
+                ("name_apposition", rf"(?<!\w){lab}\s*\(\s*{nm}\s*\)"),
+                (
+                    "name_apposition",
+                    rf"(?<!\w){lab}\s*,\s*{nm}(?!\w)(?!\s+(?:and|or|nor)\b)",
+                ),
+                (
+                    "copula",
+                    rf"(?<!\w){nm}\s+{BRIDGE_COPULA}\s+{BRIDGE_DETERMINERS}\s+{lab}(?!\w)",
+                ),
+                (
+                    "copula",
+                    rf"(?<!\w){BRIDGE_DETERMINERS}\s+{lab}\s+{BRIDGE_COPULA}\s+{nm}(?!\w)",
+                ),
+            ):
+                if common_noun_only and BRIDGE_DETERMINERS not in pattern:
+                    continue
+                if re.search(pattern, quote, re.IGNORECASE):
+                    return {
+                        "type": "source_bridge",
+                        "predicate": kind,
+                        "owner_name": name,
+                        "witness_unit_id": unit["id"],
+                    }
+    return None
+
+
 def scoped_alias_proof(
     label: str,
     owner: str,
@@ -2085,7 +2186,20 @@ def scoped_alias_proof(
     pattern = literal_pattern(label)
     in_profile = any(pattern.search(text) for text in profile)
     role_only = not name_tokens
-    if name_tokens:
+    bridge = None
+    if (
+        name_tokens
+        and not name_tokens & owner_tokens
+        and not in_profile
+        and len(label.split()) == 1
+        and not any(
+            name_tokens & owner_name_tokens(other, registry, aliases) for other in registry if other not in {owner, "narrator"}
+        )
+    ):
+        bridge = source_bridge_predicate(label, owner, scene_units, registry, aliases, common_noun_only=True)
+    if bridge is not None:
+        literal = "source_bridge"
+    elif name_tokens:
         if not name_tokens & owner_tokens and not in_profile:
             return None, f"label {label!r} shares no name word with {owner!r} and is not written in its profile"
         extra = name_tokens - owner_tokens
@@ -2095,7 +2209,10 @@ def scoped_alias_proof(
                     return None, f"label {label!r} carries the name of another cast member {other!r}"
         literal = "shared_name_word" if name_tokens & owner_tokens else "owner_profile_literal"
     elif not in_profile:
-        return None, f"role or title label {label!r} is not written in the profile of {owner!r}"
+        bridge = source_bridge_predicate(label, owner, scene_units, registry, aliases)
+        if bridge is None:
+            return None, f"role or title label {label!r} is not written in the profile of {owner!r}"
+        literal = "source_bridge"
     else:
         literal = "owner_profile_literal"
     quote = mention_unit["quote"]
@@ -2137,7 +2254,9 @@ def scoped_alias_proof(
                     break
             if profile_relation:
                 break
-    if role_only:
+    if literal == "source_bridge":
+        supported, continuity = True, bridge
+    elif role_only:
         # A title cannot bind by authority, role similarity, or a broad profile anchor. It needs an
         # explicit owner name in the scene, or a profile relation whose other participant is actually named.
         if continuity is not None and continuity.get("type") != "literal_witness":

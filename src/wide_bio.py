@@ -41,7 +41,7 @@ HARD_DEADLINE_S = 240
 FALLBACK_MODEL = re.compile(r"(?i)(^|[:\-_/])8b\b")
 LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 PROOF_NUM_CTX = 262144
 CANONICAL_CONFIG = (
     Path(__file__).resolve().parent.parent / "local" / "config.toml"
@@ -95,6 +95,21 @@ SCHEMA = {
         }
     },
 }
+
+
+# ##################################################################
+# per-chunk response schema
+# SCHEMA is only the template: each request is sent with `paragraph_id` constrained to the exact IDs of that chunk's shown paragraphs, so the server cannot emit an unshown or marker-shaped ID such as `P 000001`. A chunk with no shown paragraph can only return no facts. Local quote/witness validation still runs on every response.
+def chunk_schema(chunk: Chunk) -> dict:
+    schema = json.loads(json.dumps(SCHEMA))
+    facts = schema["properties"]["facts"]
+    ids = [paragraph.id for paragraph in chunk.paragraphs]
+    if ids:
+        facts["items"]["properties"]["paragraph_id"] = {"type": "string", "enum": ids}
+    else:
+        facts.pop("items")
+        facts["maxItems"] = 0
+    return schema
 
 
 class ContractError(Exception):
@@ -452,7 +467,7 @@ def build_plan(
         "fixed_overhead_tokens": fixed_overhead,
         "input_budget": config.input_budget,
         "tokenizer_capture_sha256": config.tokenizer_sha256,
-        "schema_sha256": sha256_text(canonical_json(SCHEMA)),
+        "schema_template_sha256": sha256_text(canonical_json(SCHEMA)),
         "system_prompt_sha256": sha256_text(SYSTEM_PROMPT),
         "calibration_required": True,
         "coverage": coverage,
@@ -465,6 +480,8 @@ def build_plan(
                 "input_tokens": item.input_tokens,
                 "padded_tokens": item.padded_tokens,
                 "user_sha256": sha256_text(item.user),
+                "paragraph_ids": [paragraph.id for paragraph in item.chunk.paragraphs],
+                "schema_sha256": sha256_text(canonical_json(chunk_schema(item.chunk))),
             }
             for item in planned
         ],
@@ -713,7 +730,13 @@ def request_record(config: ProofConfig, item: PlannedChunk) -> tuple[str, bytes]
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": item.user},
     ]
-    return request_for(config.backend, messages, 0.0, config.output_tokens, SCHEMA)
+    return request_for(
+        config.backend,
+        messages,
+        0.0,
+        config.output_tokens,
+        chunk_schema(item.chunk),
+    )
 
 
 Transport = Callable[[str, bytes, float], dict]

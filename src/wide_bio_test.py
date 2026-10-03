@@ -8,14 +8,20 @@ import pytest
 from src.wide_bio import (
     CATEGORIES,
     MAX_FIXED_OVERHEAD_TOKENS,
+    SCHEMA,
+    Chunk,
     ContractError,
     build_counter,
     build_plan,
+    canonical_json,
+    chunk_schema,
     load_proof_config,
     main,
     padded,
     project_chapters,
+    request_record,
     run_extraction,
+    sha256_text,
     validate_calibration,
     validate_response,
 )
@@ -614,3 +620,69 @@ def test_cli_run_builds_plan_with_calibrated_overhead(world, capsys) -> None:
     )
     assert "calibration_drift" in capsys.readouterr().err
     assert not (runout / "plan.json").exists()
+
+
+def sent_paragraph_id_schema(config, item) -> dict:
+    _, payload = request_record(config, item)
+    return json.loads(payload)["format"]["properties"]["facts"]["items"]["properties"][
+        "paragraph_id"
+    ]
+
+
+def test_each_request_constrains_paragraph_id_to_that_chunks_exact_ids(world) -> None:
+    config, plan, _ = one_chunk(world)
+    assert len(plan.chunks) > 1
+    template = SCHEMA["properties"]["facts"]["items"]["properties"]["paragraph_id"]
+    assert "enum" not in template
+    for item, entry in zip(plan.chunks, plan.artifact["chunks"]):
+        ids = [paragraph.id for paragraph in item.chunk.paragraphs]
+        assert ids and all(len(i) == 6 and i.isdigit() for i in ids)
+        assert sent_paragraph_id_schema(config, item) == {
+            "type": "string",
+            "enum": ids,
+        }
+        assert entry["paragraph_ids"] == ids
+        assert entry["schema_sha256"] == sha256_text(
+            canonical_json(chunk_schema(item.chunk))
+        )
+    assert len({entry["schema_sha256"] for entry in plan.artifact["chunks"]}) == len(
+        plan.chunks
+    )
+    assert plan.artifact["schema_template_sha256"] == sha256_text(
+        canonical_json(SCHEMA)
+    )
+    assert "schema_sha256" not in plan.artifact
+
+
+def test_invented_marker_paragraph_id_is_schema_blocked_and_locally_rejected(
+    world,
+) -> None:
+    config, plan, _ = one_chunk(world)
+    item = next(
+        item
+        for item in plan.chunks
+        if any(p.text.startswith("Ren was") for p in item.chunk.paragraphs)
+    )
+    ren = next(p for p in item.chunk.paragraphs if p.text.startswith("Ren was"))
+    allowed = sent_paragraph_id_schema(config, item)["enum"]
+    assert "P 000001" not in allowed
+    good = {
+        "subject": "Ren",
+        "category": "appearance",
+        "value": "tall",
+        "quote": "Ren was tall",
+        "paragraph_id": ren.id,
+    }
+    assert good["paragraph_id"] in allowed
+    result = validate_response(
+        json.dumps({"facts": [good, {**good, "paragraph_id": "P 000001"}]}), item.chunk
+    )
+    assert len(result["claims"]) == 1
+    assert [r["reason"] for r in result["rejected"]] == ["unknown_paragraph_id"]
+    assert result["rejected"][0]["fact"]["paragraph_id"] == "P 000001"
+    assert result["status"] == "partial"
+
+
+def test_chunk_without_shown_paragraphs_schema_allows_no_facts() -> None:
+    schema = chunk_schema(Chunk("k9999", 0, 3, ()))
+    assert schema["properties"]["facts"] == {"type": "array", "maxItems": 0}

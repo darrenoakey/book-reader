@@ -5166,9 +5166,21 @@ def _identity_duplicates(actor_id: str, name: str, registry: dict, aliases: dict
         elif key in known_ids:
             duplicates.append(f"{candidate!r} is already an alias of {known_ids[key]}")
     for owner in adjudication_owners(name, registry, aliases):
-        if owner_relevance(name, owner, registry[owner], aliases) >= 3:
+        if _shares_identifying_name(name, owner, registry[owner], aliases):
             duplicates.append(f"name {name!r} shares a name with registered actor {owner}")
     return duplicates
+
+
+def _shares_identifying_name(name: str, owner: str, entry: dict, aliases: dict) -> bool:
+    """True when a proposed name is an owner's exact name/id/alias or shares a non-title name word with it.
+
+    A shared title or role word alone (Lord, Professor, Captain...) names a class of people, not one actor, so it never
+    makes two different full names the same identity."""
+    if owner_relevance(name, owner, entry, aliases) >= 4:
+        return True
+    owner_forms = [str(entry.get("name", owner)), owner, *(alias for alias, target in aliases.items() if target == owner)]
+    owner_words = set().union(*(label_components(form) for form in owner_forms)) - TITLE_ROLE_TOKENS
+    return bool((label_components(name) - TITLE_ROLE_TOKENS) & owner_words)
 
 
 def _mention_link(row: dict, draft: dict, source: _ChapterSource, fact_units: dict[tuple[str, str], dict]) -> tuple[dict | None, str]:
@@ -5545,6 +5557,9 @@ ROOT_APPROVAL_CONTRACT = "cast_variant_root_approval"
 ROOT_APPROVAL_VERSION = 1
 ROOT_APPROVAL_STAGE = "cast_root_approval"
 ROOT_APPROVAL_BLOCKED = "root_approval_blocked"
+ROOT_APPROVAL_MALFORMED = "root_approval_malformed"
+UNCERTAIN_VERDICT = "uncertain"
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 ROOT_APPROVE_ACTION = "approve_root"
 NATIVE_REVIEW = "native_review_audit"
 SOURCE_REVIEW = "source_reviewed_trusted_role"
@@ -5571,6 +5586,24 @@ KIN_MODIFIER_WORDS = frozenset({"little", "big", "older", "younger", "elder", "d
 
 def _approval_invalid(message: str) -> OperationalError:
     return OperationalError("cast_integrity", f"caretaker root approval: {message}")
+
+
+class _MalformedApproval(Exception):
+    """One approval entry is invalid on its own (schema, values, review structure): held as a typed pending row, never a crash."""
+
+
+def _checked_approval_entry(approval: object) -> tuple[str, str, str]:
+    """(actor_id, proposal sha, note) of a structurally valid approval entry, else _MalformedApproval."""
+    if not isinstance(approval, dict) or set(approval) != ROOT_APPROVAL_FIELDS:
+        raise _MalformedApproval("approval entry is not an object with exactly the documented fields")
+    if approval["action"] != ROOT_APPROVE_ACTION:
+        raise _MalformedApproval(f"only the {ROOT_APPROVE_ACTION!r} action exists")
+    actor_id, sha, note = approval["actor_id"], approval["proposal_sha256"], approval["note"]
+    if not all(isinstance(item, str) for item in (actor_id, sha, note)) or not SHA256_HEX.fullmatch(sha):
+        raise _MalformedApproval("approval actor_id, note and a 64-hex proposal_sha256 must be text")
+    if HUMAN_REVIEW_CLAIM.search(json.dumps(approval)):
+        raise _MalformedApproval("approval claims a human review the system cannot attest")
+    return actor_id, sha, note
 
 
 def _stored_pending_roots(project: Path) -> dict[str, dict]:
@@ -5756,52 +5789,120 @@ def variant_root_duplicate_blockers(root: dict, registry: dict, aliases: dict, c
         if target and target != actor_id:
             blockers.append(f"variant {label!r} is already an alias of {target}")
         for owner, entry in registry.items():
-            if owner != "narrator" and isinstance(entry, dict) and owner_relevance(label, owner, entry, aliases) >= 3:
+            if owner != "narrator" and isinstance(entry, dict) and _shares_identifying_name(label, owner, entry, aliases):
                 blockers.append(f"variant {label!r} is literally carried by registered actor {owner}")
     return list(dict.fromkeys(blockers))
 
 
 def _validated_reviews(source: _ChapterSource, sha: str, reviews: object, mentions: list[dict]) -> list[dict]:
+    """One exact review per included mention. A structurally invalid review is _MalformedApproval; a witness that is not the exact current source stays OperationalError."""
     if not isinstance(reviews, list) or not reviews:
-        raise _approval_invalid("approval requires one review per included mention")
+        raise _MalformedApproval("approval requires one review per included mention")
     expected = {_scope_tuple(m["scope"]): m["scope"] for m in mentions}
     checked: dict[tuple, dict] = {}
     for review in reviews:
         if not isinstance(review, dict) or set(review) != ROOT_REVIEW_FIELDS or review["proposal_sha256"] != sha:
-            raise _approval_invalid("review has an invalid schema or cites a different proposal sha")
+            raise _MalformedApproval("review has an invalid schema or cites a different proposal sha")
         scope = review["scope"]
-        if not isinstance(scope, dict) or set(scope) != ROOT_SCOPE_FIELDS or type(scope["span_start"]) is not int:
-            raise _approval_invalid("review scope is invalid")
+        if (
+            not isinstance(scope, dict)
+            or set(scope) != ROOT_SCOPE_FIELDS
+            or type(scope["span_start"]) is not int
+            or not all(isinstance(scope[field], str) for field in ROOT_SCOPE_FIELDS - {"span_start"})
+        ):
+            raise _MalformedApproval("review scope is invalid")
         key = _scope_tuple(scope)
         if expected.get(key) != scope or key in checked:
-            raise _approval_invalid("review scope is not exactly one included mention of the proposal")
-        if review["provenance"] not in REVIEW_PROVENANCES or review["verdict"] != DISTINCT_VERDICT:
-            raise _approval_invalid(f"review provenance must be one of {sorted(REVIEW_PROVENANCES)} with verdict {DISTINCT_VERDICT}")
+            raise _MalformedApproval("review scope is not exactly one included mention of the proposal")
+        if not isinstance(review["provenance"], str) or review["provenance"] not in REVIEW_PROVENANCES or review["verdict"] != DISTINCT_VERDICT:
+            raise _MalformedApproval(f"review provenance must be one of {sorted(REVIEW_PROVENANCES)} with verdict {DISTINCT_VERDICT}")
         witnesses = review["factual_witnesses"]
         if review["provenance"] == NATIVE_REVIEW:
             if review["reviewer_role"] is not None or witnesses != [] or review["factual_basis"] != "":
-                raise _approval_invalid("a native review reference carries no reviewer role, witnesses or basis")
+                raise _MalformedApproval("a native review reference carries no reviewer role, witnesses or basis")
             exact: list[dict] = []
         else:
-            basis = review["factual_basis"]
-            if review["reviewer_role"] not in TRUSTED_REVIEW_ROLES or not isinstance(basis, str) or not basis.strip():
-                raise _approval_invalid("a source review needs a trusted reviewer role and a factual basis")
+            basis, role = review["factual_basis"], review["reviewer_role"]
+            if not isinstance(role, str) or role not in TRUSTED_REVIEW_ROLES or not isinstance(basis, str) or not basis.strip():
+                raise _MalformedApproval("a source review needs a trusted reviewer role and a factual basis")
+            if not isinstance(witnesses, list) or not witnesses or not all(
+                isinstance(w, dict)
+                and CONTEXT_V2_WITNESS_FIELDS <= set(w)
+                and all(isinstance(w[field], str) for field in CONTEXT_V2_WITNESS_FIELDS)
+                for w in witnesses
+            ):
+                raise _MalformedApproval("a source review needs exact factual witnesses of the documented schema")
             exact = _exact_cited_witnesses(source, witnesses, "source review witness")
-            if not exact:
-                raise _approval_invalid("a source review needs exact factual witnesses")
         checked[key] = {**review, "factual_witnesses": exact}
     if set(checked) != set(expected):
-        raise _approval_invalid("reviews must cover every included mention exactly once")
+        raise _MalformedApproval("reviews must cover every included mention exactly once")
     return [checked[key] for key in expected]
 
 
-def _review_records_for_gate(reviews: list[dict], audit: list[dict], words: list[str]) -> tuple[list[dict], list[str]]:
+def _recorded_owner_support_holds(provenance: object, owner: str, entry: dict, registry: dict, aliases: dict) -> bool:
+    """True while the support a native existing:<id> record carries is still honoured by the current registry."""
+    if not isinstance(provenance, dict):
+        return False
+    if provenance.get("type") == "literal_witness":
+        named = provenance.get("owner_name")
+        return isinstance(named, str) and named.casefold() in {form.casefold() for form in owner_name_forms(owner, registry, aliases)}
+    if provenance.get("type") == "content_anchor":
+        anchor = provenance.get("anchor")
+        return isinstance(anchor, str) and bool(anchor) and any(
+            anchor.casefold() in {w.casefold() for w in re.findall(r"\b[a-zA-Z]{4,}\b", text)}
+            for _field, text in extract_owner_profile_facts(entry)
+        )
+    return False
+
+
+def _existing_owner_claim_is_current(
+    native: dict, claim: str, mention: dict, registry: dict, aliases: dict, source: _ChapterSource
+) -> bool:
+    """A native existing:<id> claim is current only while its owner is a live registered actor AND either the support the record
+    carries is still honoured by the registry or the current source scene of the exact mention re-proves it with the ordinary
+    review guards. Anything else (owner gone, no recorded support and no scene proof) is stale/unusable."""
+    owner = claim.split(":", 1)[1]
+    entry = registry.get(owner)
+    if owner == "narrator" or not isinstance(entry, dict):
+        return False
+    if native.get("verdict") == claim and _recorded_owner_support_holds(native.get("provenance"), owner, entry, registry, aliases):
+        return True
+    scope = mention["scope"]
+    ordered, by_id = source.units(source.resolve(scope["chapter"], scope["chapter_sha256"], "native review mention"))
+    scene = scene_units_at(by_id, [unit["id"] for unit in ordered], [unit["id"] for unit in ordered].index(scope["unit_id"]))
+    return review_verdict_error(scope["label"], claim, [scope["unit_id"]], {}, {}, registry, aliases, by_id, mention["unit"], scene) is None
+
+
+def _native_review_veto(native: dict, mention: dict, registry: dict, aliases: dict, source: _ChapterSource) -> str | None:
+    """Why a native audit record that is not distinct_living_identity still binds the mention, or None when a source review may resolve it.
+
+    Resolvable: `uncertain` (including an invalid/unsupported or low-confidence raw existing:/same_provisional: review) and a
+    stale/unusable existing:<id>. Binding: a currently valid source-supported existing:<id> (recorded verdict, or the raw review
+    behind an `uncertain` record), and every other verdict (nonidentity_fragment, same_provisional:*, unknown)."""
+    verdict = native.get("verdict")
+    claim = verdict
+    if verdict == UNCERTAIN_VERDICT:
+        raw = native.get("raw_review")
+        claim = raw.get("verdict") if isinstance(raw, dict) else None
+        if not (isinstance(claim, str) and claim.startswith("existing:")):
+            return None
+    elif not (isinstance(verdict, str) and verdict.startswith("existing:")):
+        return f"native verdict {verdict!r} is a real conflict a source review cannot resolve"
+    if _existing_owner_claim_is_current(native, claim, mention, registry, aliases, source):
+        return f"{claim} is still supported by the current source and registry"
+    return None
+
+
+def _review_records_for_gate(
+    reviews: list[dict], audit: list[dict], words: list[str], mentions: list[dict], registry: dict, aliases: dict, source: _ChapterSource
+) -> tuple[list[dict], list[str]]:
     """Effective per-mention review records for variant_root_approval_gate, plus the reasons any review is unusable."""
     recorded = {
         (r.get("chapter_sha256"), r.get("quote_sha256"), r.get("label"), r.get("span_start")): r
         for r in audit
         if isinstance(r, dict)
     }
+    mention_by_scope = {_scope_tuple(m["scope"]): m for m in mentions}
     effective: list[dict] = []
     blockers: list[str] = []
     for review in reviews:
@@ -5815,9 +5916,13 @@ def _review_records_for_gate(reviews: list[dict], audit: list[dict], words: list
                 continue
             effective.append(native)
             continue
+        resolved = None
         if native and native.get("verdict") != DISTINCT_VERDICT:
-            blockers.append(f"{where}: the source review contradicts the native review verdict {native.get('verdict')!r}")
-            continue
+            why = _native_review_veto(native, mention_by_scope[_scope_tuple(scope)], registry, aliases, source)
+            if why:
+                blockers.append(f"{where}: the source review contradicts the native review verdict {native.get('verdict')!r}: {why}")
+                continue
+            resolved = native.get("verdict")
         if not any(_names_word(scope["label"], w["unit_quote"]) or any(_names_word(x, w["unit_quote"]) for x in words) for w in review["factual_witnesses"]):
             blockers.append(f"{where}: no source-review witness literally names the mention or the identity")
             continue
@@ -5830,6 +5935,7 @@ def _review_records_for_gate(reviews: list[dict], audit: list[dict], words: list
                 "verdict": DISTINCT_VERDICT,
                 "review_provenance": SOURCE_REVIEW,
                 "reviewer_role": review["reviewer_role"],
+                "resolved_native_verdict": resolved,
                 "own_source_witness": {
                     "unit_id": scope["unit_id"],
                     "provenance": SOURCE_REVIEW,
@@ -5841,7 +5947,7 @@ def _review_records_for_gate(reviews: list[dict], audit: list[dict], words: list
     return effective, blockers
 
 
-def _scoped_alias_record(actor_id: str, sha: str, mention: dict, review: dict, note: str) -> dict:
+def _scoped_alias_record(actor_id: str, sha: str, mention: dict, review: dict, note: str, resolved_native: object = None) -> dict:
     scope = mention["scope"]
     return {
         "chapter_sha256": scope["chapter_sha256"],
@@ -5859,6 +5965,7 @@ def _scoped_alias_record(actor_id: str, sha: str, mention: dict, review: dict, n
             "proposal_sha256": sha,
             "review_provenance": review["provenance"],
             "reviewer_role": review["reviewer_role"],
+            **({"resolved_native_verdict": resolved_native} if resolved_native else {}),
         },
     }
 
@@ -5891,18 +5998,31 @@ def _resolve_root_rows(recovery: RecoveryLedger, root: dict, sha: str, mentions:
             recovery.resolve(row, "approved_root_materialized", {"proposal_sha256": sha})
 
 
+def _close_malformed_rows(recovery: RecoveryLedger, current: set[str]) -> None:
+    """Resolve every open malformed-entry row whose entry is no longer in the file (fixed, replaced or removed)."""
+    for row in recovery.open_pending(ROOT_APPROVAL_STAGE):
+        digest = row["evidence"].get("entry_sha256") if isinstance(row["evidence"], dict) else None
+        if row["code"] == ROOT_APPROVAL_MALFORMED and digest not in current:
+            recovery.resolve(row, "root_approval_entry_superseded", {"entry_sha256": digest})
+
+
 def ingest_root_approvals(
     project: Path, source_sha: str, chapters: list[Path], progress: dict, recovery: RecoveryLedger
 ) -> dict:
     """Materialize every root the caretaker input approves and that passes every gate; return what happened.
 
-    Validation of the whole file (schema, source sha, exact proposal sha, exact current source, review structure) happens
-    before any write and fails closed. A gate failure only blocks that one root (typed pending row, nothing written).
-    Idempotent: an exact already-registered root only re-asserts its scoped audit and row resolutions.
+    Fail closed (OperationalError, nothing written) on file-level problems: unreadable file, wrong contract/version/fields,
+    wrong source book sha, an approval naming a proposal sha that is unknown / another actor's / not open, or any stored root
+    or cited witness that is not the exact current source. An approval entry that is invalid on its own (schema, values, human
+    claim, repeated actor/sha, malformed reviews) is never a crash: it becomes a typed `root_approval_malformed` pending row
+    and the file is held whole (no root of it is materialized until every entry is well formed). A gate failure only blocks
+    that one root (typed pending row, nothing written). Idempotent: an exact already-registered root only re-asserts its
+    scoped audit and row resolutions.
     """
-    outcome: dict[str, list] = {"materialized": [], "already": [], "blocked": []}
+    outcome: dict[str, list] = {"materialized": [], "already": [], "blocked": [], "malformed": []}
     path = project / ROOT_APPROVAL_NAME
     if not path.is_file():
+        _close_malformed_rows(recovery, set())
         return outcome
     payload = load_object(path, "caretaker root approvals")
     if (
@@ -5923,27 +6043,46 @@ def ingest_root_approvals(
     }
     registry, aliases = progress["registry"], progress["aliases"]
     plan: list[dict] = []
+    malformed: list[tuple[object, str]] = []
     seen_actors: set[str] = set()
     seen_shas: set[str] = set()
     for approval in payload["approvals"]:
-        if not isinstance(approval, dict) or set(approval) != ROOT_APPROVAL_FIELDS or approval["action"] != ROOT_APPROVE_ACTION:
-            raise _approval_invalid(f"approval has an invalid schema or action (only {ROOT_APPROVE_ACTION!r} exists)")
-        actor_id, sha, note = approval["actor_id"], approval["proposal_sha256"], approval["note"]
-        if not all(isinstance(item, str) for item in (actor_id, sha, note)) or HUMAN_REVIEW_CLAIM.search(json.dumps(approval)):
-            raise _approval_invalid("approval has invalid values or claims a human review the system cannot attest")
-        if actor_id in seen_actors or sha in seen_shas:
-            raise _approval_invalid("approval repeats an actor or proposal")
-        seen_actors.add(actor_id)
-        seen_shas.add(sha)
-        root = stored.get(sha)
-        if root is None or root["actor_id"] != actor_id:
-            raise _approval_invalid(f"no pending proposal for actor {actor_id!r} has the exact sha {sha!r}")
-        already = _materialized_root_sha(registry, actor_id) == sha
-        if not already and sha not in open_roots:
-            raise _approval_invalid(f"proposal {sha[:16]} for {actor_id!r} is not an open pending proposal (superseded or resolved)")
-        mentions = _revalidated_root(source, root)
-        reviews = _validated_reviews(source, sha, approval["reviews"], mentions)
+        try:
+            actor_id, sha, _note = _checked_approval_entry(approval)
+            if actor_id in seen_actors or sha in seen_shas:
+                raise _MalformedApproval("approval repeats an actor or proposal")
+            seen_actors.add(actor_id)
+            seen_shas.add(sha)
+            root = stored.get(sha)
+            if root is None or root["actor_id"] != actor_id:
+                raise _approval_invalid(f"no pending proposal for actor {actor_id!r} has the exact sha {sha!r}")
+            already = _materialized_root_sha(registry, actor_id) == sha
+            if not already and sha not in open_roots:
+                raise _approval_invalid(f"proposal {sha[:16]} for {actor_id!r} is not an open pending proposal (superseded or resolved)")
+            mentions = _revalidated_root(source, root)
+            reviews = _validated_reviews(source, sha, approval["reviews"], mentions)
+        except _MalformedApproval as error:
+            malformed.append((approval, str(error)))
+            continue
         plan.append({"approval": approval, "root": root, "sha": sha, "mentions": mentions, "reviews": reviews, "already": already})
+    digests = {payload_hash(entry): (entry, why) for entry, why in malformed}
+    _close_malformed_rows(recovery, set(digests))
+    if digests:
+        for digest, (entry, why) in digests.items():
+            recovery.record(
+                ROOT_APPROVAL_STAGE,
+                f"{ROOT_APPROVAL_MALFORMED}:{digest[:16]}",
+                ROOT_APPROVAL_MALFORMED,
+                f"approval entry is malformed: {why}; no root of {ROOT_APPROVAL_NAME} is materialized until every entry is well formed",
+                severity="pending",
+                evidence={
+                    "entry_sha256": digest,
+                    "actor_id": entry.get("actor_id") if isinstance(entry, dict) and isinstance(entry.get("actor_id"), str) else None,
+                    "problem": why,
+                },
+            )
+            outcome["malformed"].append({"entry_sha256": digest, "problem": why})
+        return outcome
     if not plan:
         return outcome
     characters = load_object(project / "characters.json", "characters profile")
@@ -5955,18 +6094,31 @@ def ingest_root_approvals(
         actor_id = root["actor_id"]
         known = mention_scoped_audit_index(records)
         review_by_scope = {_scope_tuple(r["scope"]): r for r in reviews}
+        effective, blockers = _review_records_for_gate(reviews, audit, _name_words(root["name"]), mentions, registry, aliases, source)
+        resolved_native = {
+            (e["chapter_sha256"], e["quote_sha256"], e["label"], e["span_start"]): e.get("resolved_native_verdict") for e in effective
+        }
         wanted = {
-            _scope_tuple(m["scope"]): _scoped_alias_record(actor_id, sha, m, review_by_scope[_scope_tuple(m["scope"])], item["approval"]["note"])
+            _scope_tuple(m["scope"]): _scoped_alias_record(
+                actor_id, sha, m, review_by_scope[_scope_tuple(m["scope"])], item["approval"]["note"], resolved_native.get(_scope_tuple(m["scope"]))
+            )
             for m in mentions
         }
         if not item["already"]:
-            effective, blockers = _review_records_for_gate(reviews, audit, _name_words(root["name"]))
             blockers += variant_root_approval_gate(root, registry, aliases, effective)
             blockers += variant_root_duplicate_blockers(root, registry, aliases, characters, voices)
             blockers += variant_root_participant_blockers(root, mentions, registry, aliases, source)
             for scope_key, record in wanted.items():
                 prior = known.get(scope_key)
-                if prior and (prior["decision"], prior["canonical"]) != ("alias", actor_id):
+                # An earlier exact-scope ambiguity is explicitly unresolved evidence, not a contrary identity decision.
+                # This approval has independently re-proven that scope from current source witnesses, so supersede it
+                # append-only. Every positive conflicting decision (existing alias, non-character, etc.) remains a veto.
+                supersedable_ambiguity = (
+                    prior
+                    and prior.get("decision") == "ambiguous"
+                    and prior.get("canonical") in {None, "", "none"}
+                )
+                if prior and not supersedable_ambiguity and (prior["decision"], prior["canonical"]) != ("alias", actor_id):
                     blockers.append(f"mention {record['label']!r}@{record['span_start']} already has scoped decision {prior['decision']}:{prior['canonical']}")
                 mention = next(m for m in mentions if _scope_tuple(m["scope"]) == scope_key)
                 if not any(
@@ -6005,7 +6157,13 @@ def ingest_root_approvals(
         # 1. scoped audit (idempotent: only absent scopes are appended)
         added = False
         for scope_key, record in wanted.items():
-            if scope_key not in known:
+            prior = known.get(scope_key)
+            supersedable_ambiguity = (
+                prior
+                and prior.get("decision") == "ambiguous"
+                and prior.get("canonical") in {None, "", "none"}
+            )
+            if prior is None or supersedable_ambiguity:
                 supersede_scoped_record(records, known, scope_key, record)
                 added = True
         if added:

@@ -58,6 +58,7 @@ from src.cast_freeze import (
     validate_preparation_coverage,
     variant_draft_actor,
     variant_root_approval_gate,
+    variant_root_duplicate_blockers,
     verify_frozen_cast,
 )
 from src.data_recovery import OperationalError, RecoveryLedger
@@ -1980,6 +1981,44 @@ def test_variant_root_approval_gate_needs_strong_facts_and_never_changes_the_reg
     assert [registry, aliases, root, reviews] == snapshot
 
 
+def test_variant_root_gate_title_only_overlap_never_blocks_a_different_full_name(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    aliases = {"ana": "ana"}
+    result = adapt_context_resolution_v2(
+        v2_payload(_draft_rows(chapters), drafts=[v2_draft(chapters)]), V2_SOURCE_SHA, chapters, registry, aliases, []
+    )
+    (root,) = result["roots"]
+    reviews = _review_records(root)
+    cast = {
+        **registry,
+        "lord_bloodwin": {"name": "Lord Bloodwin"},
+        "professor_venmont": {"name": "Professor Venmont"},
+        "bram": {"name": "Bram"},
+    }
+    cast_aliases = {**aliases, "lord_bloodwin": "lord_bloodwin", "professor_venmont": "professor_venmont", "bram": "bram", "the_professor": "professor_venmont", "old_wick": "bram"}
+
+    def duplicates(actor_id: str, name: str, reg: dict | None = None, ali: dict | None = None) -> list[str]:
+        found = variant_root_approval_gate(
+            {**root, "actor_id": actor_id, "name": name}, cast if reg is None else reg, cast_aliases if ali is None else ali, reviews
+        )
+        return [b for b in found if "shares a name" in b or "already" in b]
+
+    # a shared title/role word alone is not an identity overlap
+    assert duplicates("lord_ravenspire", "Lord Ravenspire") == []
+    assert duplicates("lord_venmont_two", "Lord Selia") == []
+    assert duplicates("professor_orrin", "Professor Orrin") == []
+    assert duplicates("captain_orrin", "Captain Orrin", reg={**cast, "captain_hale": {"name": "Captain Hale"}}) == []
+    # a real overlap still blocks: exact full name, shared given name/surname, alias, id
+    assert any("already registered" in b for b in duplicates("lord_bloodwin", "Lord Bloodwin"))
+    assert any("shares a name" in b for b in duplicates("lord_two", "Lord Bloodwin"))
+    assert any("shares a name" in b for b in duplicates("bloodwin_two", "Bloodwin"))
+    assert any("shares a name" in b for b in duplicates("professor_two", "Professor Venmont"))
+    assert any("shares a name" in b for b in duplicates("venmont_two", "Lady Venmont"))
+    assert any("shares a name" in b for b in duplicates("bram_two", "Lord Bram"))
+    assert any("alias" in b for b in duplicates("the_professor", "Someone Else"))
+    assert any("shares a name" in b for b in duplicates("wick_two", "Wick Smith"))
+
+
 # ##################################################################
 # variant root approval and materialization
 # Real temp chapters, real ledger, real files: a root becomes a registry actor only through the documented approval input,
@@ -2067,7 +2106,7 @@ def test_root_approval_materializes_native_reviewed_root_once_and_only_exactly(t
 
     outcome = approve(tmp_path, chapters, progress, recovery)
 
-    assert outcome == {"materialized": ["zed"], "already": [], "blocked": []}
+    assert outcome == {"materialized": ["zed"], "already": [], "blocked": [], "malformed": []}
     entry = progress["registry"]["zed"]
     assert entry["origin"] == "approved_root" and entry["approved_root"]["proposal_sha256"] == proposal_sha(root)
     assert entry["approved_root"]["approval"]["reviews"], "raw review refs are retained"
@@ -2090,11 +2129,63 @@ def test_root_approval_materializes_native_reviewed_root_once_and_only_exactly(t
     assert recovery.open_pending(CONTEXT_V2_STAGE) == [] and recovery.open_pending(ROOT_APPROVAL_STAGE) == []
     # idempotent: replaying the approval and re-ingesting the unchanged v2 file change nothing and leave nothing pending
     snapshot, size = untouched_state(tmp_path), len(recovery.entries())
-    assert approve(tmp_path, chapters, progress, recovery) == {"materialized": [], "already": ["zed"], "blocked": []}
+    assert approve(tmp_path, chapters, progress, recovery) == {"materialized": [], "already": ["zed"], "blocked": [], "malformed": []}
     assert ingest_context_resolution_v2(tmp_path, V2_SOURCE_SHA, chapters, progress["registry"], progress["aliases"], recovery) == []
     assert untouched_state(tmp_path) == snapshot and len(recovery.entries()) == size
     fresh = RecoveryLedger(tmp_path)
     assert fresh.open_pending(CONTEXT_V2_STAGE) == []
+
+
+def test_root_approval_title_only_overlap_with_registered_actors_never_blocks(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    # registered court actors share only the title/role word "Professor"/"Lord" with the Zed root and its "Professor" variant
+    registry = {**registry, "professor_venmont": {"name": "Professor Venmont"}, "lord_bloodwin": {"name": "Lord Bloodwin"}}
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    native_audit(tmp_path, root)
+    write_root_approval(tmp_path, root, root_reviews(root, chapters))
+
+    assert approve(tmp_path, chapters, progress, recovery) == {"materialized": ["zed"], "already": [], "blocked": [], "malformed": []}
+
+
+def test_root_approval_real_overlap_with_a_title_bearing_registered_actor_still_blocks(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    native_audit(tmp_path, root)
+    write_root_approval(tmp_path, root, root_reviews(root, chapters))
+    # the registry changes after staging: a titled actor now carries the root's own name word "Zed"
+    progress["registry"]["professor_zed_venmont"] = {"name": "Professor Zed Venmont"}
+
+    outcome = approve(tmp_path, chapters, progress, recovery)
+
+    assert outcome["materialized"] == [] and "zed" not in progress["registry"]
+    blockers = [b for entry in outcome["blocked"] for b in entry["blockers"]]
+    assert any("shares a name with registered actor professor_zed_venmont" in b for b in blockers)
+    assert any("variant 'Zed' is literally carried by registered actor professor_zed_venmont" in b for b in blockers)
+    assert not any("variant 'Professor'" in b for b in blockers)  # the title-only variant is never what blocks
+
+
+def test_variant_root_duplicate_blockers_ignore_title_only_labels_but_keep_real_identification(tmp_path: Path) -> None:
+    registry = {
+        "ana": {"name": "Ana"},
+        "professor_venmont": {"name": "Professor Venmont"},
+        "lord_bloodwin": {"name": "Lord Bloodwin"},
+    }
+    aliases = {key: key for key in registry} | {"old_wick": "ana"}
+
+    def blockers(*labels: str) -> list[str]:
+        root = {"actor_id": "zed", "name": "Zed", "variants": [{"label": label} for label in labels]}
+        return variant_root_duplicate_blockers(root, registry, aliases, {}, {})
+
+    # title/role-only overlap with a different full name is no identification
+    assert blockers("Professor", "Lord", "Lord Ravenspire", "Professor Orrin", "Zed") == []
+    # exact full name, a shared given-name/surname word, and a known alias still identify a registered actor
+    assert any("carried by registered actor lord_bloodwin" in b for b in blockers("Lord Bloodwin"))
+    assert any("carried by registered actor professor_venmont" in b for b in blockers("Venmont"))
+    assert any("carried by registered actor professor_venmont" in b for b in blockers("Lady Venmont"))
+    assert any("carried by registered actor ana" in b for b in blockers("Old Wick"))
+    assert any("carried by registered actor ana" in b for b in blockers("Ana"))
 
 
 def test_root_approval_accepts_source_reviewed_trusted_role_proof_with_truthful_provenance(tmp_path: Path) -> None:
@@ -2130,30 +2221,15 @@ def test_root_approval_input_violations_fail_closed_before_any_write(tmp_path: P
     def mutated(reviews: list[dict], **change) -> list[dict]:
         return [{**reviews[0], **change}, *reviews[1:]]
 
-    attempt(good, sha="0" * 64)  # unknown proposal sha
-    attempt(good, action="approve_all")
-    attempt(good, actor_id="someone_else")
-    attempt(good, extra="field")
-    attempt(good, note="approved after human review of the book")  # an untruthful provenance claim
-    attempt(good[1:])  # a mention without a review
-    attempt([*good, good[0]])  # a repeated review
-    attempt(mutated(good, proposal_sha256="1" * 64))
-    attempt(mutated(good, provenance="human_reviewed"))
-    attempt(mutated(good, provenance="source_reviewed_human"))
-    attempt(mutated(good, verdict="uncertain"))
-    attempt(mutated(good, scope={**good[0]["scope"], "span_start": good[0]["scope"]["span_start"] + 1}))
-    attempt(mutated(good, reviewer_role="caretaker"))  # a native reference carries no reviewer role
-    attempt(mutated(source_good, reviewer_role="reviewer"))  # not a trusted role
-    attempt(mutated(source_good, reviewer_role="human"))
-    attempt(mutated(source_good, factual_basis=" "))
-    attempt(mutated(source_good, factual_witnesses=[]))
+    attempt(good, sha="0" * 64)  # unknown proposal sha (hash mismatch with the stored proposals)
+    attempt(good, actor_id="someone_else")  # a sha that belongs to another actor
     forged = {**v2_witness(chapters, 0, 3), "unit_quote": "invented"}
-    attempt(mutated(source_good, factual_witnesses=[forged]))
+    attempt(mutated(source_good, factual_witnesses=[forged]))  # a witness that is not the exact current source
     # wrong book, wrong contract, and a changed chapter byte
     write_root_approval(tmp_path, root, good)
     approval_path = tmp_path / ROOT_APPROVAL_NAME
     payload = json.loads(approval_path.read_text())
-    for change in ({"source_sha256": "c" * 64}, {"contract": "other"}, {"version": 2}):
+    for change in ({"source_sha256": "c" * 64}, {"contract": "other"}, {"version": 2}, {"extra": 1}, {"approvals": {}}):
         approval_path.write_text(json.dumps({**payload, **change}), encoding="utf-8")
         with pytest.raises(OperationalError):
             approve(tmp_path, chapters, progress, recovery)
@@ -2184,8 +2260,8 @@ def test_root_approval_blocks_every_failed_gate_without_writing_anything(tmp_pat
     blocked(root_reviews(root, chapters), "no native distinct-living-identity review")
     native_audit(tmp_path, root, verdict="uncertain")
     blocked(root_reviews(root, chapters), "no native distinct-living-identity review")
-    # a source review can never override a contradicting native verdict
-    native_audit(tmp_path, root, verdict="existing:ana")
+    # a source review can never override a real native conflict (a fragment verdict here; see the resolution tests for existing:<id>)
+    native_audit(tmp_path, root, verdict="nonidentity_fragment")
     blocked(root_reviews(root, chapters, SOURCE_REVIEW), "contradicts the native review verdict")
     # a source-review witness that names neither the mention nor the identity proves nothing
     (tmp_path / NEW_IDENTITY_AUDIT_NAME).unlink()
@@ -2193,6 +2269,233 @@ def test_root_approval_blocks_every_failed_gate_without_writing_anything(tmp_pat
     blocked(root_reviews(root, chapters, SOURCE_REVIEW, witness=(0, 1)), "no source-review witness literally names")
     # the same proposal after the blockers change supersedes the older blocked row instead of stacking
     assert len(recovery.open_pending(ROOT_APPROVAL_STAGE)) == 1
+
+
+def malformed_audit(tmp_path: Path, root: dict, per_mention: list[dict]) -> None:
+    """Native audit with one hand-shaped record per mention (verdict/raw_review/provenance/... merged over a distinct record)."""
+    records = [{**record, **extra} for record, extra in zip(_review_records(root), per_mention, strict=True)]
+    (tmp_path / NEW_IDENTITY_AUDIT_NAME).write_text(json.dumps({"records": records}), encoding="utf-8")
+
+
+def uncertain_record(raw_verdict: str = "uncertain", **extra) -> dict:
+    return {"verdict": "uncertain", "raw_review": {"verdict": raw_verdict, "witness_unit_ids": [], "confidence": 0.3}, **extra}
+
+
+def test_source_review_resolves_native_uncertain_and_stale_unsupported_reviews(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    # mention 0 is genuinely uncertain, mention 1 is an unsupported (rejected) existing:ana review recorded as uncertain,
+    # mention 2 is an existing:<id> whose owner is no longer a registered actor (stale)
+    malformed_audit(
+        tmp_path,
+        root,
+        [
+            uncertain_record(),
+            uncertain_record("existing:ana", pending_type="unapproved_alias", invalid_reason="lacks source/registry support"),
+            {"verdict": "existing:departed", "raw_review": {"verdict": "existing:departed", "witness_unit_ids": [], "confidence": 0.9}},
+        ],
+    )
+    write_root_approval(tmp_path, root, root_reviews(root, chapters, SOURCE_REVIEW))
+    assert approve(tmp_path, chapters, progress, recovery)["materialized"] == ["zed"]
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert sorted(r["approved_root"]["resolved_native_verdict"] for r in records) == ["existing:departed", "uncertain", "uncertain"]
+    assert all(r["approved_root"]["review_provenance"] == SOURCE_REVIEW and "human" not in json.dumps(r).casefold() for r in records)
+    assert recovery.open_pending(ROOT_APPROVAL_STAGE) == []
+
+
+def test_native_unsupported_existing_without_owner_proof_does_not_veto(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    # ana is registered but neither recorded support nor the mention's scene ties "Zed"/"Professor" to her
+    stale = {"verdict": "existing:ana", "raw_review": {"verdict": "existing:ana", "witness_unit_ids": [], "confidence": 0.9}}
+    gone = {**stale, "provenance": {"type": "literal_witness", "owner_name": "Anna", "owner_profile_field": "name", "witness_unit_id": "c00s00000"}}
+    malformed_audit(tmp_path, root, [stale, gone, stale])
+    write_root_approval(tmp_path, root, root_reviews(root, chapters, SOURCE_REVIEW))
+    assert approve(tmp_path, chapters, progress, recovery)["materialized"] == ["zed"]
+
+
+def test_currently_valid_source_supported_existing_still_vetoes_a_source_review(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    before = untouched_state(tmp_path)
+    ana_support = {"type": "literal_witness", "owner_name": "Ana", "owner_profile_field": "name", "witness_unit_id": "c00s00000"}
+    valid = {"verdict": "existing:ana", "raw_review": {"verdict": "existing:ana", "witness_unit_ids": [], "confidence": 0.9}, "provenance": ana_support}
+    uncertain_ok = uncertain_record()
+
+    def vetoed(per_mention: list[dict], contains: str = "contradicts the native review verdict") -> None:
+        malformed_audit(tmp_path, root, per_mention)
+        write_root_approval(tmp_path, root, root_reviews(root, chapters, SOURCE_REVIEW))
+        result = approve(tmp_path, chapters, progress, recovery)
+        assert result["materialized"] == [] and any(contains in b for b in result["blocked"][0]["blockers"]), result
+        assert untouched_state(tmp_path) == before and "zed" not in progress["registry"]
+
+    vetoed([uncertain_ok, valid, uncertain_ok])  # recorded support still honoured by the registry (Ana is still named Ana)
+    # the source scene of the exact mention re-proves the owner (no recorded support, "Professor" is written in Ana's profile)
+    progress["registry"]["ana"]["bio"] = "a scout everyone calls Professor"
+    vetoed([{"verdict": "existing:ana", "raw_review": {"verdict": "existing:ana"}}, uncertain_ok, uncertain_ok])
+    # a low-confidence record (uncertain) whose raw review was this valid existing:ana is the same real conflict
+    vetoed([uncertain_record("existing:ana"), uncertain_ok, uncertain_ok], "still supported by the current source")
+    progress["registry"]["ana"]["bio"] = "a scout"
+    # every other real native verdict binds too
+    for verdict in ("nonidentity_fragment", "same_provisional:c7", "something_else"):
+        vetoed([{"verdict": verdict, "raw_review": {"verdict": verdict}}, uncertain_ok, uncertain_ok], "real conflict")
+    # a native-provenance claim never rides on an uncertain record
+    malformed_audit(tmp_path, root, [uncertain_ok] * 3)
+    write_root_approval(tmp_path, root, root_reviews(root, chapters))
+    result = approve(tmp_path, chapters, progress, recovery)
+    assert result["materialized"] == [] and any("no native distinct-living-identity review" in b for b in result["blocked"][0]["blockers"])
+
+
+def test_source_review_resolving_uncertain_never_overrides_participant_duplicate_or_scoped_conflicts(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    malformed_audit(tmp_path, root, [uncertain_record()] * 3)
+    write_root_approval(tmp_path, root, root_reviews(root, chapters, SOURCE_REVIEW))
+    before = untouched_state(tmp_path)
+    # original-anchor / duplicate conflict
+    progress["registry"]["old_zed"] = {"name": "Zed"}
+    result = approve(tmp_path, chapters, progress, recovery)
+    assert result["materialized"] == [] and any("already the name of registered actor" in b for b in result["blocked"][0]["blockers"])
+    del progress["registry"]["old_zed"]
+    # an exact-scope scoped decision already binds one mention
+    scope = root["variants"][1]["scopes"][0]["scope"]
+    (tmp_path / SCOPED_AUDIT_NAME).write_text(
+        json.dumps(
+            {
+                "records": [
+                    {
+                        "chapter_sha256": scope["chapter_sha256"], "quote_sha256": scope["quote_sha256"], "label": scope["label"],
+                        "span_start": scope["span_start"], "canonical": "ana", "decision": "alias", "confidence": 1.0, "reason": "earlier",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = approve(tmp_path, chapters, progress, recovery)
+    assert result["materialized"] == [] and any("already has scoped decision" in b for b in result["blocked"][0]["blockers"])
+    assert "zed" not in progress["registry"]
+    (tmp_path / SCOPED_AUDIT_NAME).unlink()
+    assert untouched_state(tmp_path) == before
+    # a witness that names neither the mention nor the identity proves nothing even over an uncertain native
+    write_root_approval(tmp_path, root, root_reviews(root, chapters, SOURCE_REVIEW, witness=(0, 0)))
+    result = approve(tmp_path, chapters, progress, recovery)
+    assert any("no source-review witness literally names" in b for b in result["blocked"][0]["blockers"])
+    # the distinct-participant gate still blocks a family label whose scene names two participants
+    pair = tmp_path / "pair"
+    pair.mkdir()
+    siblings = (
+        "Zed appeared at the gate beside Mara. The hall was quiet. Auntie waved from the porch. Auntie is the sister of Zed. "
+        "Rain fell on the roof. Dust blew."
+    )
+    chapters, progress, recovery, root = kin_staged(pair, siblings)
+    malformed_audit(pair, root, [uncertain_record()] * sum(len(v["scopes"]) for v in root["variants"]))
+    write_root_approval(pair, root, root_reviews(root, chapters, SOURCE_REVIEW))
+    result = approve(pair, chapters, progress, recovery)
+    assert result["materialized"] == [] and any("family label 'Auntie'" in b for b in result["blocked"][0]["blockers"])
+    assert "zed" not in progress["registry"]
+
+
+def test_root_approval_supersedes_exact_ambiguous_scopes_with_append_only_history(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    # A prior ambiguity is unresolved evidence, not an identity/non-character decision. Strong exact-source reviews may
+    # replace it, retaining why the scope was previously held. This deliberately does not loosen non-ambiguous conflicts.
+    prior = []
+    for record in _review_records(root):
+        prior.append(
+            {
+                "chapter_sha256": record["chapter_sha256"],
+                "quote_sha256": record["quote_sha256"],
+                "label": record["label"],
+                "span_start": record["span_start"],
+                "canonical": "none",
+                "decision": "ambiguous",
+                "confidence": 0.0,
+                "reason": "earlier exact-source uncertainty",
+            }
+        )
+    (tmp_path / SCOPED_AUDIT_NAME).write_text(json.dumps({"records": prior}), encoding="utf-8")
+    write_root_approval(tmp_path, root, root_reviews(root, chapters, SOURCE_REVIEW))
+
+    assert approve(tmp_path, chapters, progress, recovery)["materialized"] == ["zed"]
+    records = json.loads((tmp_path / SCOPED_AUDIT_NAME).read_text())["records"]
+    assert all(record["decision"] == "alias" and record["canonical"] == "zed" for record in records)
+    assert all(record["history"] == [{"decision": "ambiguous", "canonical": "none", "confidence": 0.0, "reason": "earlier exact-source uncertainty"}] for record in records)
+
+
+def test_malformed_individual_approval_entries_become_typed_rows_and_hold_the_whole_file(tmp_path: Path) -> None:
+    chapters, registry = v2_fixture(tmp_path)
+    progress, recovery, roots = staged_root_project(tmp_path, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    root = roots["zed"]
+    native_audit(tmp_path, root)
+    good = root_reviews(root, chapters)
+    source_good = root_reviews(root, chapters, SOURCE_REVIEW)
+    before = untouched_state(tmp_path)
+
+    def mutated(reviews: list[dict], **change) -> list[dict]:
+        return [{**reviews[0], **change}, *reviews[1:]]
+
+    def held(reviews: list[dict], **over) -> dict:
+        write_root_approval(tmp_path, root, reviews, **over)
+        result = approve(tmp_path, chapters, progress, recovery)  # never raises
+        assert result["materialized"] == [] and result["blocked"] == [] and len(result["malformed"]) == 1, result
+        assert untouched_state(tmp_path) == before and "zed" not in progress["registry"] and "zed" not in progress["aliases"]
+        (row,) = recovery.open_pending(ROOT_APPROVAL_STAGE)
+        assert row["code"] == "root_approval_malformed" and row["evidence"]["entry_sha256"] == result["malformed"][0]["entry_sha256"]
+        assert row["evidence"]["problem"] == result["malformed"][0]["problem"]
+        return result
+
+    held(good, action="approve_all")
+    held(good, extra="field")
+    held(good, note="approved after human review of the book")  # an untruthful provenance claim
+    held(good, note=7)
+    held(good, sha="not-a-sha")
+    held(good[1:])  # a mention without a review
+    held([*good, good[0]])  # a repeated review
+    held([])
+    held(mutated(good, proposal_sha256="1" * 64))
+    held(mutated(good, provenance="human_reviewed"))
+    held(mutated(good, provenance=["unhashable"]))
+    held(mutated(good, verdict="uncertain"))
+    held(mutated(good, scope={**good[0]["scope"], "span_start": good[0]["scope"]["span_start"] + 1}))
+    held(mutated(good, scope={**good[0]["scope"], "label": ["unhashable"]}))
+    held(mutated(good, reviewer_role="caretaker"))
+    held(mutated(source_good, reviewer_role="reviewer"))
+    held(mutated(source_good, reviewer_role=["unhashable"]))
+    held(mutated(source_good, factual_basis=" "))
+    held(mutated(source_good, factual_witnesses=[]))
+    held(mutated(source_good, factual_witnesses=["not an object"]))
+    held(mutated(source_good, factual_witnesses=[{"chapter_file": "x"}]))
+    # a non-object entry and a repeated actor in one file are malformed entries too (one row each, deduplicated across batches)
+    approval = json.loads((tmp_path / ROOT_APPROVAL_NAME).read_text())
+    entry = {"action": "approve_root", "actor_id": "zed", "proposal_sha256": proposal_sha(root), "reviews": good, "note": "ok"}
+    (tmp_path / ROOT_APPROVAL_NAME).write_text(json.dumps({**approval, "approvals": ["junk", entry, entry]}), encoding="utf-8")
+    result = approve(tmp_path, chapters, progress, recovery)
+    assert result["materialized"] == [] and len(result["malformed"]) == 2 and "zed" not in progress["registry"]
+    size = len(recovery.entries())
+    assert approve(tmp_path, chapters, progress, recovery)["malformed"] and len(recovery.entries()) == size
+    assert {r["code"] for r in recovery.open_pending(ROOT_APPROVAL_STAGE)} == {"root_approval_malformed"}
+    assert untouched_state(tmp_path) == before
+    # fixing the file closes the typed rows and the root materializes; nothing stays pending
+    write_root_approval(tmp_path, root, good)
+    assert approve(tmp_path, chapters, progress, recovery)["materialized"] == ["zed"]
+    assert recovery.open_pending(ROOT_APPROVAL_STAGE) == []
+    # a removed file also closes a malformed row
+    other = tmp_path / "gone"
+    other.mkdir()
+    chapters, registry = v2_fixture(other)
+    progress, recovery, roots = staged_root_project(other, chapters, registry, _draft_rows(chapters), [v2_draft(chapters)])
+    write_root_approval(other, roots["zed"], [])
+    assert len(approve(other, chapters, progress, recovery)["malformed"]) == 1 and len(recovery.open_pending(ROOT_APPROVAL_STAGE)) == 1
+    (other / ROOT_APPROVAL_NAME).unlink()
+    assert approve(other, chapters, progress, recovery) == {"materialized": [], "already": [], "blocked": [], "malformed": []}
+    assert recovery.open_pending(ROOT_APPROVAL_STAGE) == []
 
 
 def test_root_approval_independent_duplicate_and_kind_gates(tmp_path: Path) -> None:
@@ -2214,7 +2517,7 @@ def test_root_approval_independent_duplicate_and_kind_gates(tmp_path: Path) -> N
 
     assert any("name 'Zed' is already the name of registered actor" in b for b in blockers_with(registry={"old_zed": {"name": "Zed"}}))
     assert any("variant 'Professor' is already an alias of ana" in b for b in blockers_with(aliases={"professor": "ana"}))
-    assert any("literally carried by registered actor" in b for b in blockers_with(registry={"prof_lin": {"name": "Professor Lin"}}))
+    assert any("literally carried by registered actor" in b for b in blockers_with(registry={"zed_lin": {"name": "Zed Lin"}}))
     assert any("original profile entry" in b for b in blockers_with(files={"characters.json": {"ana": {"name": "Ana"}, "zed": {"name": "Z"}}}))
     assert any("original voice entry" in b for b in blockers_with(files={"characters.json": {"ana": {"name": "Ana"}}, "voices.json": {"zed": {}}}))
     (tmp_path / "voices.json").write_text(json.dumps({"ana": {}}), encoding="utf-8")

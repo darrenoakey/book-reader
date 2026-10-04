@@ -645,6 +645,20 @@ def run_hour(source: Path, hour_index: int = 1, lean_cast: bool = False) -> Path
 
 
 # ##################################################################
+# load lean cast
+# read only the existing-profile summary and aliases for a matching source;
+# no source-character audit or cast mutation occurs in this mode.
+def load_lean_cast(source: Path, project: Path) -> tuple[dict, dict]:
+    lean = load_json_store(project / "lean_characters.json", "lean character summary")
+    if lean.get("mode") != "lean_existing_profiles_v1" or lean.get("source_sha256") != source_fingerprint(source):
+        raise RuntimeError("lean character summary does not match this source")
+    cast, aliases = lean.get("actors"), lean.get("aliases")
+    if not isinstance(cast, dict) or not isinstance(aliases, dict):
+        raise TypeError("lean character summary is malformed")
+    return cast, aliases
+
+
+# ##################################################################
 # run locked hour
 # produce one numbered hour and commit the exact next source cursor only after its movie succeeds.
 def _run_hour_locked(source: Path, hour_index: int = 1, lean_cast: bool = False) -> Path:
@@ -678,12 +692,7 @@ def _run_hour_locked(source: Path, hour_index: int = 1, lean_cast: bool = False)
     # touching a registry. Every new production hour starts only after the whole-source
     # frozen manifest verifies the source and every voice/portrait anchor byte.
     if hour_index >= 3 and lean_cast:
-        lean = load_json_store(project / "lean_characters.json", "lean character summary")
-        if lean.get("mode") != "lean_existing_profiles_v1" or lean.get("source_sha256") != source_fingerprint(source):
-            raise RuntimeError("lean character summary does not match this source")
-        cast, aliases = lean.get("actors"), lean.get("aliases")
-        if not isinstance(cast, dict) or not isinstance(aliases, dict):
-            raise RuntimeError("lean character summary is malformed")
+        cast, aliases = load_lean_cast(source, project)
         scoped_references = None
     elif hour_index >= 3:
         from src.cast_freeze import (

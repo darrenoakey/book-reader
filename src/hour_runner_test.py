@@ -14,12 +14,22 @@ from src.hour_runner import (
     canonical_character_id,
     chapter_order,
     extend_appearances,
+    load_lean_cast,
     load_ledger,
     prepare_hour_directory,
     script_for_chapter,
     synthesize_window,
     validate_appearances,
 )
+
+
+def test_real_lean_hour_cast_loads_existing_212_actor_summary() -> None:
+    root = Path("/Users/darrenoakey/src/book-reader")
+    source = root / "incoming" / "weakest_beast_tamer.txt"
+    project = root / "output" / "weakest_beast_tamer"
+    cast, aliases = load_lean_cast(source, project)
+    assert len(cast) == 212 and len(aliases) >= len(cast)
+    assert all({"name", "bio", "look"} <= set(info) for info in cast.values())
 
 
 # ##################################################################

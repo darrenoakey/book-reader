@@ -7091,6 +7091,59 @@ def empty_chapter_names(progress: dict) -> dict[str, str]:
 
 
 # ##################################################################
+# required wide bio
+# the `wide_bio_required` gate. Returns a terminal status dict (never the legacy scanner) unless the scan is ready AND proves complete native candidate accounting, in which case every unscanned chapter is committed to the structural and semantic ledgers from that accounting and None is returned so preparation continues to the pending/quarantine gates and freeze.
+def required_wide_bio(
+    project: Path, chapters: list[Path], progress: dict, source_text: str, recovery: RecoveryLedger, wide_bio
+) -> dict | None:
+    progress_path = project / PROGRESS_NAME
+    coverage = semantic_coverage(progress)
+    if wide_bio is None:
+        raise OperationalError("cast_integrity", "wide_bio_required needs a whole-source wide-bio hook")
+    if int(coverage["next_chapter"]) != int(progress["next_chapter"]):
+        return {
+            "status": "blocked",
+            "reason": "wide_bio_required_legacy_prefix_unclassified",
+            "chapters": len(chapters),
+            "next_chapter": progress["next_chapter"],
+        }
+    outcome = wide_bio(project, chapters, progress, source_text, recovery, require_accounting=True)
+    atomic_json(progress_path, progress)
+    summary = {key: value for key, value in outcome.items() if key != "accounting_rows"}
+    if outcome.get("state") != "applied":
+        return {
+            "status": "preparing",
+            "chapters": len(chapters),
+            "next_chapter": progress["next_chapter"],
+            "wide_bio": summary,
+            "warnings": len(recovery.entries()),
+        }
+    if not (outcome.get("accounting") or {}).get("complete"):
+        return {
+            "status": "blocked",
+            "reason": "wide_bio_required_candidate_accounting_incomplete",
+            "chapters": len(chapters),
+            "next_chapter": progress["next_chapter"],
+            "wide_bio": summary,
+            "warnings": len(recovery.entries()),
+        }
+    for index in range(int(progress["next_chapter"]), len(chapters)):
+        path = chapters[index]
+        unit = {
+            "start": index,
+            "batch": [path],
+            "units": immutable_evidence_units([path]),
+            "classifications": outcome["accounting_rows"][path.name],
+            "registry": progress["registry"],
+            "aliases": progress["aliases"],
+            "quarantine": None,
+        }
+        commit_batch(project, progress, coverage, unit, False)
+        atomic_json(progress_path, progress)
+    return None
+
+
+# ##################################################################
 # prepare cast
 # resumes each bounded native-Ollama batch from durable progress and atomically publishes a freeze only after all chapters and assets validate.
 def prepare_cast(
@@ -7100,11 +7153,12 @@ def prepare_cast(
     ask=None,
     max_revalidations: int | None = QUARANTINE_REVALIDATION_LIMIT,
     wide_bio=None,
+    wide_bio_required: bool = False,
 ) -> dict:
     source = source.resolve()
     if not source.is_file():
         raise OperationalError("source_missing", f"input source is not a file: {source}")
-    if LLM_STYLE != "ollama" and not verify_only and ask is None:
+    if LLM_STYLE != "ollama" and not verify_only and ask is None and not wide_bio_required:
         raise OperationalError(
             "cast_integrity", "prepare-cast requires schema-constrained native Ollama configured in local/config.toml"
         )
@@ -7172,6 +7226,11 @@ def prepare_cast(
     ingest_root_approvals(project, source_sha, chapters, progress, recovery)
     ingest_source_reviewed_retirements(project, source_sha, chapters, progress, recovery)
     earlier = {row_key(row) for row in recovery.open_quarantined("cast")}
+    if wide_bio_required:
+        # The whole-source scan runs BEFORE the legacy scanner, which is never called in this mode: either the scan proves every native candidate accounted (and the cursors advance from that accounting) or publication is blocked.
+        early = required_wide_bio(project, chapters, progress, source_text, recovery, wide_bio)
+        if early is not None:
+            return early
     # Historical 0..cursor batches had structural hashes only. Reclassify that prefix under the semantic ledger before touching the next production batch.
     # A data problem quarantines only the offending chapter (semantic ledger only; the structural cursor never moves backwards).
     while int(coverage["next_chapter"]) < int(progress["next_chapter"]):
@@ -7203,7 +7262,7 @@ def prepare_cast(
                 "actors": len(progress["registry"]),
                 "warnings": len(recovery.entries()),
             }
-    if wide_bio is not None:
+    if wide_bio is not None and not wide_bio_required:
         # Optional whole-source wide-context fact pass (src.wide_bio_delta.WideBioHook). It sees the finished structural registry, only appends `facts` / source-bridged aliases / typed pending rows, and a result that is not fully applied (offline, deadline, error, partial coverage) is never approval: nothing is frozen.
         outcome = wide_bio(project, chapters, progress, source_text, recovery)
         atomic_json(progress_path, progress)
@@ -7216,12 +7275,14 @@ def prepare_cast(
                 "wide_bio": outcome,
                 "warnings": len(recovery.entries()),
             }
-    replay_pending(project, chapters, progress, ambiguous, source_text, recovery, ask)
-    atomic_json(progress_path, progress)
-    revalidate_quarantines(
-        project, chapters, progress, ambiguous, source_text, recovery, ask, max_revalidations, earlier
-    )
-    atomic_json(progress_path, progress)
+    if not wide_bio_required:
+        # Both replays re-ask the legacy scanner, so the required mode never runs them: open rows stay open and block.
+        replay_pending(project, chapters, progress, ambiguous, source_text, recovery, ask)
+        atomic_json(progress_path, progress)
+        revalidate_quarantines(
+            project, chapters, progress, ambiguous, source_text, recovery, ask, max_revalidations, earlier
+        )
+        atomic_json(progress_path, progress)
     blocked = quarantined_chapter_names(progress)
     pending_rows = recovery.open_pending("cast")
     quality_rows = [

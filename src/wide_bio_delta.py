@@ -35,6 +35,9 @@ from pathlib import Path
 from src.cast_freeze import (
     TITLE_ROLE_TOKENS,
     CastDataIssue,
+    candidate_coverage_ledger,
+    exact_scope,
+    immutable_evidence_units,
     label_components,
     normalized_id,
     owner_name_forms,
@@ -1463,7 +1466,7 @@ def append_unique(target: list, text: str) -> None:
 
 def apply_to_cast(registry: dict, aliases: dict, claims: Sequence[dict]) -> dict:
     actor_of: dict[str, str] = {}
-    applied, held = 0, []
+    applied, held, applied_claims = 0, [], []
 
     def hold(claim: dict, reason: str) -> None:
         held.append(
@@ -1527,7 +1530,121 @@ def apply_to_cast(registry: dict, aliases: dict, claims: Sequence[dict]) -> dict
             aliases[alias_key] = actor
         append_unique(facts.setdefault(claim["category"], []), claim["value"])
         applied += 1
-    return {"applied": applied, "pending": held}
+        applied_claims.append(claim)
+    return {"applied": applied, "pending": held, "applied_claims": applied_claims}
+
+
+# ##################################################################
+# candidate accounting
+# the native contract freezes one disposition for every deterministic candidate of every chapter (src.cast_freeze.candidate_coverage_ledger). A whole-source wide-bio scan only speaks about subjects it extracted facts for, so it may stand in for the legacy scanner only when EVERY candidate of EVERY chapter is accounted for locally, after the claims were applied: a registry/alias owner (an original actor, or one a validated claim created or bridged), a deterministic non-entity, or an exact-label typed pending item the scan retained (which keeps blocking publication). Any other candidate is unaccounted and the result is never complete.
+def pending_labels(held: Sequence[dict], rejected: Sequence[dict]) -> set[str]:
+    labels = set()
+    for item in held:
+        fact = item.get("fact")
+        who = fact.get("subject") if isinstance(fact, dict) else None
+        if isinstance(who, dict) and isinstance(who.get("name"), str):
+            labels.add(norm_space(who["name"]))
+    labels.update(norm_space(item["subject"]) for item in rejected)
+    return labels
+
+
+def candidate_accounting(
+    chapters: Sequence[Path], registry: dict, aliases: dict, held_labels: set[str]
+) -> dict:
+    counts = {"owner": 0, "nonentity": 0, "pending": 0}
+    unaccounted: list[dict] = []
+    rows: dict[str, list[dict]] = {}
+    for path in chapters:
+        rows[path.name] = []
+        try:
+            ledger = candidate_coverage_ledger(
+                immutable_evidence_units([path]), registry, aliases
+            )
+        except CastDataIssue as error:
+            unaccounted.append({"chapter": path.name, "reason": error.code})
+            continue
+        for candidate in ledger:
+            if candidate["known_owner"]:
+                disposition, owner = "owner", candidate["known_owner"]
+            elif candidate["nonentity"]:
+                disposition, owner = "nonentity", "none"
+            elif norm_space(candidate["label"]) in held_labels:
+                disposition, owner = "pending", "none"
+            else:
+                unaccounted.append(
+                    {
+                        "chapter": path.name,
+                        "candidate_id": candidate["id"],
+                        "label": candidate["label"],
+                    }
+                )
+                continue
+            counts[disposition] += 1
+            rows[path.name].append(
+                {
+                    "candidate_id": candidate["id"],
+                    "label": candidate["label"],
+                    "ref_ids": candidate["ref_ids"],
+                    "status": f"wide_bio_{disposition}",
+                    "identity": owner,
+                }
+            )
+    return {
+        "complete": not unaccounted,
+        "candidates": sum(counts.values()) + len(unaccounted),
+        **counts,
+        "unaccounted_count": len(unaccounted),
+        "unaccounted": unaccounted[:25],
+        "rows": rows,
+    }
+
+
+# ##################################################################
+# reconcile old pending
+# closes an existing legacy typed-identity pending row only by exact proof: its recorded chapters still have their recorded hashes (exact_scope), and EVERY literal mention it holds is the very sentence (quote hash) of a claim this run validated and applied for exactly that label inside the very chapter text (hash). One uncovered mention, a stale scope, another row or any other code leaves the row open; nothing is ever closed in bulk.
+def reconcile_old_pending(
+    recovery, chapters: Sequence[Path], applied_claims: Sequence[dict]
+) -> list[dict]:
+    by_name = {path.name: path for path in chapters}
+    proven = {
+        (
+            norm_space(claim["subject"]),
+            claim["quote_sha256"],
+            claim["witness"]["chapter_text_sha256"],
+        ): claim["claim_id"]
+        for claim in applied_claims
+        if isinstance(claim.get("witness"), dict)
+    }
+    closed = []
+    for row in recovery.open_pending("cast"):
+        evidence = row["evidence"] if isinstance(row.get("evidence"), dict) else {}
+        mentions = evidence.get("mentions")
+        if (
+            not str(row["code"]).startswith("pending_")
+            or str(row["item"]).startswith("wide_bio:")
+            or not isinstance(mentions, list)
+            or not mentions
+            or not exact_scope(row, by_name)
+        ):
+            continue
+        proofs = [
+            proven.get(
+                (
+                    norm_space(str(mention.get("label", ""))),
+                    mention.get("quote_sha256"),
+                    mention.get("chapter_sha256"),
+                )
+            )
+            for mention in mentions
+            if isinstance(mention, dict)
+        ]
+        if len(proofs) != len(mentions) or not all(proofs):
+            continue
+        recovery.resolve(
+            row, "wide_bio_exact_claim_scope", {"claim_ids": sorted(set(proofs))}
+        )
+        closed.append({"item": row["item"], "code": row["code"]})
+    return closed
 
 
 # ##################################################################
@@ -1559,9 +1676,15 @@ class WideBioHook:
         progress: dict,
         source_text: str,
         recovery,
+        require_accounting: bool = False,
     ) -> dict:
         applied = progress.get("wide_bio")
-        if isinstance(applied, dict) and applied.get("state") == "applied":
+        # a required run never trusts the cache: apply, reconcile and accounting are idempotent over the same journal
+        if (
+            not require_accounting
+            and isinstance(applied, dict)
+            and applied.get("state") == "applied"
+        ):
             return applied
         config = load_proof_config(self.config_path)
         out = self.out_dir
@@ -1647,18 +1770,33 @@ class WideBioHook:
                 evidence={
                     "plan_sha256": plan.artifact["plan_sha256"],
                     "source_hash": plan.artifact["coverage"]["source_sha256"],
+                    "fact_sha256": sha256_text(canonical_json(row["detail"])),
                     "fact": row["detail"],
                 },
             )
+        closed = reconcile_old_pending(recovery, chapters, outcome["applied_claims"])
         result = {
             "state": "applied",
             "plan_sha256": plan.artifact["plan_sha256"],
             "claims_applied": outcome["applied"],
             "pending": len(rows),
+            "closed_pending": closed,
             "calls_total": summary["calls_total"],
         }
+        if not require_accounting:
+            progress["wide_bio"] = result
+            return result
+        accounting = candidate_accounting(
+            chapters,
+            progress["registry"],
+            progress["aliases"],
+            pending_labels(held, outcome["pending"]),
+        )
+        result["accounting"] = {
+            key: value for key, value in accounting.items() if key != "rows"
+        }
         progress["wide_bio"] = result
-        return result
+        return {**result, "accounting_rows": accounting["rows"]}
 
 
 # ##################################################################
@@ -1720,6 +1858,11 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
         help="send the wide-bio requests (the structural cast batches follow their own configuration)",
     )
     pc.add_argument("--max-batches", type=int, default=None)
+    pc.add_argument(
+        "--wide-bio-required",
+        action="store_true",
+        help="run the whole-source scan BEFORE the legacy scanner and never call the scanner: complete only when every native candidate is accounted, otherwise blocked",
+    )
     args = parser.parse_args(argv)
     exit_file = None
     try:
@@ -1744,7 +1887,10 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
                 args.hard_deadline_s,
             )
             result = prepare_cast(
-                args.source, max_batches=args.max_batches, wide_bio=hook
+                args.source,
+                max_batches=args.max_batches,
+                wide_bio=hook,
+                wide_bio_required=args.wide_bio_required,
             )
             print(json.dumps(result, sort_keys=True, default=str))
             return 0 if result.get("status") == "frozen" else 3

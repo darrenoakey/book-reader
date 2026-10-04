@@ -1,5 +1,6 @@
 """Real-file tests for the resumable wide-bio delta runner (tiny real byte-level BPE vocabulary, real temp source, no model, no network)."""
 
+import contextlib
 import json
 import re
 import shutil
@@ -15,6 +16,7 @@ from src.wide_bio import (
     build_counter,
     load_proof_config,
     project_chapters,
+    sha256_text,
 )
 from src.wide_bio_delta import (
     DeltaSettings,
@@ -561,3 +563,202 @@ def test_cli_plan_writes_exact_call_budget_and_run_needs_execute(
     cal.write_text("{}", encoding="utf-8")
     assert main(["run", *base, "--calibration", str(cal)]) == 2
     assert "execute_required" in capsys.readouterr().err
+
+
+# ##################################################################
+# wide_bio_required gate (prepare_cast integration): real project on disk, real hook; the legacy `ask` raises if it is ever called
+def forbidden_ask(*_args, **_kwargs):
+    raise AssertionError(
+        "the legacy scanner must never be asked in wide_bio_required mode"
+    )
+
+
+def one_chunk_transport(config, facts, calls):
+    def transport(url: str, payload: bytes, timeout: float) -> dict:
+        calls.append(json.loads(payload)["messages"][1]["content"])
+        return {
+            "model": config.backend.model,
+            "done_reason": "stop",
+            "prompt_eval_count": 7,
+            "eval_count": 3,
+            "content": json.dumps({"facts": facts}),
+        }
+
+    return transport
+
+
+@contextlib.contextmanager
+def required_book(root: Path, text: str):
+    from src.cast_freeze import ANCHOR_IDS
+
+    source = root / f"book-{uuid.uuid4().hex}.txt"
+    source.write_text(text, encoding="utf-8")
+    project = get_output_dir(source)
+    try:
+        (project / "chapters").mkdir(parents=True)
+        (project / "chapters" / "00-intro.txt").write_text(
+            "Book by Tester, narrated by Narrator", encoding="utf-8"
+        )
+        (project / "chapters" / "01-one.txt").write_text(text, encoding="utf-8")
+        profiles = {a: {"name": a, "bio": "", "look": ""} for a in ANCHOR_IDS}
+        profiles["ren"] = {
+            "name": "Ren",
+            "bio": "original bio",
+            "look": "original look",
+        }
+        (project / "characters.json").write_text(json.dumps(profiles), encoding="utf-8")
+        yield source, project
+    finally:
+        shutil.rmtree(project, ignore_errors=True)
+
+
+def required_run(root, config_path, config, source, facts, ask=forbidden_ask):
+    (root / "cal.json").write_text(
+        json.dumps(calibration(config, config.tokenizer_sha256)), encoding="utf-8"
+    )
+    calls: list[str] = []
+    hook = WideBioHook(
+        config_path,
+        root / f"req-{uuid.uuid4().hex}",
+        DeltaSettings(100000, 512, 1),
+        root / "cal.json",
+        True,
+        one_chunk_transport(config, facts, calls),
+    )
+    result = prepare_cast(
+        source, ask=ask, wide_bio=hook, wide_bio_required=True
+    )
+    return result, calls
+
+
+def seed_pending(
+    project: Path, label: str, quote: str, chapter: Path, mention_hash=None
+):
+    """A legacy typed-identity pending row exactly as the scanner records it (mention scope + source hashes)."""
+    from src.cast_freeze import file_digest
+
+    recovery = RecoveryLedger(project)
+    recovery.record(
+        "cast",
+        f"chapters 1-1:{label.lower()}",
+        "pending_new_identity",
+        f"new_identity review of {label!r} is pending",
+        severity="pending",
+        evidence={
+            "type": "new_identity",
+            "label": label,
+            "reason": "x",
+            "mentions": [
+                {
+                    "chapter": chapter.name,
+                    "chapter_sha256": sha256_text(chapter.read_text(encoding="utf-8")),
+                    "quote_sha256": mention_hash or sha256_text(quote),
+                    "label": label,
+                    "span_start": 0,
+                }
+            ],
+            "source": [chapter.name],
+            "source_hash": {chapter.name: file_digest(chapter)},
+        },
+    )
+
+
+def test_required_complete_applies_early_closes_exact_scope_only_and_never_asks(
+    world,
+) -> None:
+    root, config_path, config, *_ = world
+    with required_book(root, "Ren wore a red cloak.\n") as (source, project):
+        chapter = project / "chapters" / "01-one.txt"
+        seed_pending(project, "Ren", "Ren wore a red cloak.", chapter)
+        seed_pending(
+            project, "Zed", "Zed ran.", chapter
+        )  # no claim proves this mention
+        facts = [fact("Ren", "ren", "look", "a red cloak", "000000")]
+        result, calls = required_run(root, config_path, config, source, facts)
+        progress = json.loads((project / "cast_preparation_progress.json").read_text())
+        assert len(calls) == 1 and not (project / MANIFEST_NAME).exists()
+        assert progress["wide_bio"]["accounting"]["complete"] is True
+        assert progress["wide_bio"]["closed_pending"] == [
+            {"item": "chapters 1-1:ren", "code": "pending_new_identity"}
+        ]
+        # early application: original profile kept, fact appended, cursors advanced from the accounting
+        ren = progress["registry"]["ren"]
+        assert ren["bio"] == "original bio" and ren["look"] == "original look"
+        assert ren["facts"]["look"] == ["a red cloak"]
+        assert (
+            progress["next_chapter"]
+            == progress["semantic_coverage"]["next_chapter"]
+            == 1
+        )
+        # only the exactly proven row was closed; the unproven one stays open and blocks
+        open_items = [r["item"] for r in RecoveryLedger(project).open_pending("cast")]
+        assert open_items == ["chapters 1-1:zed"]
+        assert result["status"] == "blocked" and result["pending"] == 1
+
+
+def test_required_mode_allows_openai_primary_without_a_legacy_ask(world) -> None:
+    root, config_path, config, *_ = world
+    with required_book(root, "Ren wore a red cloak.\n") as (source, project):
+        chapter = project / "chapters" / "01-one.txt"
+        seed_pending(project, "Zed", "Zed ran.", chapter)
+        facts = [fact("Ren", "ren", "look", "a red cloak", "000000")]
+        result, calls = required_run(root, config_path, config, source, facts, ask=None)
+        assert len(calls) == 1 and result["status"] == "blocked"
+
+
+def test_required_invalid_claim_is_retained_pending_with_hashes_and_not_applied(
+    world,
+) -> None:
+    root, config_path, config, *_ = world
+    with required_book(root, "Ren wore a red cloak.\n\nMara smiled.\n") as (
+        source,
+        project,
+    ):
+        facts = [
+            fact("Ren", "ren", "look", "a red cloak", "000000"),
+            fact("Mara", "ambiguous", "look", "smiled", "000001"),
+        ]
+        result, _ = required_run(root, config_path, config, source, facts)
+        progress = json.loads((project / "cast_preparation_progress.json").read_text())
+        rows = RecoveryLedger(project).open_pending("cast")
+        assert [r["code"] for r in rows] == ["wide_bio_pending_ambiguous_subject"]
+        evidence = rows[0]["evidence"]
+        assert (
+            evidence["plan_sha256"]
+            and evidence["source_hash"]
+            and evidence["fact_sha256"]
+        )
+        assert "mara" not in progress["registry"] and "mara" not in progress["aliases"]
+        assert progress["wide_bio"]["accounting"]["pending"] == 1
+        assert result["status"] == "blocked" and not (project / MANIFEST_NAME).exists()
+
+
+def test_required_blocks_without_native_candidate_accounting(world) -> None:
+    root, config_path, config, *_ = world
+    with required_book(root, "Ren wore a red cloak.\n\nMara smiled.\n") as (
+        source,
+        project,
+    ):
+        facts = [fact("Ren", "ren", "look", "a red cloak", "000000")]
+        result, _ = required_run(root, config_path, config, source, facts)
+        progress = json.loads((project / "cast_preparation_progress.json").read_text())
+        assert result["status"] == "blocked"
+        assert result["reason"] == "wide_bio_required_candidate_accounting_incomplete"
+        assert [
+            u["label"] for u in result["wide_bio"]["accounting"]["unaccounted"]
+        ] == ["Mara"]
+        assert progress["next_chapter"] == 0 and not (project / MANIFEST_NAME).exists()
+
+
+def test_required_offline_scan_is_preparing_and_never_asks(world) -> None:
+    root, config_path, *_ = world
+    with required_book(root, "Ren wore a red cloak.\n") as (source, project):
+        hook = WideBioHook(config_path, root / "off2", DeltaSettings(100000, 512, 1))
+        result = prepare_cast(
+            source, ask=forbidden_ask, wide_bio=hook, wide_bio_required=True
+        )
+        assert (
+            result["status"] == "preparing"
+            and result["wide_bio"]["state"] == "not_ready"
+        )
+        assert not (project / MANIFEST_NAME).exists()

@@ -4,6 +4,7 @@ import contextlib
 import json
 import re
 import shutil
+import sys
 import uuid
 from pathlib import Path
 
@@ -1103,12 +1104,40 @@ def finalize_args(project, source, config_path, out):
     ]
 
 
-def refuse_connection(*_a, **_k):
-    raise AssertionError("finalize-adaptive must never open a connection")
+_network_denial_guard_installed = False
+_network_denial_active = False
+
+
+# ##################################################################
+# network denial guard
+# blocks real socket-connect audit events only during a finalization test;
+# this verifies the default production transport cannot be reached.
+def install_network_denial_guard() -> None:
+    global _network_denial_guard_installed
+    if _network_denial_guard_installed:
+        return
+
+    def deny_socket_connect(event: str, _args: tuple) -> None:
+        if _network_denial_active and event == "socket.connect":
+            raise AssertionError("finalize-adaptive must never open a connection")
+
+    sys.addaudithook(deny_socket_connect)
+    _network_denial_guard_installed = True
+
+
+@pytest.fixture
+def network_denied() -> None:
+    global _network_denial_active
+    install_network_denial_guard()
+    _network_denial_active = True
+    try:
+        yield
+    finally:
+        _network_denial_active = False
 
 
 def test_finalize_adaptive_applies_to_current_progress_closes_exact_old_pending_and_blocks(
-    world, capsys
+    world, capsys, network_denied
 ) -> None:
     root, config_path, config, *_ = world
     text = "Ren wore a red cloak.\n\nMara smiled.\n"
@@ -1127,7 +1156,7 @@ def test_finalize_adaptive_applies_to_current_progress_closes_exact_old_pending_
         journal = (out / "journal.jsonl").read_bytes()
         used = len(calls)
         capsys.readouterr()
-        assert main(finalize_args(project, source, config_path, out), refuse_connection) == 3
+        assert main(finalize_args(project, source, config_path, out)) == 3
         result = json.loads(capsys.readouterr().out)
         assert len(calls) == used and (out / "journal.jsonl").read_bytes() == journal
         progress = json.loads((project / "cast_preparation_progress.json").read_text())
@@ -1146,12 +1175,12 @@ def test_finalize_adaptive_applies_to_current_progress_closes_exact_old_pending_
         assert len(typed) == 1 and typed[0]["evidence"]["fact_sha256"]
         assert result["status"] == "blocked" and not (project / MANIFEST_NAME).exists()
         # idempotent over the same progress
-        assert main(finalize_args(project, source, config_path, out), refuse_connection) == 3
+        assert main(finalize_args(project, source, config_path, out)) == 3
         assert len(calls) == used
 
 
 def test_finalize_adaptive_with_candidate_gap_is_blocked_and_never_freezes(
-    world, capsys
+    world, capsys, network_denied
 ) -> None:
     root, config_path, config, *_ = world
     with required_book(root, "Ren wore a red cloak.\n\nMara smiled.\n") as (
@@ -1162,7 +1191,7 @@ def test_finalize_adaptive_with_candidate_gap_is_blocked_and_never_freezes(
         out, code, _ = build_adaptive(root, config_path, config, source, project, facts)
         assert code == 0
         capsys.readouterr()
-        assert main(finalize_args(project, source, config_path, out), refuse_connection) == 3
+        assert main(finalize_args(project, source, config_path, out)) == 3
         result = json.loads(capsys.readouterr().out)
         assert result["reason"] == "wide_bio_required_candidate_accounting_incomplete"
         assert [
@@ -1172,7 +1201,7 @@ def test_finalize_adaptive_with_candidate_gap_is_blocked_and_never_freezes(
 
 
 def test_finalize_adaptive_complete_and_clean_proceeds_to_freeze_gates(
-    world, capsys
+    world, capsys, network_denied
 ) -> None:
     root, config_path, config, *_ = world
     with required_book(root, "Ren wore a red cloak.\n") as (source, project):
@@ -1185,7 +1214,7 @@ def test_finalize_adaptive_complete_and_clean_proceeds_to_freeze_gates(
         from src.data_recovery import OperationalError
 
         with pytest.raises(OperationalError, match="voice profiles"):
-            main(finalize_args(project, source, config_path, out), refuse_connection)
+            main(finalize_args(project, source, config_path, out))
         progress = json.loads((project / "cast_preparation_progress.json").read_text())
         assert progress["wide_bio"]["accounting"]["complete"] is True
         assert progress["wide_bio"]["pending"] == 0
@@ -1198,7 +1227,7 @@ def refused(capsys) -> str:
 
 
 def test_finalize_adaptive_refuses_incomplete_exhausted_and_foreign_outputs(
-    world, capsys
+    world, capsys, network_denied
 ) -> None:
     root, config_path, config, *_ = world
     with required_book(root, "Ren wore a red cloak.\n\nMara smiled.\n") as (
@@ -1213,21 +1242,21 @@ def test_finalize_adaptive_refuses_incomplete_exhausted_and_foreign_outputs(
         assert code == 3
         args = finalize_args(project, source, config_path, out)
         capsys.readouterr()
-        assert main(args, refuse_connection) == 2 and refused(capsys) == "adaptive_output_incomplete"
+        assert main(args) == 2 and refused(capsys) == "adaptive_output_incomplete"
         assert not (project / "cast_preparation_progress.json").exists()
         # a plain (non-adaptive) run directory is not accepted
-        assert main(finalize_args(project, source, config_path, root / "fparent"), refuse_connection) == 2
+        assert main(finalize_args(project, source, config_path, root / "fparent")) == 2
         assert refused(capsys) in {
             "adaptive_output_invalid",
             "adaptive_output_incomplete",
         }
         # a project that is not the source's output directory is refused
-        assert main(finalize_args(root, source, config_path, out), refuse_connection) == 2
+        assert main(finalize_args(root, source, config_path, out)) == 2
         assert refused(capsys) == "project_mismatch"
 
 
 def test_finalize_adaptive_refuses_tampering_missing_exit_and_other_source(
-    world, capsys
+    world, capsys, network_denied
 ) -> None:
     root, config_path, config, *_ = world
     with required_book(root, "Ren wore a red cloak.\n\nMara smiled.\n") as (
@@ -1245,7 +1274,7 @@ def test_finalize_adaptive_refuses_tampering_missing_exit_and_other_source(
             shutil.copytree(out, bad)
             path = bad / "raw" / name
             path.write_text(path.read_text() + " ")
-            assert main(finalize_args(project, source, config_path, bad), refuse_connection) == 2
+            assert main(finalize_args(project, source, config_path, bad)) == 2
             assert refused(capsys) == "journal_inconsistent"
         for victim, expected in (
             ("run.exit", "adaptive_output_incomplete"),
@@ -1259,18 +1288,18 @@ def test_finalize_adaptive_refuses_tampering_missing_exit_and_other_source(
                 seed = json.loads((bad / victim).read_text())
                 seed["registry"]["ren"]["bio"] = "forged"
                 (bad / victim).write_text(json.dumps(seed))
-            assert main(finalize_args(project, source, config_path, bad), refuse_connection) == 2
+            assert main(finalize_args(project, source, config_path, bad)) == 2
             assert refused(capsys) == expected
         plan_bad = root / "bad-plan"
         shutil.copytree(out, plan_bad)
         plan = json.loads((plan_bad / "plan.json").read_text())
         plan["adaptive"]["retry_output_tokens"] = 4096
         (plan_bad / "plan.json").write_text(json.dumps(plan))
-        assert main(finalize_args(project, source, config_path, plan_bad), refuse_connection) == 2
+        assert main(finalize_args(project, source, config_path, plan_bad)) == 2
         assert refused(capsys) == "adaptive_output_mismatch"
         # a changed source no longer reproduces the plan
         source.write_text("Ren wore a red cloak.\n\nMara frowned.\n", encoding="utf-8")
-        assert main(finalize_args(project, source, config_path, out), refuse_connection) == 2
+        assert main(finalize_args(project, source, config_path, out)) == 2
         assert refused(capsys) in {"adaptive_output_mismatch", "journal_inconsistent"}
         assert not (project / "cast_preparation_progress.json").exists()
 

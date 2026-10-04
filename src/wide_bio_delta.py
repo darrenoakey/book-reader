@@ -77,13 +77,104 @@ from src.wide_bio import (
 )
 from src.wide_bio_tokenizer import TokenizerRefusal
 
-DELTA_VERSION = 1
+DELTA_VERSION = 2
 QUOTE_MAX = 240
-VALUE_MAX = 160
+VALUE_MAX = 100
 REF_NOVEL = "novel"
 REF_AMBIGUOUS = "ambiguous"
 # short category enum: appearance, role, gender, kinship, gene/beast, age (changes included), source alias
-CATEGORIES = ("look", "role", "gender", "kin", "beast", "age", "alias")
+CATEGORIES = (
+    "look",
+    "role",
+    "gender",
+    "kin",
+    "beast",
+    "age",
+    "alias",
+    "voice",
+    "power",
+)
+# compact-density contract (delta v2). Raw 4096/8192 runs hit the output cap because the model returned long dialogue/action
+# sentences as "facts". Density is repaired at the source (prompt + schema + value length) and judged locally with purely
+# syntactic rules: a value is the shortest contiguous phrase of the category, never a quotation, a question, a sentence, or a
+# clause. Nothing is capped per subject or category: every distinct explicit trait stays expressible.
+VALUE_WORDS_MAX = {
+    "look": 10,
+    "role": 7,
+    "gender": 4,
+    "kin": 10,
+    "beast": 8,
+    "age": 8,
+    "alias": 6,
+    "voice": 12,
+    "power": 12,
+}
+QUOTE_MARKS = '"\u201c\u201d\u00ab\u00bb\u201e'
+# closed-class function words: a subject pronoun or a speech verb marks a clause or an utterance, never a trait phrase
+CLAUSE_SUBJECT_WORDS = frozenset(
+    [
+        "i",
+        "you",
+        "he",
+        "she",
+        "it",
+        "we",
+        "they",
+        "me",
+        "him",
+        "them",
+        "said",
+        "says",
+        "say",
+        "asked",
+        "asks",
+        "replied",
+        "cried",
+        "shouted",
+        "whispered",
+        "muttered",
+        "answered",
+        "called",
+        "exclaimed",
+        "demanded",
+        "told",
+    ]
+)
+# copulas, auxiliaries and negations: a finite clause, so only phrases of the plain-noun categories are checked against them
+CLAUSE_VERB_WORDS = frozenset(
+    [
+        "am",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "has",
+        "have",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "shall",
+        "should",
+        "can",
+        "could",
+        "may",
+        "might",
+        "must",
+        "not",
+        "no",
+        "never",
+    ]
+)
+PHRASE_CATEGORIES = frozenset(CATEGORIES) - {"voice", "power"}
+LEADING_WORDS = frozenset(
+    ["the", "a", "an", "his", "her", "their", "its", "my", "your", "our"]
+)
 FACT_FIELDS = ("subject", "category", "value", "paragraph_id")
 SUBJECT_FIELDS = ("name", "ref")
 PENDING_REASONS = (
@@ -105,19 +196,29 @@ PENDING_REASONS = (
     "role_scope_uncertain",
     "alias_unbridged",
     "actor_id_collision",
+    "dialogue_value",
+    "value_not_compact",
+    "clause_value",
+    "category_incompatible_value",
 )
 NO_RESPONSE = frozenset({"transport_error", "over_budget", "token_count_refused"})
 SYSTEM_PROMPT = (
     "You extract NEW character biography facts from a book excerpt. Return only JSON matching the schema. "
     "Each fact has `subject` (who: `name` as written in the paragraph, and `ref`), `category`, `value` and `paragraph_id`. "
-    "`value` is a short snippet copied exactly, unmodified and contiguous, from the paragraph named by `paragraph_id` "
-    "(one of the [[P id]] markers); it is the evidence itself, so do not paraphrase it. "
-    f"Categories: {', '.join(CATEGORIES)} (look=appearance, kin=kinship, beast=gene/beast nature, age includes age changes, "
-    "alias=another name the source gives the same character). "
+    "`value` is the SHORTEST phrase copied exactly, unmodified and contiguous, from the paragraph named by `paragraph_id` "
+    "(one of the [[P id]] markers) that states the trait; it is the evidence itself, so never paraphrase it and never copy "
+    "a sentence, a quotation, dialogue, an action or a general observation. "
+    f"Categories: {', '.join(CATEGORIES)}. look=physical appearance (one row per distinct feature: hair, eyes, build, clothing worn habitually), "
+    "role=an explicit occupation, rank or title only, kin=an explicit named relationship (one row per relative), "
+    "beast=an explicit creature or species, gender=explicit gender, age=an explicit age or age change, "
+    "alias=another name the source explicitly gives the same character, voice=an explicit voice, manner of speech or personality trait, "
+    "power=an explicit ability or power (one row per power). "
+    "Report every distinct explicit trait of every character; several rows for one character and category are expected when the source states several. "
+    "Skip what the source does not state outright: no transient action, no speech, no inference. Do not repeat a trait twice. "
     "An 'Already established' section may list characters and traits already cited: do not repeat those traits, and use the "
     "listed [id] as `subject.ref` for those characters. It is only a de-duplication aid. Read every paragraph: still report "
     "every new trait of a known character, every character that is not listed (`ref` = novel), and any fact whose subject is "
-    "unclear (`ref` = ambiguous). Do not infer, merge identities, or invent; if nothing new qualifies return an empty facts list."
+    "unclear (`ref` = ambiguous; never guess an actor). Do not infer, merge identities, or invent; if nothing new qualifies return an empty facts list."
 )
 
 
@@ -130,6 +231,44 @@ def norm_space(text: str) -> str:
 
 def norm_value(text: str) -> str:
     return norm_space(text).casefold().strip(" .,;:!")
+
+
+def norm_slot(text: str) -> str:
+    """Trait slot identity: the normalised value without leading articles or possessives (`his grey eyes` == `grey eyes`)."""
+    words = norm_value(text).split()
+    while len(words) > 1 and words[0] in LEADING_WORDS:
+        words.pop(0)
+    return " ".join(words)
+
+
+def compactness_problem(
+    category: str, value: str, subject: str, names: Sequence[str]
+) -> str | None:
+    """Deterministic syntactic density rules for one literal value; None when it is a compact trait phrase."""
+    if any(mark in value for mark in QUOTE_MARKS) or "?" in value or "!" in value:
+        return "dialogue_value"
+    words = re.findall(r"\w+(?:['\u2019-]\w+)*", value)
+    if (
+        not words
+        or len(words) > VALUE_WORDS_MAX[category]
+        or re.search(r"[.;:\n]\s*\S", value)
+    ):
+        return "value_not_compact"
+    lowered = {word.casefold() for word in words}
+    if lowered & CLAUSE_SUBJECT_WORDS or (
+        category in PHRASE_CATEGORIES and lowered & CLAUSE_VERB_WORDS
+    ):
+        return "clause_value"
+    known = {norm_space(name).casefold() for name in [subject, *names]}
+    if category not in ("alias", "role") and norm_space(value).casefold() in known:
+        return "category_incompatible_value"
+    # a phrase led by the character's own name is that character doing something, not a trait of them
+    lead = norm_space(value).casefold()
+    if category != "alias" and any(
+        lead.startswith(name + " ") for name in {norm_space(subject).casefold()}
+    ):
+        return "clause_value"
+    return None
 
 
 def subject_id(name: str) -> str:
@@ -305,9 +444,9 @@ class Established:
 
     def has_trait(self, sid: str, category: str, value: str) -> bool:
         subject = self.subjects.get(sid)
-        return bool(subject) and norm_value(value) in subject["traits"].get(
-            category, {}
-        )
+        return bool(subject) and norm_slot(value) in {
+            norm_slot(known) for known in subject["traits"].get(category, {}).values()
+        }
 
     def apply(self, claims: Sequence[dict]) -> None:
         for claim in claims:
@@ -442,7 +581,7 @@ def validate_delta_response(
                 }
             )
             continue
-        key = (outcome["subject_id"], outcome["category"], norm_value(outcome["value"]))
+        key = (outcome["subject_id"], outcome["category"], norm_slot(outcome["value"]))
         known = state.has_trait(key[0], key[1], outcome["value"])
         if known or key in seen:
             result["duplicates"].append(
@@ -506,6 +645,9 @@ def judge_fact(
         return pending("unsupported_value")
     if len(value) > VALUE_MAX:
         return pending("value_too_long")
+    problem = compactness_problem(fact["category"], value, who["name"], established)
+    if problem:
+        return pending(problem)
     if paragraph.witness is None:
         return pending("no_chapter_witness")
     subject, ref = norm_space(who["name"]), who["ref"]
@@ -701,6 +843,19 @@ def build_delta_plan(
         "input_budget": config.input_budget,
         "tokenizer_capture_sha256": config.tokenizer_sha256,
         "system_prompt_sha256": sha256_text(SYSTEM_PROMPT),
+        "compact_contract_sha256": sha256_text(
+            canonical_json(
+                {
+                    "value_max": VALUE_MAX,
+                    "words": VALUE_WORDS_MAX,
+                    "quote_marks": QUOTE_MARKS,
+                    "subject_words": sorted(CLAUSE_SUBJECT_WORDS),
+                    "verb_words": sorted(CLAUSE_VERB_WORDS),
+                    "phrase_categories": sorted(PHRASE_CATEGORIES),
+                    "leading": sorted(LEADING_WORDS),
+                }
+            )
+        ),
         "schema_template_sha256": sha256_text(
             canonical_json(delta_schema(["p"], ["s"]))
         ),

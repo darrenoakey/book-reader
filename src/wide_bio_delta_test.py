@@ -19,7 +19,12 @@ from src.wide_bio import (
     sha256_text,
 )
 from src.wide_bio_delta import (
+    DELTA_VERSION,
+    PENDING_REASONS,
+    SYSTEM_PROMPT,
+    VALUE_MAX,
     DeltaSettings,
+    Established,
     WideBioHook,
     apply_to_cast,
     build_delta_plan,
@@ -28,6 +33,7 @@ from src.wide_bio_delta import (
     pinned_seed,
     reconstruct_quote,
     run_delta,
+    validate_delta_response,
 )
 from src.wide_bio_test import calibration, capture_file, make_config
 
@@ -156,6 +162,8 @@ def test_schema_is_per_chunk_and_short(world) -> None:
         "beast",
         "age",
         "alias",
+        "voice",
+        "power",
     }
     assert delta_schema([], [])["properties"]["facts"]["maxItems"] == 0
 
@@ -1264,3 +1272,189 @@ def test_finalize_adaptive_refuses_tampering_missing_exit_and_other_source(
         assert main(finalize_args(project, source, config_path, out)) == 2
         assert refused(capsys) in {"adaptive_output_mismatch", "journal_inconsistent"}
         assert not (project / "cast_preparation_progress.json").exists()
+
+
+# compact-density contract (delta v2)
+# captured-style source: dialogue-heavy paragraphs around explicit traits, as in the raw 4096/8192 runs that hit the output cap.
+DENSE = (
+    "Mira Vale, the harbour pilot, had copper hair and grey eyes, and she was twenty-six years old.\n\n"
+    '"I told you we would sail at dawn," said Mira, "and I will not wait for the tide to turn again, whatever the captain says!"\n\n'
+    "Tomas was her younger brother and the half-brother of Ren, and he could call lightning and speak with gulls.\n\n"
+    "Mira slammed the door, crossed the quay and shouted for the boat to be brought round at once.\n\n"
+    "Everyone on the quay knew Mira Vale as the Gull Queen, a gruff and patient woman with a voice like gravel.\n\n"
+)
+
+
+@pytest.fixture
+def dense(tmp_path: Path):
+    _path, digest = capture_file(tmp_path)
+    config = load_proof_config(make_config(tmp_path, digest))
+    project = tmp_path / "project"
+    (project / "chapters").mkdir(parents=True)
+    (project / "chapters" / "01-one.txt").write_text(DENSE, encoding="utf-8")
+    chapters = project_chapters(project)
+    plan = build_delta_plan(
+        DENSE,
+        chapters,
+        config,
+        build_counter(config),
+        DeltaSettings(4000, 512, 1),
+        0,
+        "seed",
+    )
+    assert len(plan.chunks) == 1
+    state = Established()
+    state.seed(REGISTRY, ALIASES)
+    candidates = {"Mira Vale": False, "Mira": False, "Tomas": False}
+    return plan.chunks[0], state, candidates
+
+
+def verdict(dense, rows):
+    chunk, state, candidates = dense
+    return validate_delta_response(
+        json.dumps({"facts": rows}), chunk, state, [], candidates
+    )
+
+
+def reasons(result):
+    return [item["pending_reason"] for item in result["pending"]]
+
+
+def test_compact_discriminative_json_is_fully_accepted_without_per_category_cap(
+    dense,
+) -> None:
+    rows = [
+        fact("Mira Vale", "novel", "role", "harbour pilot", "000000"),
+        fact("Mira Vale", "novel", "look", "copper hair", "000000"),
+        fact("Mira Vale", "novel", "look", "grey eyes", "000000"),
+        fact("Mira Vale", "novel", "age", "twenty-six years old", "000000"),
+        fact("Mira Vale", "novel", "alias", "the Gull Queen", "000004"),
+        fact("Mira Vale", "novel", "voice", "a voice like gravel", "000004"),
+        fact("Mira Vale", "novel", "voice", "gruff and patient", "000004"),
+        fact("Tomas", "novel", "kin", "younger brother", "000002"),
+        fact("Tomas", "novel", "kin", "half-brother of Ren", "000002"),
+        fact("Tomas", "novel", "power", "call lightning", "000002"),
+        fact("Tomas", "novel", "power", "speak with gulls", "000002"),
+        fact("Tomas", "novel", "power", "speak with gulls", "000002"),
+        fact("Mira Vale", "novel", "alias", "Gull Queen", "000004"),
+    ]
+    result = verdict(dense, rows)
+    assert result["pending"] == [], result["pending"]
+    assert len(result["claims"]) == 11
+    # the same literal trait slot is deduplicated, never a distinct trait
+    assert [item["reason"] for item in result["duplicates"]] == [
+        "duplicate_in_response"
+    ] * 2
+    assert {claim["category"] for claim in result["claims"]} >= {
+        "look",
+        "kin",
+        "power",
+        "voice",
+    }
+    assert sum(1 for c in result["claims"] if c["category"] == "look") == 2
+    assert sum(1 for c in result["claims"] if c["category"] == "kin") == 2
+
+
+def test_verbose_dialogue_and_action_rows_are_typed_pending_never_claims(dense) -> None:
+    verbose = [
+        fact(
+            "Mira",
+            "novel",
+            "role",
+            '"I told you we would sail at dawn," said Mira',
+            "000001",
+        ),
+        fact("Mira", "novel", "voice", "whatever the captain says!", "000001"),
+        fact(
+            "Mira",
+            "novel",
+            "look",
+            "I will not wait for the tide to turn again",
+            "000001",
+        ),
+        fact(
+            "Mira",
+            "novel",
+            "role",
+            "slammed the door, crossed the quay and shouted",
+            "000003",
+        ),
+        fact("Mira", "novel", "look", "Mira slammed the door", "000003"),
+        fact("Mira", "novel", "power", "shouted for the boat", "000003"),
+        fact("Mira", "novel", "kin", "Mira", "000003"),
+        fact("Mira", "novel", "role", "was the harbour pilot", "000000"),
+        fact("Mira", "novel", "age", "she was twenty-six years old", "000000"),
+        fact(
+            "Mira",
+            "novel",
+            "look",
+            "Mira Vale, the harbour pilot, had copper hair and grey eyes, and she was",
+            "000000",
+        ),
+        fact(
+            "Mira Vale",
+            "novel",
+            "alias",
+            "Everyone on the quay knew Mira Vale as the Gull Queen",
+            "000004",
+        ),
+    ]
+    result = verdict(dense, verbose)
+    assert result["claims"] == []
+    assert set(reasons(result)) <= set(PENDING_REASONS)
+    assert len(result["pending"]) == len(verbose)
+    assert {
+        "dialogue_value",
+        "clause_value",
+        "value_not_compact",
+        "category_incompatible_value",
+    } <= set(reasons(result))
+    # the valid compact phrase for the same subject/category is still accepted next to the rejected verbose rows
+    mixed = verdict(
+        dense,
+        [
+            verbose[0],
+            fact("Mira Vale", "novel", "role", "harbour pilot", "000000"),
+            verbose[3],
+            fact("Mira Vale", "novel", "alias", "the Gull Queen", "000004"),
+        ],
+    )
+    assert [c["value"] for c in mixed["claims"]] == ["harbour pilot", "the Gull Queen"]
+    assert reasons(mixed) == ["dialogue_value", "value_not_compact"]
+
+
+def test_unknown_subject_stays_ambiguous_pending_and_is_never_forced_to_an_actor(
+    dense,
+) -> None:
+    result = verdict(dense, [fact("he", "ambiguous", "look", "grey eyes", "000000")])
+    assert result["claims"] == [] and reasons(result) == ["ambiguous_subject"]
+
+
+def test_plan_fingerprint_changes_and_old_runs_stay_incompatible(world) -> None:
+    root, _, config, chapters, count, _seed, plan, *_ = world
+    assert DELTA_VERSION == 2 and plan.artifact["delta_version"] == 2
+    assert VALUE_MAX <= 100 and "SHORTEST" in SYSTEM_PROMPT
+    assert plan.artifact["compact_contract_sha256"]
+    out = root / "old-run"
+    out.mkdir()
+    legacy = {
+        key: value
+        for key, value in plan.artifact.items()
+        if key != "compact_contract_sha256"
+    }
+    legacy["delta_version"] = 1
+    legacy["plan_sha256"] = "0" * 64
+    (out / "plan.json").write_text(json.dumps(legacy), encoding="utf-8")
+    with pytest.raises(ContractError, match="different plan"):
+        run_delta(
+            chapters,
+            config,
+            plan,
+            out,
+            None,
+            count,
+            None,
+            cast=None,
+            registry=REGISTRY,
+            aliases=ALIASES,
+        )

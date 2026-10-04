@@ -131,7 +131,7 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0, resolution: int 
 # ##################################################################
 # main
 # entry point for step runner
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(prog="step_runner")
@@ -145,7 +145,7 @@ def main() -> int:
         default=DEFAULT_RESOLUTION,
         help="Movie vertical resolution (default: 720)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     return run_step(args.step, Path(args.epub_path), max_chapters=args.max_chapters, resolution=args.resolution)
 
 

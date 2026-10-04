@@ -2,7 +2,6 @@
 
 import json
 import shutil
-import sys
 import uuid
 from pathlib import Path
 
@@ -85,15 +84,13 @@ def test_run_step_unknown(story_project, capsys: pytest.CaptureFixture[str]) -> 
 # ##################################################################
 # test main cli
 # the argparse entry point drives a real extract and rejects unsupported resolutions
-def test_main_cli(story_project, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_main_cli(story_project, capsys: pytest.CaptureFixture[str]) -> None:
     story, output_dir = story_project
-    monkeypatch.setattr(sys, "argv", ["step_runner", "extract", str(story)])
-    assert main() == 0
+    assert main(["extract", str(story)]) == 0
     assert is_step_complete(output_dir, "extract")
     capsys.readouterr()
-    monkeypatch.setattr(sys, "argv", ["step_runner", "movie", str(story), "--resolution", "999"])
     with pytest.raises(SystemExit) as exc:
-        main()
+        main(["movie", str(story), "--resolution", "999"])
     assert exc.value.code == 2
 
 

@@ -1511,7 +1511,7 @@ def adopt_parent(
         any(chunk_id not in known_chunk_ids for chunk_id in parent_chunk_ids)
         or len(set(parent_chunk_ids)) != len(parent_chunk_ids)
         or any(item.get("attempt") != 1 for item in records)
-    ): 
+    ):
         raise ContractError(
             "parent must hold unique first attempts for known chunks only",
             "adaptive_parent_invalid",
@@ -1876,6 +1876,81 @@ def pinned_seed(out_dir: Path, registry: dict, aliases: dict) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def apply_ready(
+    out: Path,
+    plan: DeltaPlan,
+    summary: dict,
+    chapters: Sequence[Path],
+    progress: dict,
+    recovery,
+    require_accounting: bool,
+) -> dict:
+    """Apply a ready run's claims to `progress`, record every typed pending item, close only exactly proven old pending rows and (when required) run candidate accounting."""
+    claims = [
+        json.loads(line)
+        for line in (out / "claims.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    held = [
+        json.loads(line)
+        for line in (out / "pending.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    outcome = apply_to_cast(progress["registry"], progress["aliases"], claims)
+    rows = [
+        {
+            "item": f"wide_bio:{item['chunk_id']}:{item['pending_id'][:16]}",
+            "reason": item["pending_reason"],
+            "detail": item,
+        }
+        for item in held
+    ] + [
+        {
+            "item": f"wide_bio:{item['chunk_id']}:{item['claim_id'][:16]}",
+            "reason": item["pending_reason"],
+            "detail": item,
+        }
+        for item in outcome["pending"]
+    ]
+    for row in rows:
+        recovery.record(
+            "cast",
+            row["item"],
+            f"wide_bio_pending_{row['reason']}",
+            f"wide-bio fact is pending: {row['reason']}",
+            severity="pending",
+            evidence={
+                "plan_sha256": plan.artifact["plan_sha256"],
+                "source_hash": plan.artifact["coverage"]["source_sha256"],
+                "fact_sha256": sha256_text(canonical_json(row["detail"])),
+                "fact": row["detail"],
+            },
+        )
+    closed = reconcile_old_pending(recovery, chapters, outcome["applied_claims"])
+    result = {
+        "state": "applied",
+        "plan_sha256": plan.artifact["plan_sha256"],
+        "claims_applied": outcome["applied"],
+        "pending": len(rows),
+        "closed_pending": closed,
+        "calls_total": summary["calls_total"],
+    }
+    if not require_accounting:
+        progress["wide_bio"] = result
+        return result
+    accounting = candidate_accounting(
+        chapters,
+        progress["registry"],
+        progress["aliases"],
+        pending_labels(held, outcome["pending"]),
+    )
+    result["accounting"] = {
+        key: value for key, value in accounting.items() if key != "rows"
+    }
+    progress["wide_bio"] = result
+    return {**result, "accounting_rows": accounting["rows"]}
+
+
 @dataclass(frozen=True, slots=True)
 class WideBioHook:
     config_path: Path
@@ -1952,69 +2027,153 @@ class WideBioHook:
                 "source_fraction": summary["source_fraction"],
                 "out_dir": str(out),
             }
-        claims = [
-            json.loads(line)
-            for line in (out / "claims.jsonl").read_text(encoding="utf-8").splitlines()
-            if line
-        ]
-        held = [
-            json.loads(line)
-            for line in (out / "pending.jsonl").read_text(encoding="utf-8").splitlines()
-            if line
-        ]
-        outcome = apply_to_cast(progress["registry"], progress["aliases"], claims)
-        rows = [
-            {
-                "item": f"wide_bio:{item['chunk_id']}:{item['pending_id'][:16]}",
-                "reason": item["pending_reason"],
-                "detail": item,
-            }
-            for item in held
-        ] + [
-            {
-                "item": f"wide_bio:{item['chunk_id']}:{item['claim_id'][:16]}",
-                "reason": item["pending_reason"],
-                "detail": item,
-            }
-            for item in outcome["pending"]
-        ]
-        for row in rows:
-            recovery.record(
-                "cast",
-                row["item"],
-                f"wide_bio_pending_{row['reason']}",
-                f"wide-bio fact is pending: {row['reason']}",
-                severity="pending",
-                evidence={
-                    "plan_sha256": plan.artifact["plan_sha256"],
-                    "source_hash": plan.artifact["coverage"]["source_sha256"],
-                    "fact_sha256": sha256_text(canonical_json(row["detail"])),
-                    "fact": row["detail"],
-                },
-            )
-        closed = reconcile_old_pending(recovery, chapters, outcome["applied_claims"])
-        result = {
-            "state": "applied",
-            "plan_sha256": plan.artifact["plan_sha256"],
-            "claims_applied": outcome["applied"],
-            "pending": len(rows),
-            "closed_pending": closed,
-            "calls_total": summary["calls_total"],
-        }
-        if not require_accounting:
-            progress["wide_bio"] = result
-            return result
-        accounting = candidate_accounting(
-            chapters,
-            progress["registry"],
-            progress["aliases"],
-            pending_labels(held, outcome["pending"]),
+        return apply_ready(
+            out, plan, summary, chapters, progress, recovery, require_accounting
         )
-        result["accounting"] = {
-            key: value for key, value in accounting.items() if key != "rows"
-        }
-        progress["wide_bio"] = result
-        return {**result, "accounting_rows": accounting["rows"]}
+
+
+# ##################################################################
+# finalize adaptive
+# no-provider finalization of a COMPLETED adaptive run. Nothing here can send a request: the verifier replays the whole adaptive output offline (source, seed, plan, journal hash chain and every saved raw response re-judged locally against rebuilt state) and accepts it only when every chunk is ready; a missing, truncated or length-exhausted chunk, an unfinished run, a different source/seed/plan or any tampered file is refused before anything is applied. The hook then applies the verified claims to the CURRENT prepare_cast progress through the same apply_ready path as the live hook (existing apply_to_cast: originals preserved, aliases only source-bridged and never taking another actor's name), records exact typed pending rows, closes only exactly proven old pending rows and runs candidate accounting; prepare_cast never freezes while a gap or pending row remains.
+def verify_adaptive_output(
+    config: ProofConfig, chapters: Sequence[Path], source_text: str, out: Path
+) -> tuple[DeltaPlan, dict, dict]:
+    try:
+        stored = json.loads((out / "plan.json").read_text(encoding="utf-8"))
+        seed_bytes = (out / "seed.json").read_bytes()
+        seed = json.loads(seed_bytes)
+        exit_code = (out / "run.exit").read_text(encoding="utf-8").strip()
+        journal = (out / "journal.jsonl").read_bytes()
+    except (OSError, ValueError) as error:
+        raise ContractError(
+            f"adaptive output is unreadable: {error}", "adaptive_output_incomplete"
+        ) from error
+    policy = stored.get("adaptive") if isinstance(stored, dict) else None
+    if (
+        not isinstance(policy, dict)
+        or not isinstance(seed, dict)
+        or not isinstance(seed.get("registry"), dict)
+        or not isinstance(seed.get("aliases"), dict)
+    ):
+        raise ContractError(
+            "output is not an adaptive run directory", "adaptive_output_invalid"
+        )
+    if exit_code != "0" or not journal.endswith(b"\n"):
+        raise ContractError(
+            "adaptive run did not finish cleanly (run.exit is not 0 or the journal has a torn tail)",
+            "adaptive_output_incomplete",
+        )
+    try:
+        settings = DeltaSettings(stored["target_tokens"], stored["delta_tokens"], 2)
+        overhead = stored["fixed_overhead_tokens"]
+    except KeyError as error:
+        raise ContractError(
+            "adaptive plan is missing its settings", "adaptive_output_invalid"
+        ) from error
+    base = build_delta_plan(
+        source_text,
+        chapters,
+        config,
+        build_counter(config),
+        DeltaSettings(settings.target_tokens, settings.delta_tokens, 1),
+        overhead,
+        sha256_text(canonical_json(seed)),
+    )
+    rest = {key: value for key, value in stored.items() if key != "plan_sha256"}
+    if (
+        rest.pop("adaptive") != policy
+        or {**base.artifact, "plan_sha256": None} != {**rest, "plan_sha256": None}
+        or policy.get("parent_plan_sha256") != base.artifact["plan_sha256"]
+        or stored.get("plan_sha256")
+        != sha256_text(canonical_json({**rest, "adaptive": policy}))
+        or policy.get("base_output_tokens") != config.output_tokens
+        or policy.get("retry_output_tokens") != RETRY_OUTPUT_TOKENS
+        or policy.get("retry_margin_tokens") != RETRY_MARGIN_TOKENS
+    ):
+        raise ContractError(
+            "adaptive plan does not match the current source, config and seed",
+            "adaptive_output_mismatch",
+        )
+    plan = DeltaPlan(base.source, base.chunks, settings, overhead, stored)
+    summary = run_delta(
+        chapters,
+        config,
+        plan,
+        out,
+        None,
+        build_counter(config),
+        registry=seed["registry"],
+        aliases=seed["aliases"],
+    )
+    statuses = summary["chunk_status"]
+    if (
+        summary["state"] != "ready"
+        or set(statuses) != {"ready"}
+        or statuses["ready"] != len(plan.chunks)
+        or summary["length_exhausted"]
+        or summary["calls_this_invocation"]
+        or summary["source_fraction"] != 1.0
+    ):
+        raise ContractError(
+            f"adaptive output is not complete: {summary['reason']} {statuses}",
+            "adaptive_output_incomplete",
+        )
+    return plan, summary, seed
+
+
+@dataclass(frozen=True, slots=True)
+class AdaptiveFinalizeHook:
+    config_path: Path
+    out_dir: Path
+
+    def __call__(
+        self,
+        project: Path,
+        chapters: Sequence[Path],
+        progress: dict,
+        source_text: str,
+        recovery,
+        require_accounting: bool = False,
+    ) -> dict:
+        plan, summary, _seed = verify_adaptive_output(
+            load_proof_config(self.config_path), chapters, source_text, self.out_dir
+        )
+        return apply_ready(
+            self.out_dir,
+            plan,
+            summary,
+            chapters,
+            progress,
+            recovery,
+            require_accounting,
+        )
+
+
+def no_ask(*_args, **_kwargs):
+    raise ContractError("finalize-adaptive never calls a provider", "no_provider")
+
+
+def finalize_adaptive_command(args) -> int:
+    from src.cast_freeze import prepare_cast
+    from src.epub_extract import get_output_dir
+
+    config = load_proof_config(args.config)
+    project = args.project.resolve()
+    if get_output_dir(args.source.resolve()).resolve() != project:
+        raise ContractError(
+            "project is not the output directory of this source", "project_mismatch"
+        )
+    chapters = project_chapters(project)
+    # refuse an unverifiable output before prepare_cast touches any progress
+    verify_adaptive_output(config, chapters, read_source(args.source), args.out)
+    result = prepare_cast(
+        args.source,
+        ask=no_ask,
+        wide_bio=AdaptiveFinalizeHook(args.config, args.out),
+        wide_bio_required=True,
+    )
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 0 if result.get("status") == "frozen" else 3
 
 
 def adaptive_command(args, settings: DeltaSettings, transport: Transport) -> int:
@@ -2153,6 +2312,16 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
         action="store_true",
         help="send the retry calls; without it nothing is sent",
     )
+    fin = sub.add_parser(
+        "finalize-adaptive",
+        help="no-provider: verify a COMPLETED adaptive output and apply it to the current prepare-cast progress (never freezes while a gap or pending row remains)",
+    )
+    fin.add_argument("project", type=Path)
+    fin.add_argument("--source", type=Path, required=True)
+    fin.add_argument("--config", type=Path, required=True)
+    fin.add_argument(
+        "--out", type=Path, required=True, help="completed adaptive output"
+    )
     pc = sub.choices["prepare-cast"]
     pc.add_argument(
         "--execute",
@@ -2168,6 +2337,8 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
     args = parser.parse_args(argv)
     exit_file = None
     try:
+        if args.command == "finalize-adaptive":
+            return finalize_adaptive_command(args)
         settings = DeltaSettings(
             args.target_tokens,
             args.delta_tokens,

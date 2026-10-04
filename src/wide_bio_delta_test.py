@@ -855,14 +855,19 @@ def test_adaptive_partial_parent_reuses_saved_rows_retries_length_and_continues_
     records = (partial / "journal.jsonl").read_text(encoding="utf-8").splitlines()
     # A real bounded pass has only a valid hash-chain prefix, not invented records
     # for the source chunks it has not reached yet.
-    (partial / "journal.jsonl").write_text("\n".join(records[:2]) + "\n", encoding="utf-8")
+    (partial / "journal.jsonl").write_text(
+        "\n".join(records[:2]) + "\n", encoding="utf-8"
+    )
     for suffix in (".response.txt", ".meta.json"):
         (partial / "raw" / f"k0002.a1{suffix}").unlink()
     calls: list = []
-    assert main(
-        adaptive_args(base, partial, root / "adaptive", "--execute"),
-        adaptive_transport(config, calls, stop_reply),
-    ) == 0
+    assert (
+        main(
+            adaptive_args(base, partial, root / "adaptive", "--execute"),
+            adaptive_transport(config, calls, stop_reply),
+        )
+        == 0
+    )
     assert calls == [("k0001", 8192), ("k0002", config.output_tokens)]
     assert tree(parent) == before
 
@@ -1007,3 +1012,255 @@ def test_adaptive_input_budget_guard_uses_retry_cap_and_margin(parent_run) -> No
     assert max(c["max_padded_prompt_tokens"] for c in plan["chunks"]) < (
         config.backend.num_ctx - 8192 - config.reserve_tokens
     )
+
+
+# ##################################################################
+# finalize-adaptive: no-provider finalization of a completed adaptive output into the current prepare_cast progress
+def adaptive_facts(config, facts_by_chunk, length_chunks, calls, exhaust=()):
+    def transport(url: str, payload: bytes, timeout: float) -> dict:
+        body = json.loads(payload)
+        cap = body["options"]["num_predict"]
+        chunk = re.search(r"Excerpt (k\d+)", body["messages"][1]["content"]).group(1)
+        calls.append((chunk, cap))
+        if chunk in exhaust or (chunk in length_chunks and cap == config.output_tokens):
+            return {
+                "model": config.backend.model,
+                "done_reason": "length",
+                "prompt_eval_count": 7,
+                "eval_count": cap,
+                "content": '{"facts":[{"subject"',
+            }
+        return {
+            "model": config.backend.model,
+            "done_reason": "stop",
+            "prompt_eval_count": 7,
+            "eval_count": 3,
+            "content": json.dumps({"facts": facts_by_chunk.get(chunk, [])}),
+        }
+
+    return transport
+
+
+def build_adaptive(
+    root, config_path, config, source, project, facts, length=(), exhaust=()
+):
+    """A real parent run + a real adaptive run (the only calls ever made), both through the CLI."""
+    cal = root / "cal.json"
+    cal.write_text(
+        json.dumps(calibration(config, config.tokenizer_sha256)), encoding="utf-8"
+    )
+    base = [
+        str(project),
+        "--source",
+        str(source),
+        "--config",
+        str(config_path),
+        "--target-tokens",
+        "1",
+        "--delta-tokens",
+        "512",
+        "--calibration",
+        str(cal),
+    ]
+    calls: list = []
+    transport = adaptive_facts(config, facts, set(length), calls, set(exhaust))
+    parent, out = root / "fparent", root / "fadaptive"
+    # the seed a real run pins is the preparation registry at scan time
+    pinned_seed(parent, json.loads(json.dumps(REGISTRY)), dict(ALIASES))
+    main(["run", *base, "--out", str(parent), "--execute"], transport)
+    code = main(
+        ["adaptive", *base, "--from-out", str(parent), "--out", str(out), "--execute"],
+        transport,
+    )
+    return out, code, calls
+
+
+def finalize_args(project, source, config_path, out):
+    return [
+        "finalize-adaptive",
+        str(project),
+        "--source",
+        str(source),
+        "--config",
+        str(config_path),
+        "--out",
+        str(out),
+    ]
+
+
+@pytest.fixture
+def no_network(monkeypatch):
+    import socket
+
+    def refuse(*_a, **_k):
+        raise AssertionError("finalize-adaptive must never open a connection")
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+
+
+def test_finalize_adaptive_applies_to_current_progress_closes_exact_old_pending_and_blocks(
+    world, capsys, no_network
+) -> None:
+    root, config_path, config, *_ = world
+    text = "Ren wore a red cloak.\n\nMara smiled.\n"
+    with required_book(root, text) as (source, project):
+        chapter = project / "chapters" / "01-one.txt"
+        seed_pending(project, "Ren", "Ren wore a red cloak.", chapter)
+        seed_pending(project, "Zed", "Zed ran.", chapter)
+        facts = {
+            "k0000": [fact("Ren", "ren", "look", "a red cloak", "000000")],
+            "k0001": [fact("Mara", "ambiguous", "look", "smiled", "000001")],
+        }
+        out, code, calls = build_adaptive(
+            root, config_path, config, source, project, facts, length=["k0000"]
+        )
+        assert code == 0 and ("k0000", 8192) in calls
+        journal = (out / "journal.jsonl").read_bytes()
+        used = len(calls)
+        capsys.readouterr()
+        assert main(finalize_args(project, source, config_path, out)) == 3
+        result = json.loads(capsys.readouterr().out)
+        assert len(calls) == used and (out / "journal.jsonl").read_bytes() == journal
+        progress = json.loads((project / "cast_preparation_progress.json").read_text())
+        ren = progress["registry"]["ren"]
+        assert ren["bio"] == "original bio" and ren["facts"]["look"] == ["a red cloak"]
+        assert "mara" not in progress["registry"]
+        assert progress["wide_bio"]["closed_pending"] == [
+            {"item": "chapters 1-1:ren", "code": "pending_new_identity"}
+        ]
+        # exact typed pending for the ambiguous subject; the unproven old row also stays open
+        rows = RecoveryLedger(project).open_pending("cast")
+        assert sorted(r["item"] for r in rows if r["code"].startswith("pending_")) == [
+            "chapters 1-1:zed"
+        ]
+        typed = [r for r in rows if r["code"] == "wide_bio_pending_ambiguous_subject"]
+        assert len(typed) == 1 and typed[0]["evidence"]["fact_sha256"]
+        assert result["status"] == "blocked" and not (project / MANIFEST_NAME).exists()
+        # idempotent over the same progress
+        assert main(finalize_args(project, source, config_path, out)) == 3
+        assert len(calls) == used
+
+
+def test_finalize_adaptive_with_candidate_gap_is_blocked_and_never_freezes(
+    world, capsys, no_network
+) -> None:
+    root, config_path, config, *_ = world
+    with required_book(root, "Ren wore a red cloak.\n\nMara smiled.\n") as (
+        source,
+        project,
+    ):
+        facts = {"k0000": [fact("Ren", "ren", "look", "a red cloak", "000000")]}
+        out, code, _ = build_adaptive(root, config_path, config, source, project, facts)
+        assert code == 0
+        capsys.readouterr()
+        assert main(finalize_args(project, source, config_path, out)) == 3
+        result = json.loads(capsys.readouterr().out)
+        assert result["reason"] == "wide_bio_required_candidate_accounting_incomplete"
+        assert [
+            u["label"] for u in result["wide_bio"]["accounting"]["unaccounted"]
+        ] == ["Mara"]
+        assert not (project / MANIFEST_NAME).exists()
+
+
+def test_finalize_adaptive_complete_and_clean_proceeds_to_freeze_gates(
+    world, capsys, no_network
+) -> None:
+    root, config_path, config, *_ = world
+    with required_book(root, "Ren wore a red cloak.\n") as (source, project):
+        facts = {"k0000": [fact("Ren", "ren", "look", "a red cloak", "000000")]}
+        out, code, _ = build_adaptive(root, config_path, config, source, project, facts)
+        assert code == 0
+        capsys.readouterr()
+        # nothing wide-bio related blocks any more, so prepare_cast proceeds to the freeze gates; the asset
+        # stage (voices.json, never present in this tiny project) is the first thing that stops it
+        from src.data_recovery import OperationalError
+
+        with pytest.raises(OperationalError, match="voice profiles"):
+            main(finalize_args(project, source, config_path, out))
+        progress = json.loads((project / "cast_preparation_progress.json").read_text())
+        assert progress["wide_bio"]["accounting"]["complete"] is True
+        assert progress["wide_bio"]["pending"] == 0
+        assert RecoveryLedger(project).open_pending("cast") == []
+        assert not (project / MANIFEST_NAME).exists()
+
+
+def refused(capsys) -> str:
+    return json.loads(capsys.readouterr().err)["refused"]
+
+
+def test_finalize_adaptive_refuses_incomplete_exhausted_and_foreign_outputs(
+    world, capsys, no_network
+) -> None:
+    root, config_path, config, *_ = world
+    with required_book(root, "Ren wore a red cloak.\n\nMara smiled.\n") as (
+        source,
+        project,
+    ):
+        facts = {"k0000": [fact("Ren", "ren", "look", "a red cloak", "000000")]}
+        # k0001 stays length-exhausted at 8192
+        out, code, _ = build_adaptive(
+            root, config_path, config, source, project, facts, exhaust=["k0001"]
+        )
+        assert code == 3
+        args = finalize_args(project, source, config_path, out)
+        capsys.readouterr()
+        assert main(args) == 2 and refused(capsys) == "adaptive_output_incomplete"
+        assert not (project / "cast_preparation_progress.json").exists()
+        # a plain (non-adaptive) run directory is not accepted
+        assert main(finalize_args(project, source, config_path, root / "fparent")) == 2
+        assert refused(capsys) in {
+            "adaptive_output_invalid",
+            "adaptive_output_incomplete",
+        }
+        # a project that is not the source's output directory is refused
+        assert main(finalize_args(root, source, config_path, out)) == 2
+        assert refused(capsys) == "project_mismatch"
+
+
+def test_finalize_adaptive_refuses_tampering_missing_exit_and_other_source(
+    world, capsys, no_network
+) -> None:
+    root, config_path, config, *_ = world
+    with required_book(root, "Ren wore a red cloak.\n\nMara smiled.\n") as (
+        source,
+        project,
+    ):
+        facts = {"k0000": [fact("Ren", "ren", "look", "a red cloak", "000000")]}
+        out, code, _ = build_adaptive(
+            root, config_path, config, source, project, facts, length=["k0000"]
+        )
+        assert code == 0
+        capsys.readouterr()
+        for name in ("k0000.a2.response.txt", "k0001.a1.response.txt"):
+            bad = root / f"bad-{name}"
+            shutil.copytree(out, bad)
+            path = bad / "raw" / name
+            path.write_text(path.read_text() + " ")
+            assert main(finalize_args(project, source, config_path, bad)) == 2
+            assert refused(capsys) == "journal_inconsistent"
+        for victim, expected in (
+            ("run.exit", "adaptive_output_incomplete"),
+            ("seed.json", "adaptive_output_mismatch"),
+        ):
+            bad = root / f"bad-{victim}"
+            shutil.copytree(out, bad)
+            if victim == "run.exit":
+                (bad / victim).unlink()
+            else:
+                seed = json.loads((bad / victim).read_text())
+                seed["registry"]["ren"]["bio"] = "forged"
+                (bad / victim).write_text(json.dumps(seed))
+            assert main(finalize_args(project, source, config_path, bad)) == 2
+            assert refused(capsys) == expected
+        plan_bad = root / "bad-plan"
+        shutil.copytree(out, plan_bad)
+        plan = json.loads((plan_bad / "plan.json").read_text())
+        plan["adaptive"]["retry_output_tokens"] = 4096
+        (plan_bad / "plan.json").write_text(json.dumps(plan))
+        assert main(finalize_args(project, source, config_path, plan_bad)) == 2
+        assert refused(capsys) == "adaptive_output_mismatch"
+        # a changed source no longer reproduces the plan
+        source.write_text("Ren wore a red cloak.\n\nMara frowned.\n", encoding="utf-8")
+        assert main(finalize_args(project, source, config_path, out)) == 2
+        assert refused(capsys) in {"adaptive_output_mismatch", "journal_inconsistent"}
+        assert not (project / "cast_preparation_progress.json").exists()

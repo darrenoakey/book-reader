@@ -70,7 +70,7 @@ def chunk_text(text: str, chunk_size: int = 4000, overlap: int = 0) -> list[str]
 # script integrity
 # a script is only ever accepted whole: every chunk must parse completely,
 # use known speakers and cover the source text. Anything else raises —
-# there is NO all-narrator fallback.
+# there is NO all-narrator substitute.
 CHUNK_SIZE = 4000
 MAX_ATTEMPTS = 6
 RETRY_DELAY_SECONDS = 5

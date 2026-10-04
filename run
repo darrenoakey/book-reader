@@ -128,8 +128,8 @@ print(json.dumps(plan_quarantine_revalidation(Path({str(source)!r})), indent=2, 
     limit = "QUARANTINE_REVALIDATION_LIMIT" if args.max_revalidations is None else repr(args.max_revalidations)
     code = f'''\
 from pathlib import Path
-from src.cast_freeze import QUARANTINE_REVALIDATION_LIMIT, prepare_cast
-print(prepare_cast(Path({str(source)!r}), verify_only={args.verify_only!r}, max_batches={args.max_batches!r}, max_revalidations={limit}))
+from src.cast_freeze import QUARANTINE_REVALIDATION_LIMIT, prepare_cast, prepare_lean_characters
+print(prepare_lean_characters(Path({str(source)!r})) if {args.lean!r} else prepare_cast(Path({str(source)!r}), verify_only={args.verify_only!r}, max_batches={args.max_batches!r}, max_revalidations={limit}))
 '''
     return run_venv([str(VENV_PYTHON), "-c", code])
 
@@ -307,6 +307,7 @@ def main(argv: list[str]) -> int:
     p_prepare.add_argument("--max-batches", type=int, default=None, help="Process at most this many durable source batches, then exit cleanly")
     p_prepare.add_argument("--max-revalidations", type=int, default=None, help="Retry at most this many open quarantine rows (exact source hash, bounded attempts per row) this pass")
     p_prepare.add_argument("--plan-quarantines", action="store_true", help="Read-only: report which open quarantine rows are eligible, stale or exhausted; no inference or writes")
+    p_prepare.add_argument("--lean", action="store_true", help="Fast existing-profile character summary only; no source scan, cross-check, identity merge or media change")
     p_prepare.set_defaults(func=command_prepare_cast)
 
     p_continue = sub.add_parser("continue", help="Resume sequential 480p hourly production to the established source EOF; never uploads")

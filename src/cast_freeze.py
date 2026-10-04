@@ -7145,6 +7145,24 @@ def required_wide_bio(
 
 # ##################################################################
 # prepare cast
+# lean character preparation
+# publishes a small reusable character summary from the existing project profiles only;
+# it deliberately performs no source scan, identity merge, alias resolution or media mutation.
+def prepare_lean_characters(source: Path) -> dict:
+    source = source.resolve()
+    project = get_output_dir(source)
+    base = load_object(project / "characters.json", "characters profile")
+    actors = {
+        actor_id: {"name": info.get("name", actor_id), "bio": info.get("bio", ""), "look": info.get("look", "")}
+        for actor_id, info in base.items()
+    }
+    if not ANCHOR_IDS <= set(actors):
+        raise OperationalError("cast_integrity", "existing project is missing original Part 1 canonical anchors")
+    artifact = {"mode": "lean_existing_profiles_v1", "source_sha256": source_fingerprint(source), "actors": actors}
+    atomic_json(project / "lean_characters.json", artifact)
+    return {"status": "lean_ready", "actors": len(actors), "artifact": str(project / "lean_characters.json")}
+
+
 # resumes each bounded native-Ollama batch from durable progress and atomically publishes a freeze only after all chapters and assets validate.
 def prepare_cast(
     source: Path,

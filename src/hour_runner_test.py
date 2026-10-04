@@ -369,3 +369,61 @@ def test_saved_audio_tamper_refused_and_text_located() -> None:
         assert [h["hour"] for h in hits] == ["hour-003"] and hits[0]["start"] == 0.0
     finally:
         cleanup()
+
+
+def test_prepare_keeps_earlier_lean_actor_profiles_in_same_hour() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        project = Path(directory)
+        (project / "chapters").mkdir()
+        for name, value in (
+            ("characters.json", {"tiger_boy": {"name": "Tiger Boy"}}),
+            ("voices.json", {}),
+            ("breeze_voices.json", {}),
+            ("appearances.json", {}),
+        ):
+            (project / name).write_text(json.dumps(value), encoding="utf-8")
+        hour = project / "hours/hour-003"
+        cast = {"tiger_boy": {}, "new_one": {}, "other": {}}
+        prepare_hour_directory(project, hour, cast)
+        local = json.loads((hour / "characters.json").read_text(encoding="utf-8"))
+        local["new_one"] = {"name": "New One", "bio": "b", "look": "l"}
+        (hour / "characters.json").write_text(json.dumps(local), encoding="utf-8")
+        prepare_hour_directory(project, hour, cast)
+        merged = json.loads((hour / "characters.json").read_text(encoding="utf-8"))
+        assert set(merged) == {"tiger_boy", "new_one"} and merged["new_one"]["name"] == "New One"
+
+
+def test_scene_portraits_select_only_storyboard_characters() -> None:
+    from src.hour_runner import ensure_scene_portraits
+
+    with tempfile.TemporaryDirectory() as directory:
+        hour = Path(directory)
+        (hour / "refs").mkdir()
+        (hour / "refs" / "shown.png").write_bytes(b"png")
+        (hour / "storyboard.json").write_text(
+            json.dumps({"appearances": {"shown": "a look", "unused": "another look"},
+                        "scenes": [{"characters": ["shown", "narrator"]}, {"characters": []}]}),
+            encoding="utf-8",
+        )
+        assert ensure_scene_portraits(hour) == []
+        assert not (hour / "refs" / "unused.png").exists()
+
+
+def test_locate_text_spans_adjacent_lines_and_ellipsis() -> None:
+    from src.hour_runner import locate_text
+
+    _source, project, cleanup = _deferred_book()
+    try:
+        audio = project / "hours" / "hour-004" / "audio"
+        audio.mkdir(parents=True)
+        lines = [
+            {"index": 0, "speaker": "x", "text": "Earlier words. I lost the", "start": 0.0, "end": 1.0},
+            {"index": 1, "speaker": "x", "text": "bet.  Then a pause", "start": 1.0, "end": 2.0},
+            {"index": 2, "speaker": "x", "text": "It\u2019s official, a new beetle.", "start": 2.0, "end": 3.0},
+        ]
+        (audio / "hour-00000.timeline.json").write_text(json.dumps({"lines": lines}), encoding="utf-8")
+        hits = locate_text(project, "I lost the bet ... It's official")
+        assert [(h["hour"], h["start"]) for h in hits] == [("hour-004", 0.0)]
+        assert locate_text(project, "official lost") == []
+    finally:
+        cleanup()

@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 from datetime import datetime, timezone
@@ -362,14 +363,15 @@ def prepare_hour_directory(
             "appearances.json",
         ):
             source = json.loads((project / name).read_text(encoding="utf-8"))
-            atomic_json(
-                hour_dir / name,
-                {
-                    actor_id: source[actor_id]
-                    for actor_id in frozen_names
-                    if actor_id in source
-                },
-            )
+            kept = {
+                actor_id: source[actor_id] for actor_id in frozen_names if actor_id in source
+            }
+            existing = hour_dir / name
+            if name == "characters.json" and existing.is_file():
+                # profiles added earlier in this hour for lean-cast actors absent from root must survive.
+                previous = json.loads(existing.read_text(encoding="utf-8"))
+                kept = {**{k: v for k, v in previous.items() if k in frozen_names}, **kept}
+            atomic_json(hour_dir / name, kept)
     for name in (
         "voices",
         "refs",
@@ -587,6 +589,23 @@ def synthesize_window(
 
 
 # ##################################################################
+# ensure scene portraits
+# create only portraits for characters that appear in storyboard scenes and lack a shared ref; never overwrite refs.
+def ensure_scene_portraits(hour_dir: Path) -> list[Path]:
+    from src.movie_images import generate_missing_character_refs
+
+    storyboard = json.loads((hour_dir / "storyboard.json").read_text(encoding="utf-8"))
+    appearances = storyboard["appearances"]
+    shown = {cid for scene in storyboard["scenes"] for cid in scene.get("characters", [])}
+    needed = sorted(
+        cid for cid in shown
+        if cid != "narrator" and appearances.get(cid) not in (None, "", "NONE")
+        and not (hour_dir / "refs" / f"{cid}.png").is_file()
+    )
+    return generate_missing_character_refs(hour_dir, needed) if needed else []
+
+
+# ##################################################################
 # render hour
 # create scene images and the final movie only after its audio duration has been proven at or below one hour.
 def render_hour(hour_dir: Path, title: str) -> Path:
@@ -598,7 +617,10 @@ def render_hour(hour_dir: Path, title: str) -> Path:
     if total > HOUR_MAX_SECONDS + 0.0001:
         raise RuntimeError(f"hour audio is {total:.3f}s, exceeding the hard 3600s cap")
     build_storyboard(hour_dir, title)
-    generate_character_refs(hour_dir)
+    if (hour_dir / "frozen_cast_active_only.txt").is_file():
+        ensure_scene_portraits(hour_dir)
+    else:
+        generate_character_refs(hour_dir)
     generate_scene_images(hour_dir)
     movie = assemble_movie(hour_dir, title, resolution=FINAL_RESOLUTION)
     duration = probe_duration(movie)
@@ -705,12 +727,38 @@ def render_saved_hour(project: Path, ledger: dict, key: str, title: str) -> Path
 # locate text
 # find which saved hour audio timeline actually speaks the text, with its start second.
 def locate_text(project: Path, text: str) -> list[dict]:
-    needle = " ".join(text.lower().split())
+    segments = [
+        " ".join(re.findall(r"[a-z0-9']+", part.lower().replace("\u2019", "'")))
+        for part in re.split(r"\.{2,}|\u2026", text)
+    ]
+    segments = [part for part in segments if part]
     found = []
+    if not segments:
+        return found
     for timeline in sorted((project / "hours").glob("hour-*/audio/hour-00000.timeline.json")):
-        for line in json.loads(timeline.read_text(encoding="utf-8"))["lines"]:
-            if needle in " ".join(str(line["text"]).lower().split()):
-                found.append({"hour": timeline.parent.parent.name, "start": line["start"], "text": line["text"]})
+        lines = json.loads(timeline.read_text(encoding="utf-8"))["lines"]
+        flat, owners = "", []
+        for index, line in enumerate(lines):
+            words = " ".join(re.findall(r"[a-z0-9']+", str(line["text"]).lower().replace("\u2019", "'")))
+            if not words:
+                continue
+            flat += (" " if flat else "") + words
+            owners.append((len(flat) - len(words), index))
+        flat = f" {flat} "
+        position, first = 0, None
+        for part in segments:
+            hit = flat.find(f" {part} ", position)
+            if hit < 0:
+                first = None
+                break
+            first = hit if first is None else first
+            position = hit + len(part) + 1
+        if first is not None:
+            offset = first
+            owner = max((o for o in owners if o[0] <= offset), key=lambda o: o[0])[1]
+            found.append(
+                {"hour": timeline.parent.parent.name, "start": lines[owner]["start"], "text": lines[owner]["text"]}
+            )
     return found
 
 

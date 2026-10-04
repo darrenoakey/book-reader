@@ -359,6 +359,7 @@ class DeltaSettings:
     max_attempts: int = 1
     temperature: float | None = None
     seed: int | None = None
+    provider_grammar_profile: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("target_tokens", "delta_tokens", "max_attempts"):
@@ -386,6 +387,16 @@ class DeltaSettings:
             if isinstance(self.seed, bool) or not isinstance(self.seed, int):
                 raise ContractError(
                     "sampling seed must be an integer", "sampling_invalid"
+                )
+        if self.provider_grammar_profile is not None:
+            profile = self.provider_grammar_profile
+            if (
+                not isinstance(profile, str)
+                or not re.fullmatch(r"[a-z0-9][a-z0-9._:-]{2,200}", profile)
+            ):
+                raise ContractError(
+                    "provider grammar profile must be a stable lowercase descriptor",
+                    "grammar_profile_invalid",
                 )
 
     @property
@@ -942,6 +953,11 @@ def build_delta_plan(
     if settings.sampling is not None:
         # present only when configured, so every unsampled plan keeps its existing fingerprint
         artifact["sampling"] = settings.sampling
+    if settings.provider_grammar_profile is not None:
+        # The grammar is a server-side decoder contract, not a request field.
+        # Its verified descriptor nevertheless changes every response surface,
+        # so it is immutable plan provenance and never inferred from a URL.
+        artifact["provider_grammar_profile"] = settings.provider_grammar_profile
     artifact["plan_sha256"] = sha256_text(canonical_json(artifact))
     return DeltaPlan(source, tuple(chunks), settings, fixed_overhead, artifact)
 
@@ -2578,6 +2594,11 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
             default=None,
             help="explicit request seed, part of the plan fingerprint; needs --sampling-temperature",
         )
+        item.add_argument(
+            "--provider-grammar-profile",
+            default=None,
+            help="verified server-side JSON grammar descriptor; immutable plan provenance, never sent as a request option",
+        )
     sub.choices["run"].add_argument(
         "--execute", action="store_true", help="required: sends requests to the primary"
     )
@@ -2645,6 +2666,7 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
             getattr(args, "max_attempts", 1),
             getattr(args, "sampling_temperature", None),
             getattr(args, "sampling_seed", None),
+            getattr(args, "provider_grammar_profile", None),
         )
         if args.command == "adaptive":
             return adaptive_command(args, settings, transport)

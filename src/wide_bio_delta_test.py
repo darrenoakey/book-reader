@@ -1534,6 +1534,33 @@ def test_prepare_cast_exposes_sampled_production_flags(capsys: pytest.CaptureFix
     help_text = capsys.readouterr().out
     assert "--sampling-temperature" in help_text
     assert "--sampling-seed" in help_text
+    assert "--provider-grammar-profile" in help_text
+
+
+def test_provider_grammar_profile_is_immutable_plan_provenance(world, sampled) -> None:
+    _, _, _, chapters, count, _seed, *_ = world
+    _, _, config, *_ = sampled
+    plain = build_delta_plan(
+        TEXT, chapters, config, count, DeltaSettings(1, 512, 1), 0, "seed"
+    )
+    profiled = build_delta_plan(
+        TEXT,
+        chapters,
+        config,
+        count,
+        DeltaSettings(1, 512, 1, None, None, "tf-json-minified-ws0-v1"),
+        0,
+        "seed",
+    )
+    assert profiled.artifact["provider_grammar_profile"] == "tf-json-minified-ws0-v1"
+    assert profiled.artifact["plan_sha256"] != plain.artifact["plan_sha256"]
+    body = json.loads(
+        prepare(config, profiled, profiled.chunks[0], Established(), count).payload
+    )
+    assert "provider_grammar_profile" not in body
+    for bad in ("Uppercase", "", "x", "bad space"):
+        with pytest.raises(ContractError, match="grammar profile"):
+            DeltaSettings(1, 512, 1, None, None, bad)
 
 
 def test_sampling_changes_fingerprint_and_is_sent_only_where_openai_supports_it(

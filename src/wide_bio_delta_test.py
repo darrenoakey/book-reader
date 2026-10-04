@@ -1367,6 +1367,7 @@ def test_verbose_dialogue_and_action_rows_are_typed_pending_never_claims(dense) 
             "000001",
         ),
         fact("Mira", "novel", "voice", "whatever the captain says!", "000001"),
+        fact("Mira", "novel", "voice", "explaining that the fees are high", "000001"),
         fact(
             "Mira",
             "novel",
@@ -1422,7 +1423,7 @@ def test_verbose_dialogue_and_action_rows_are_typed_pending_never_claims(dense) 
         ],
     )
     assert [c["value"] for c in mixed["claims"]] == ["harbour pilot", "the Gull Queen"]
-    assert reasons(mixed) == ["dialogue_value", "value_not_compact"]
+    assert reasons(mixed) == ["dialogue_value", "clause_value"]
 
 
 def test_unknown_subject_stays_ambiguous_pending_and_is_never_forced_to_an_actor(
@@ -1434,9 +1435,10 @@ def test_unknown_subject_stays_ambiguous_pending_and_is_never_forced_to_an_actor
 
 def test_plan_fingerprint_changes_and_old_runs_stay_incompatible(world) -> None:
     root, _, config, chapters, count, _seed, plan, *_ = world
-    assert DELTA_VERSION == 3 and plan.artifact["delta_version"] == 3
+    assert DELTA_VERSION == 4 and plan.artifact["delta_version"] == 4
     assert VALUE_MAX <= 100 and "SHORTEST" in SYSTEM_PROMPT
     assert "earliest paragraph id" in SYSTEM_PROMPT and "MINIFIED JSON" in SYSTEM_PROMPT
+    assert "NEVER an explanation" in SYSTEM_PROMPT
     assert plan.artifact["compact_contract_sha256"]
     out = root / "old-run"
     out.mkdir()

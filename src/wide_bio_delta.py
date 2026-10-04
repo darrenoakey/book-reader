@@ -77,7 +77,7 @@ from src.wide_bio import (
 )
 from src.wide_bio_tokenizer import TokenizerRefusal
 
-DELTA_VERSION = 3
+DELTA_VERSION = 4
 QUOTE_MAX = 240
 VALUE_MAX = 100
 REF_NOVEL = "novel"
@@ -171,7 +171,12 @@ CLAUSE_VERB_WORDS = frozenset(
         "never",
     ]
 )
-PHRASE_CATEGORIES = frozenset(CATEGORIES) - {"voice", "power"}
+# Voice and power are also compact attribute phrases: an explanation of
+# dialogue is not a voice trait, and a full action clause is not a power name.
+PHRASE_CATEGORIES = frozenset(CATEGORIES)
+VOICE_REPORT_WORDS = frozenset(
+    {"explain", "explained", "explaining", "say", "said", "telling", "told", "replying", "replied", "asking", "asked", "arguing", "argued"}
+)
 LEADING_WORDS = frozenset(
     ["the", "a", "an", "his", "her", "their", "its", "my", "your", "our"]
 )
@@ -211,8 +216,8 @@ SYSTEM_PROMPT = (
     f"Categories: {', '.join(CATEGORIES)}. look=physical appearance (one row per distinct feature: hair, eyes, build, clothing worn habitually), "
     "role=an explicit occupation, rank or title only, kin=an explicit named relationship (one row per relative), "
     "beast=an explicit creature or species, gender=explicit gender, age=an explicit age or age change, "
-    "alias=another name the source explicitly gives the same character, voice=an explicit voice, manner of speech or personality trait, "
-    "power=an explicit ability or power (one row per power). "
+    "alias=another name the source explicitly gives the same character, voice=a short voice/tone/personality label such as 'a voice like gravel' or 'gruff and patient' (NEVER an explanation of what anyone said), "
+    "power=a short named ability noun phrase such as 'call lightning' (NEVER an action or full clause; one row per power). "
     "Report every distinct explicit trait of every character; several rows for one character and category are expected when the source states several. "
     "Before emitting EACH row, compare its normalised (subject name, category, value) to every row already emitted. If it is the same trait, OMIT it even if another paragraph also contains it: emit one row using its earliest paragraph id. Do not loop or repeat a trait under different paragraph ids. "
     "Return compact MINIFIED JSON: no indentation or explanatory text. Skip what the source does not state outright: no transient action, no speech, no inference. Do not repeat a trait twice. "
@@ -260,6 +265,10 @@ def compactness_problem(
         category in PHRASE_CATEGORIES and lowered & CLAUSE_VERB_WORDS
     ):
         return "clause_value"
+    if category == "voice" and (
+        lowered & VOICE_REPORT_WORDS or "that" in lowered
+    ):
+        return "category_incompatible_value"
     known = {norm_space(name).casefold() for name in [subject, *names]}
     if category not in ("alias", "role") and norm_space(value).casefold() in known:
         return "category_incompatible_value"

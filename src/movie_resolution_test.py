@@ -103,7 +103,7 @@ def test_cli_resolution_validation() -> None:
 
 # ##################################################################
 # test pipeline rerenders resolution real
-# a complete movie state only skips when its published dimensions match the requested pipeline resolution
+# a complete movie state is reused only when its published dimensions match the requested pipeline resolution
 def test_pipeline_rerenders_when_resolution_changes_real() -> None:
     from src.epub_extract import get_output_dir
     from src.state import mark_step_complete

@@ -1,6 +1,6 @@
 """Real tests for text_ingest: markdown stripping, section splitting,
 word-driven chunking, and full ingest of a real temp .md story into the
-chapters/ layout the rest of the pipeline consumes. No mocks, no services.
+chapters/ layout the rest of the pipeline consumes.
 """
 
 import tempfile

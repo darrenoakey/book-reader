@@ -22,7 +22,7 @@ async def query_haiku(prompt: str) -> str:
 
 # ##################################################################
 # parse jsonl response
-# extract jsonl lines from claude response skipping non-json lines
+# extract JSONL lines from a provider response while ignoring non-JSON lines
 def parse_jsonl_response(text: str) -> list[dict]:
     text = text.strip()
     if text.startswith("```"):

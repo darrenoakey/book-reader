@@ -19,3 +19,13 @@ as "facts". Delta version 2 repairs the output density at the source without los
 - `DELTA_VERSION` is 2 and the plan carries `compact_contract_sha256`, so the plan fingerprint (and every run directory
   identity) changes. Prior v1 raw/journal directories are immutable, incompatible history: `adaptive --from-out` refuses them
   (`adaptive_parent_mismatch`) and a v1 `--out` is refused (`plan_mismatch`). Start v2 in a NEW output directory.
+
+## Compact wire controls
+
+With a verified provider profile and `--compact-wire`, each fact uses the separately fingerprinted compact wire:
+`"s"` is the exact-case literal source name and `"r"` is the exact established id (for example,
+`"s":"Lu","r":"lu"`). The client never repairs an id or case mismatch in `s`; it remains typed
+`subject_ref_mismatch` pending. Raw compact output stays immutable and is decoded to canonical facts before the existing
+literal-value, paragraph, source-witness and subject/ref guards run. A fresh compact proof needs a locally accepted,
+source-backed new fact and no growth loop before it authorizes a new whole-source output. A syntactically complete empty
+response is not coverage evidence.

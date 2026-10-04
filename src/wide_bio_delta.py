@@ -2085,8 +2085,11 @@ def prepare_temperature_ablation(
     prepared = prepare(config, new_plan, chunk, old.state, count)
     old_body, new_body = json.loads(prior.payload), json.loads(prepared.payload)
     old_temp, new_temp = old_body.pop("temperature", None), new_body.pop("temperature", None)
-    if old_temp == new_temp or old_body != new_body:
-        raise ContractError("ablation changed more than temperature", "ablation_mismatch")
+    old_presence = old_body.pop("presence_penalty", None)
+    new_presence = new_body.pop("presence_penalty", None)
+    changed = (old_temp != new_temp, old_presence != new_presence)
+    if changed.count(True) != 1 or old_body != new_body:
+        raise ContractError("ablation changed more than one sampling field", "ablation_mismatch")
     return prior, prepared, old.state
 
 
@@ -2662,7 +2665,7 @@ def replay_ablation_command(args, settings: DeltaSettings, transport: Transport)
     seed_bytes = canonical_json(old_seed).encode()
     old_settings = DeltaSettings(
         args.target_tokens, args.delta_tokens, 1, args.from_temperature, args.sampling_seed,
-        args.provider_grammar_profile, args.compact_wire,
+        args.provider_grammar_profile, args.compact_wire, args.from_presence_penalty,
     )
     count = build_counter(config)
     source = read_source(args.source)
@@ -2671,8 +2674,8 @@ def replay_ablation_command(args, settings: DeltaSettings, transport: Transport)
     if stored != old_plan.artifact:
         raise ContractError("prefix plan is not the exact old-temperature plan", "ablation_mismatch")
     new_plan = build_delta_plan(source, chapters, config, count, settings, args.fixed_overhead, sha256_text(canonical_json(old_seed)))
-    if new_plan.settings.temperature == old_plan.settings.temperature:
-        raise ContractError("ablation needs a different temperature", "ablation_mismatch")
+    if (new_plan.settings.temperature == old_plan.settings.temperature) == (new_plan.settings.presence_penalty == old_plan.settings.presence_penalty):
+        raise ContractError("ablation needs exactly one changed sampling field", "ablation_mismatch")
     registry, aliases = old_seed["registry"], old_seed["aliases"]
     prior, prepared, state = prepare_temperature_ablation(chapters, config, old_plan, new_plan, args.prefix_out, args.chunk, count, registry, aliases)
     if not args.execute:
@@ -2693,7 +2696,7 @@ def replay_ablation_command(args, settings: DeltaSettings, transport: Transport)
         return 0
     args.out.mkdir(parents=True, exist_ok=True)
     same_or_absent(args.out / "seed.json", seed_bytes)
-    write_atomic(args.out / "ablation_provenance.json", canonical_json({"prefix_out": str(args.prefix_out), "prefix_plan_sha256": old_plan.artifact["plan_sha256"], "new_plan_sha256": new_plan.artifact["plan_sha256"], "chunk": args.chunk, "old_request_sha256": prior.request_sha256, "new_request_sha256": prepared.request_sha256, "old_temperature": old_plan.settings.temperature, "new_temperature": new_plan.settings.temperature}))
+    write_atomic(args.out / "ablation_provenance.json", canonical_json({"prefix_out": str(args.prefix_out), "prefix_plan_sha256": old_plan.artifact["plan_sha256"], "new_plan_sha256": new_plan.artifact["plan_sha256"], "chunk": args.chunk, "old_request_sha256": prior.request_sha256, "new_request_sha256": prepared.request_sha256, "old_temperature": old_plan.settings.temperature, "new_temperature": new_plan.settings.temperature, "old_presence_penalty": old_plan.settings.presence_penalty, "new_presence_penalty": new_plan.settings.presence_penalty}))
     calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
     summary = run_delta(chapters, config, new_plan, args.out, transport, count, calibration, args.soft_deadline_s, args.hard_deadline_s, registry=registry, aliases=aliases, only_chunk=args.chunk, initial_state=state)
     print(json.dumps(summary, sort_keys=True))
@@ -2821,7 +2824,9 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
     ab.add_argument("--target-tokens", type=int, required=True)
     ab.add_argument("--delta-tokens", type=int, required=True)
     ab.add_argument("--from-temperature", type=float, required=True)
+    ab.add_argument("--from-presence-penalty", type=float, default=None)
     ab.add_argument("--sampling-temperature", type=float, required=True)
+    ab.add_argument("--presence-penalty", type=float, default=None)
     ab.add_argument("--sampling-seed", type=int, required=True)
     ab.add_argument("--provider-grammar-profile", required=True)
     ab.add_argument("--compact-wire", action="store_true")

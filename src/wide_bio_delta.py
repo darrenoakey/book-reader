@@ -2663,11 +2663,24 @@ def replay_ablation_command(args, settings: DeltaSettings, transport: Transport)
         raise ContractError("ablation needs a different temperature", "ablation_mismatch")
     registry, aliases = old_seed["registry"], old_seed["aliases"]
     prior, prepared, state = prepare_temperature_ablation(chapters, config, old_plan, new_plan, args.prefix_out, args.chunk, count, registry, aliases)
+    if not args.execute:
+        stored_new = json.loads((args.out / "plan.json").read_text(encoding="utf-8"))
+        if stored_new != new_plan.artifact:
+            raise ContractError("ablation output plan does not match replay request", "ablation_mismatch")
+        verify = DeltaRun(chapters, config, new_plan, args.out, count, build_cast_index(list(chapters), registry, aliases, None), registry, aliases)
+        verify.state = state
+        verify.only_chunk = args.chunk
+        verify.replay()
+        records = verify.attempts[args.chunk]
+        if len(records) != 1 or not records[0]["called"]:
+            raise ContractError("ablation output has no single saved target call", "ablation_mismatch")
+        print(json.dumps({"state": "verified", "chunk": args.chunk, "request_sha256": prepared.request_sha256, "response_sha256": records[0]["response_sha256"]}, sort_keys=True))
+        return 0
     args.out.mkdir(parents=True, exist_ok=True)
     same_or_absent(args.out / "seed.json", seed_bytes)
     write_atomic(args.out / "ablation_provenance.json", canonical_json({"prefix_out": str(args.prefix_out), "prefix_plan_sha256": old_plan.artifact["plan_sha256"], "new_plan_sha256": new_plan.artifact["plan_sha256"], "chunk": args.chunk, "old_request_sha256": prior.request_sha256, "new_request_sha256": prepared.request_sha256, "old_temperature": old_plan.settings.temperature, "new_temperature": new_plan.settings.temperature}))
     calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
-    summary = run_delta(chapters, config, new_plan, args.out, transport if args.execute else None, count, calibration, args.soft_deadline_s, args.hard_deadline_s, registry=registry, aliases=aliases, only_chunk=args.chunk, initial_state=state)
+    summary = run_delta(chapters, config, new_plan, args.out, transport, count, calibration, args.soft_deadline_s, args.hard_deadline_s, registry=registry, aliases=aliases, only_chunk=args.chunk, initial_state=state)
     print(json.dumps(summary, sort_keys=True))
     return 0 if summary["state"] == "ready" else 3
 

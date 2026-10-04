@@ -42,6 +42,8 @@ MOVIE_PATHS = {
     "src/testdata/weakest_scoped_audit_snapshot.json",
     "src/hour_continue.py",
     "src/hour_continue_test.py",
+    "src/catchup_runner.py",
+    "src/catchup_runner_test.py",
     "src/hourly_spans.py",
     "src/hourly_spans_test.py",
     "src/llm.py",
@@ -89,6 +91,7 @@ MOVIE_TESTS = (
     "src/gate_check_test.py",
     "src/dep_install_test.py",
     "src/hour_runner_test.py",
+    "src/catchup_runner_test.py",
     "src/cast_freeze_test.py",
     "src/cast_index_test.py",
     "src/wide_bio_test.py",
@@ -108,6 +111,7 @@ MOVIE_TESTS = (
 # with the suite that executes it. Changing data_recovery re-runs all of them.
 RECOVERY_TESTS = (
     "src/data_recovery_test.py",
+    "src/catchup_runner_test.py",
     "src/audio_synth_test.py",
     "src/cast_freeze_test.py",
     "src/cast_index_test.py",
@@ -198,6 +202,8 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "src/testdata/weakest_scoped_audit_snapshot.json": ("src/cast_freeze_test.py",),
     "src/hour_continue.py": ("src/hour_continue_test.py",),
     "src/hour_continue_test.py": ("src/hour_continue_test.py",),
+    "src/catchup_runner.py": ("src/catchup_runner_test.py",),
+    "src/catchup_runner_test.py": ("src/catchup_runner_test.py",),
     "src/hourly_spans.py": ("src/hourly_spans_test.py", "src/script_generate_test.py"),
     "src/hourly_spans_test.py": ("src/hourly_spans_test.py",),
     "src/llm.py": ("src/llm_test.py", "src/script_generate_test.py", "src/hourly_spans_test.py"),

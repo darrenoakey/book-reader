@@ -13,6 +13,7 @@ from src.cast_freeze import MANIFEST_NAME, RecoveryLedger, prepare_cast
 from src.epub_extract import get_output_dir
 from src.wide_bio import (
     ContractError,
+    Paragraph,
     build_counter,
     load_proof_config,
     project_chapters,
@@ -23,6 +24,7 @@ from src.wide_bio_delta import (
     PENDING_REASONS,
     SYSTEM_PROMPT,
     VALUE_MAX,
+    DeltaChunk,
     DeltaSettings,
     Established,
     WideBioHook,
@@ -1340,6 +1342,24 @@ def test_compact_wire_schema_and_decoder_preserve_canonical_fact_validation(dens
     ]
 
 
+def test_compact_wire_captured_lu_row_requires_exact_literal_name_and_id() -> None:
+    # Literal fact captured from the live compact proof: only the source's
+    # exact-case Lu plus established id lu can pass.  A lowercased id copied
+    # into s remains typed pending; no alias/case repair is permitted.
+    text = 'Lu said, "I failed two units."'
+    paragraph = Paragraph("000119", 0, len(text), text, sha256_text(text), {"chapter": "24-part_24.txt", "chapter_offset": 0, "chapter_text_sha256": "0" * 64})
+    chunk = DeltaChunk("k0003", 0, len(text), (paragraph,), 1, False)
+    state = Established()
+    state.seed({"lu": {"name": "Lu", "facts": {}}}, {})
+    raw = json.dumps({"facts": [
+        {"s": "Lu", "r": "lu", "k": "education", "v": "failed two units", "p": "000119"},
+        {"s": "lu", "r": "lu", "k": "education", "v": "failed two units", "p": "000119"},
+    ]})
+    result = validate_delta_response(raw, chunk, state, ["lu"], {"Lu": False}, True)
+    assert [claim["value"] for claim in result["claims"]] == ["failed two units"]
+    assert [row["pending_reason"] for row in result["pending"]] == ["subject_ref_mismatch"]
+
+
 def test_compact_wire_is_distinct_plan_provenance_and_request_contract(world, sampled) -> None:
     _, _, _, chapters, count, _seed, *_ = world
     _, _, config, *_ = sampled
@@ -1347,7 +1367,7 @@ def test_compact_wire_is_distinct_plan_provenance_and_request_contract(world, sa
     compact = build_delta_plan(
         TEXT, chapters, config, count, DeltaSettings(1, 512, 1, None, None, None, True), 0, "seed"
     )
-    assert compact.artifact["wire_format"] == "compact-v1"
+    assert compact.artifact["wire_format"] == "compact-v2"
     assert compact.artifact["plan_sha256"] != plain.artifact["plan_sha256"]
     body = json.loads(prepare(config, compact, compact.chunks[0], Established(), count).payload)
     assert set(
@@ -1488,7 +1508,7 @@ def test_captured_transient_voice_delivery_and_misclassified_education_are_pendi
 
 def test_plan_fingerprint_changes_and_old_runs_stay_incompatible(world) -> None:
     root, _, config, chapters, count, _seed, plan, *_ = world
-    assert DELTA_VERSION == 6 and plan.artifact["delta_version"] == 6
+    assert DELTA_VERSION == 7 and plan.artifact["delta_version"] == 7
     assert VALUE_MAX <= 100 and "SHORTEST" in SYSTEM_PROMPT
     assert "earliest paragraph id" in SYSTEM_PROMPT and "MINIFIED JSON" in SYSTEM_PROMPT
     assert "persistent acoustic/vocal quality" in SYSTEM_PROMPT

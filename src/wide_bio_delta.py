@@ -77,7 +77,7 @@ from src.wide_bio import (
 )
 from src.wide_bio_tokenizer import TokenizerRefusal
 
-DELTA_VERSION = 6
+DELTA_VERSION = 7
 QUOTE_MAX = 240
 VALUE_MAX = 100
 REF_NOVEL = "novel"
@@ -244,7 +244,7 @@ def prompt_for_wire(compact_wire: bool) -> str:
         return SYSTEM_PROMPT
     return (
         SYSTEM_PROMPT
-        + " COMPACT WIRE FORMAT: each fact uses exactly s=subject name, r=subject ref, k=category, v=literal value, p=paragraph id; do not emit subject/category/value/paragraph_id keys."
+        + " COMPACT WIRE FORMAT: each fact uses exactly s=literal subject NAME copied exactly, including case, from the source paragraph; r=subject ID/reference (the exact established [id], or novel/ambiguous); k=category, v=literal value, p=paragraph id. s and r are different fields: for established Lu use s='Lu' and r='lu'—never use the id as s. Do not emit subject/category/value/paragraph_id keys."
     )
 
 
@@ -325,8 +325,8 @@ def delta_schema(
             "additionalProperties": False,
             "required": ["s", "r", "k", "v", "p"],
             "properties": {
-                "s": {"type": "string", "minLength": 1, "maxLength": 80, "description": "subject name"},
-                "r": {"type": "string", "enum": [REF_NOVEL, REF_AMBIGUOUS, *shown_ids], "description": "subject reference"},
+                "s": {"type": "string", "minLength": 1, "maxLength": 80, "description": "literal subject NAME copied exactly, including case, from the source paragraph; never an actor id. Example for Lu: s='Lu'."},
+                "r": {"type": "string", "enum": [REF_NOVEL, REF_AMBIGUOUS, *shown_ids], "description": "subject ID/reference: exact established [id], or novel/ambiguous. Example for Lu: r='lu'."},
                 "k": {"type": "string", "enum": list(CATEGORIES), "description": "category: voice=persistent acoustic quality; personality=enduring disposition; education=schooling/examination history; power=named supernatural/cultivation/beast/innate capability; role=occupation/rank/status."},
                 "v": {"type": "string", "minLength": 1, "maxLength": VALUE_MAX, "description": "literal value"},
                 "p": {"type": "string", "enum": list(paragraph_ids), "description": "paragraph id"},
@@ -995,7 +995,7 @@ def build_delta_plan(
         # present only when configured, so every unsampled plan keeps its existing fingerprint
         artifact["sampling"] = settings.sampling
     if settings.compact_wire:
-        artifact["wire_format"] = "compact-v1"
+        artifact["wire_format"] = "compact-v2"
     if settings.provider_grammar_profile is not None:
         # The grammar is a server-side decoder contract, not a request field.
         # Its verified descriptor nevertheless changes every response surface,

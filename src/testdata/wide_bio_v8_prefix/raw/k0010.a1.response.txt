@@ -1,0 +1,165 @@
+{
+  "facts": [
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "Gray egg, gray spore emerges, luminescent mushrooms sprout from scalp",
+      "p": "000381"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair that glow yellowish",
+      "p": "000381"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "covered in mud and gray spores",
+      "p": "000381"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "A small, scrawny boy with red hair and green eyes",
+      "p": "000381"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "luminescent mushrooms in his hair",
+      "p": "000381"
+    },
+    {
+      "s": "Professor Xiao",
+      "r": "professor_xiao",
+      "k": "look",
+      "v": "middle-aged man with owl markings on his arms",
+      "p": "000381"
+    },
+    {
+      "s": "Professor Xiao",
+      "r": "professor_xiao",
+      "k": "look",
+      "v": "eyes sharpened by his beast",
+      "p": "000381"
+    },
+    {
+      "s": "Professor Xiao",
+      "r": "professor_xiao",
+      "k": "look",
+      "v": "eyes sharpened by decades of experience",
+      "p": "000388"
+    },
+    {
+      "s": "Professor Xiao",
+      "r": "professor_xiao",
+      "k": "look",
+      "v": "owls feathers ruffling with growing concern",
+      "p": "000396"
+    },
+    {
+      "s": "Professor Xiao",
+      "r": "professor_xiao",
+      "k": "look",
+      "v": "His owl manifested completely, wings extending to their full impressive span, each feather gleaming",
+      "p": "000400"
+    },
+    {
+      "s": "Professor Xiao",
+      "r": "professor_xiao",
+      "k": "look",
+      "v": "owl manifesting across his skin",
+      "p": "000406"
+    },
+    {
+      "s": "Professor Xiao",
+      "r": "professor_xiao",
+      "k": "look",
+      "v": "eyes, sharpened by his owl and decades of night hunting",
+      "p": "000411"
+    },
+    {
+      "s": "Professor Xiao",
+      "r": "professor_xiao",
+      "k": "look",
+      "v": "The famous hunter of Yano",
+      "p": "000406"
+    },
+    {
+      "s": "Professor Xiao",
+      "r": "professor_xiao",
+      "k": "power",
+      "v": "ability to track and eliminate threats from the rival kingdom",
+      "p": "000406"
+    },
+    {
+      "s": "Professor Xiao",
+      "r": "professor_xiao",
+      "k": "power",
+      "v": "The Mist Owls abilities were perfectly adapted for night combat",
+      "p": "000412"
+    },
+    {
+      "s": "Professor Xiao",
+      "r": "professor_xiao",
+      "k": "power",
+      "v": "He could fly far faster than they could and was capable of distinguishing them perfectly in the dark",
+      "p": "000412"
+    },
+    {
+      "s": "Professor Xiao",
+      "r": "professor_xiao",
+      "k": "power",
+      "v": "A single silver feather was enough to kill a shadow stalker",
+      "p": "000412"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "power",
+      "v": "Knowledge flowed while Ren studied the terrain",
+      "p": "000381"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "power",
+      "v": "The knowledge showed him where to strike",
+      "p": "000381"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "power",
+      "v": "The knowledge flowed while he evaluated his options",
+      "p": "000384"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "power",
+      "v": "Knowledge flowing naturally through his mushrooms",
+      "p": "000399"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "use your digger beetle and dig",
+      "p": "000418"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "what your beetle can go through compact earth very quickly",
+      "p": "000418"
+    }
+  ]
+}

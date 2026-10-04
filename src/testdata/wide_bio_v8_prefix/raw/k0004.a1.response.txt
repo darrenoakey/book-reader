@@ -1,0 +1,116 @@
+{
+  "facts": [
+    {
+      "s": "Jean",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tiger boy",
+      "p": "000150"
+    },
+    {
+      "s": "Gene",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tiger boy",
+      "p": "000151"
+    },
+    {
+      "s": "Gene",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tiger markings becoming more pronounced on his face",
+      "p": "000151"
+    },
+    {
+      "s": "Gene",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "spirit claws follow a pattern of five strikes before needing to recharge energy",
+      "p": "000151"
+    },
+    {
+      "s": "Gene",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "spirit tiger's 30% strength bonus",
+      "p": "000151"
+    },
+    {
+      "s": "Gene",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "Spiritual Fong",
+      "p": "000152"
+    },
+    {
+      "s": "Gene",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "spirit tiger manifested its fangs",
+      "p": "000152"
+    },
+    {
+      "s": "Gene",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tiger markings still glowing with unused power",
+      "p": "000154"
+    },
+    {
+      "s": "Min",
+      "r": "min",
+      "k": "power",
+      "v": "water snake with surprising creativity",
+      "p": "000155"
+    },
+    {
+      "s": "Kai",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "boy with green scales",
+      "p": "000155"
+    },
+    {
+      "s": "Kai",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "green scales",
+      "p": "000160"
+    },
+    {
+      "s": "Kai",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "stone lizard scales not only increased his resistance and protected him, but his beast also enhanced",
+      "p": "000158"
+    },
+    {
+      "s": "Kai",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "speed mode",
+      "p": "000163"
+    },
+    {
+      "s": "Kai",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "50% faster",
+      "p": "000161"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "her voice cold and precise",
+      "p": "000170"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "shadow wolf had gold potential",
+      "p": "000172"
+    }
+  ]
+}

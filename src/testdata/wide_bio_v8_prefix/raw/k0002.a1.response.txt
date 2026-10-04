@@ -1,0 +1,533 @@
+{
+  "facts": [
+    {
+      "s": "Luna Starwaver",
+      "r": "luna_starwaver",
+      "k": "look",
+      "v": "blue hair rippled with its own energy",
+      "p": "000111"
+    },
+    {
+      "s": "Luna Starwaver",
+      "r": "luna_starwaver",
+      "k": "look",
+      "v": "blue eyes",
+      "p": "000111"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "healthy constitution",
+      "p": "000107"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "thin",
+      "p": "000107"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "light body",
+      "p": "000107"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "10% increase in physical strength",
+      "p": "000107"
+    },
+    {
+      "s": "Lizard Boy",
+      "r": "lizard_boy",
+      "k": "look",
+      "v": "green scales",
+      "p": "000103"
+    },
+    {
+      "s": "Lizard Boy",
+      "r": "lizard_boy",
+      "k": "look",
+      "v": "green scales gleaming",
+      "p": "000103"
+    },
+    {
+      "s": "Tiger Boy",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "feline features",
+      "p": "000103"
+    },
+    {
+      "s": "Tiger Boy",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "feline features",
+      "p": "000105"
+    },
+    {
+      "s": "Tiger Boy",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "feline features",
+      "p": "000107"
+    },
+    {
+      "s": "Tiger Boy",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "fangs gleaming",
+      "p": "000110"
+    },
+    {
+      "s": "Eagle Girl",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "irregular mana pattern in the eagle's feathers",
+      "p": "000106"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "power",
+      "v": "knowledge of beasts",
+      "p": "000103"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "power",
+      "v": "understand the boy's body positioning before the attack",
+      "p": "000107"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "power",
+      "v": "agility",
+      "p": "000107"
+    },
+    {
+      "s": "Lizard Boy",
+      "r": "lizard_boy",
+      "k": "power",
+      "v": "quick movement ability",
+      "p": "000108"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "voice firmer than expected",
+      "p": "000104"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "voice trembling but was full of conviction",
+      "p": "000085"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "voice breaking",
+      "p": "000081"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "voice breaking",
+      "p": "000084"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "voice trembling",
+      "p": "000082"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured to himself",
+      "p": "000075"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured Ren",
+      "p": "000089"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured Ren",
+      "p": "000102"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000075"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000090"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000091"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000105"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000101"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000100"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000108"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000081"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000085"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000089"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000090"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000091"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000105"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000101"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000100"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000108"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000081"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000085"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000089"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000090"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000091"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000105"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000101"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000100"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000108"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000081"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000085"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000089"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000090"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000091"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000105"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000101"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000100"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000108"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000081"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000085"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000089"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000090"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000091"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000105"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000101"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000100"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000108"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000081"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000085"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000089"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000090"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000091"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000105"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000101"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000100

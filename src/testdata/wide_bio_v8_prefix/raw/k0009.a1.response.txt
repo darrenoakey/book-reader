@@ -1,0 +1,498 @@
+{
+  "facts": [
+    {
+      "s": "Xiao",
+      "r": "professor_xiao",
+      "k": "look",
+      "v": "owl markings on his arms",
+      "p": "000342"
+    },
+    {
+      "s": "Xiao",
+      "r": "professor_xiao",
+      "k": "look",
+      "v": "middle-aged man",
+      "p": "000342"
+    },
+    {
+      "s": "Xiao",
+      "r": "professor_xiao",
+      "k": "look",
+      "v": "owls wings",
+      "p": "000342"
+    },
+    {
+      "s": "Jean",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tiger markings",
+      "p": "000342"
+    },
+    {
+      "s": "Jean",
+      "r": "ambiguous",
+      "k": "personality",
+      "v": "smiled maliciously",
+      "p": "000342"
+    },
+    {
+      "s": "Jean",
+      "r": "ambiguous",
+      "k": "personality",
+      "v": "smiled, cracking his knuckles menacingly",
+      "p": "000344"
+    },
+    {
+      "s": "Jean",
+      "r": "ambiguous",
+      "k": "personality",
+      "v": "characteristic confidence",
+      "p": "000344"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "shadow wolf barely visible as a silhouette",
+      "p": "000345"
+    },
+    {
+      "s": "Cass",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "eagle feathers manifesting slightly",
+      "p": "000344"
+    },
+    {
+      "s": "Kai",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tiger markings glowing with authority",
+      "p": "000344"
+    },
+    {
+      "s": "Klene",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "golden lion gleaming",
+      "p": "000345"
+    },
+    {
+      "s": "Fo",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "red cobra manifesting in scarlet patterns",
+      "p": "000347"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair",
+      "p": "000342"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed with quiet amusement",
+      "p": "000342"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed with satisfaction",
+      "p": "000343"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed while analyzing the problem",
+      "p": "000344"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed softly",
+      "p": "000345"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed",
+      "p": "000346"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed knowingly",
+      "p": "000347"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed with increased intensity",
+      "p": "000352"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed stronger when the idea formed",
+      "p": "000360"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed frantically",
+      "p": "000358"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed frantically as he ran",
+      "p": "000378"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "look",
+      "v": "beetle manifesting protectively",
+      "p": "000343"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "look",
+      "v": "beetle manifesting darker markings",
+      "p": "000344"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "look",
+      "v": "beetle's markings shifting protectively",
+      "p": "000351"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "look",
+      "v": "beetle's markings darkening",
+      "p": "000352"
+    },
+    {
+      "s": "Min",
+      "r": "min",
+      "k": "look",
+      "v": "water snake coiling nervously",
+      "p": "000344"
+    },
+    {
+      "s": "Min",
+      "r": "min",
+      "k": "look",
+      "v": "water snake mirroring his interest",
+      "p": "000351"
+    },
+    {
+      "s": "Min",
+      "r": "min",
+      "k": "look",
+      "v": "snake coiling anxiously",
+      "p": "000352"
+    },
+    {
+      "s": "Gene",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tiger markings flickered erratically",
+      "p": "000356"
+    },
+    {
+      "s": "Kai",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tiger markings glowing with authority",
+      "p": "000344"
+    },
+    {
+      "s": "Cass",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "eagle feathers manifesting slightly",
+      "p": "000344"
+    },
+    {
+      "s": "Klene",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "golden lion gleaming",
+      "p": "000345"
+    },
+    {
+      "s": "Fo",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "red cobra manifesting in scarlet patterns",
+      "p": "000347"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "shadow wolf barely visible as a silhouette",
+      "p": "000345"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed with quiet amusement",
+      "p": "000342"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed with satisfaction",
+      "p": "000343"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed while analyzing the problem",
+      "p": "000344"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed softly",
+      "p": "000345"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed",
+      "p": "000346"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed knowingly",
+      "p": "000347"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed with increased intensity",
+      "p": "000352"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed stronger when the idea formed",
+      "p": "000360"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed frantically",
+      "p": "000358"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed frantically as he ran",
+      "p": "000378"
+    },
+    {
+      "s": "Jean",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tiger markings",
+      "p": "000342"
+    },
+    {
+      "s": "Jean",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tiger markings flickered erratically",
+      "p": "000356"
+    },
+    {
+      "s": "Kai",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tiger markings glowing with authority",
+      "p": "000344"
+    },
+    {
+      "s": "Gene",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tiger markings flickered erratically",
+      "p": "000356"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "shadow wolf barely visible as a silhouette",
+      "p": "000345"
+    },
+    {
+      "s": "Fo",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "red cobra manifesting in scarlet patterns",
+      "p": "000347"
+    },
+    {
+      "s": "Klene",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "golden lion gleaming",
+      "p": "000345"
+    },
+    {
+      "s": "Cass",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "eagle feathers manifesting slightly",
+      "p": "000344"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "look",
+      "v": "beetle manifesting protectively",
+      "p": "000343"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "look",
+      "v": "beetle manifesting darker markings",
+      "p": "000344"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "look",
+      "v": "beetle's markings shifting protectively",
+      "p": "000351"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "look",
+      "v": "beetle's markings darkening",
+      "p": "000352"
+    },
+    {
+      "s": "Min",
+      "r": "min",
+      "k": "look",
+      "v": "water snake coiling nervously",
+      "p": "000344"
+    },
+    {
+      "s": "Min",
+      "r": "min",
+      "k": "look",
+      "v": "water snake mirroring his interest",
+      "p": "000351"
+    },
+    {
+      "s": "Min",
+      "r": "min",
+      "k": "look",
+      "v": "snake coiling anxiously",
+      "p": "000352"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair",
+      "p": "000342"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed with quiet amusement",
+      "p": "000342"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed with satisfaction",
+      "p": "000343"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed while analyzing the problem",
+      "p": "000344"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed softly",
+      "p": "000345"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed",
+      "p": "000346"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed knowingly",
+      "p": "000347"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed with increased intensity",
+      "p": "000352"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed stronger when the idea formed",
+      "p": "000360"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms pulsed frantically",
+      "p": "

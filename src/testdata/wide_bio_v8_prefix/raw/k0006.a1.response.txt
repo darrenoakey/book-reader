@@ -1,0 +1,88 @@
+{
+  "facts": [
+    {
+      "s": "Lu",
+      "r": "lu",
+      "k": "voice",
+      "v": "murmured",
+      "p": "000225"
+    },
+    {
+      "s": "Lu",
+      "r": "lu",
+      "k": "voice",
+      "v": "alarmed",
+      "p": "000227"
+    },
+    {
+      "s": "Lu",
+      "r": "lu",
+      "k": "voice",
+      "v": "panic evident in his voice",
+      "p": "000235"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "higher pitched than intended",
+      "p": "000241"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "voice barely a whisper",
+      "p": "000241"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "softly",
+      "p": "000243"
+    },
+    {
+      "s": "Professor Yang",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "voice resonated across the training field, echoing off the stone walls with commanding authority",
+      "p": "000244"
+    },
+    {
+      "s": "Professor Yang",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "voice carrying clear across the field",
+      "p": "000245"
+    },
+    {
+      "s": "Professor Yang",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "voice turned serious, resonating with experience",
+      "p": "000247"
+    },
+    {
+      "s": "Professor Yang",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "voice cut through the murmurss",
+      "p": "000248"
+    },
+    {
+      "s": "Professor May",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "voice resonated",
+      "p": "000249"
+    },
+    {
+      "s": "Professor Song",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "voice bounced off the stone walls",
+      "p": "000256"
+    }
+  ]
+}

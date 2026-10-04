@@ -1,0 +1,53 @@
+{
+  "facts": [
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "Gray egg, gray spore emerges, luminescent mushrooms sprout from scalp",
+      "p": "000038"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair that glow yellowish",
+      "p": "000038"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "covered in mud and gray spores",
+      "p": "000038"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "tired",
+      "p": "000038"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "A small, scrawny boy with red hair and green eyes",
+      "p": "000038"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "luminescent mushrooms in his hair",
+      "p": "000038"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "age",
+      "v": "10 years of life",
+      "p": "000038"
+    }
+  ]
+}

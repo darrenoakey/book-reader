@@ -222,6 +222,14 @@ IMPACT: dict[str, tuple[str, ...]] = {
 }
 
 
+# The captured real production prefix the recovery tests replay; every file of it selects exactly those tests.
+for _fixture in sorted((ROOT / "src/testdata/wide_bio_v8_prefix").rglob("*")):
+    if _fixture.is_file():
+        _name = _fixture.relative_to(ROOT).as_posix()
+        MOVIE_PATHS.add(_name)
+        IMPACT[_name] = ("src/wide_bio_recovery_test.py",)
+
+
 # ##################################################################
 # select tests
 # Union the tests that execute each changed path. Unknown code fails closed

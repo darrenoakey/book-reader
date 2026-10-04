@@ -13,6 +13,7 @@ Old records are never moved into the new-profile journal and the base directory 
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import sys
@@ -106,6 +107,19 @@ class Context:
     new_plan: DeltaPlan
 
 
+# Building a plan tokenises the whole 9 MB source (~10 s) and the cast index reads every chapter; both are immutable products of their inputs, so one process builds each at most once.
+@functools.lru_cache(maxsize=8)
+def cached_plan(source_sha: str, config_path: str, chapters: tuple[str, ...], settings: DeltaSettings, overhead: int, seed_sha: str, source_path: str) -> DeltaPlan:
+    config = load_proof_config(Path(config_path))
+    return build_delta_plan(read_source(Path(source_path)), [Path(c) for c in chapters], config, build_counter(config), settings, overhead, seed_sha)
+
+
+@functools.lru_cache(maxsize=4)
+def cached_cast_index(chapters: tuple[str, ...], seed_json: str):
+    seed = json.loads(seed_json)
+    return build_cast_index([Path(c) for c in chapters], seed.get("registry", {}), seed.get("aliases", {}), None)
+
+
 def settings_from_stored(stored: dict, profile: str | None, penalty: float | None) -> DeltaSettings:
     sampling = stored.get("sampling") or {}
     return DeltaSettings(
@@ -152,10 +166,11 @@ def load_context(
     count = build_counter(config)
     overhead = stored["fixed_overhead_tokens"]
     seed_sha = sha_json(seed)
-    old = build_delta_plan(source, chapters, config, count, settings_from_stored(stored, OLD_PROFILE, None), overhead, seed_sha)
+    keys = (expect_source_sha256, str(config_path), tuple(str(c) for c in chapters))
+    old = cached_plan(*keys, settings_from_stored(stored, OLD_PROFILE, None), overhead, seed_sha, str(source_path))
     if old.artifact != stored:
         refuse("the rebuilt old plan is not identical to the base plan.json", "base_plan_mismatch")
-    new = build_delta_plan(source, chapters, config, count, settings_from_stored(stored, NEW_PROFILE, PRESENCE_PENALTY), overhead, seed_sha)
+    new = cached_plan(*keys, settings_from_stored(stored, NEW_PROFILE, PRESENCE_PENALTY), overhead, seed_sha, str(source_path))
     differing = {key for key in old.artifact if old.artifact[key] != new.artifact.get(key)} | (set(new.artifact) - set(old.artifact))
     if differing != {"provider_grammar_profile", "presence_penalty", "plan_sha256"}:
         refuse(f"new plan differs from the old plan in more than the profile and penalty: {sorted(differing)}", "new_plan_drift")
@@ -225,7 +240,7 @@ def write_snapshot(files: dict[str, bytes], dest: Path) -> None:
 # offline revalidation of the old run
 # the existing DeltaRun replays the sealed copy under the ORIGINAL plan, profile and prefix state: every saved raw response is re-judged against rebuilt state and must reproduce its journal record.  Only the sealed copy is ever replayed, so the base is never opened for writing.
 def replay_old(ctx: Context, snapshot: Path) -> DeltaRun:
-    cast = build_cast_index(list(ctx.chapters), ctx.seed.get("registry", {}), ctx.seed.get("aliases", {}), None)
+    cast = cached_cast_index(tuple(str(c) for c in ctx.chapters), canonical_json(ctx.seed))
     run = DeltaRun(list(ctx.chapters), ctx.config, ctx.old_plan, snapshot, ctx.count, cast, ctx.seed.get("registry"), ctx.seed.get("aliases"))
     run.replay()
     return run
@@ -243,6 +258,11 @@ def disposition(run: DeltaRun, chunk: DeltaChunk) -> str:
 def attempt_evidence(record: dict) -> dict:
     keys = ("attempt", "status", "called", "request_sha256", "response_sha256", "meta_sha256", "result_sha256", "record_sha256", "server")
     return {key: record.get(key) for key in keys}
+
+
+def journal_hash(run: DeltaRun, chunk_id: str, attempt: int) -> str:
+    """The hash-chain record hash of that attempt in the replayed journal (replayed attempts do not carry it themselves)."""
+    return next(item["record_sha256"] for item in run.journal.records if item["chunk_id"] == chunk_id and item["attempt"] == attempt)
 
 
 def span_sha256(ctx: Context, chunk: DeltaChunk) -> str:
@@ -271,7 +291,7 @@ def chunk_entry(ctx: Context, run: DeltaRun, chunk: DeltaChunk) -> dict:
         "paragraph_span": [chunk.paragraphs[0].id, chunk.paragraphs[-1].id],
         "base_user_sha256": next(item["base_user_sha256"] for item in ctx.old_plan.artifact["chunks"] if item["id"] == chunk.id),
         "disposition": disposition(run, chunk),
-        "old_attempts": [attempt_evidence(record) for record in run.attempts[chunk.id]],
+        "old_attempts": [attempt_evidence(record) | {"record_sha256": journal_hash(run, chunk.id, record["attempt"])} for record in run.attempts[chunk.id]],
     }
     if chunk.id in run.ready:
         entry["old_validation"] = validation_evidence(run.ready[chunk.id])
@@ -456,7 +476,7 @@ def fetch_models(config: ProofConfig, timeout: float = 30.0) -> dict:
 # DeltaRun under the NEW plan whose journal holds only new-profile attempts.  Old validated-ready claims are fed into the state in chunk order (never into the journal and never re-asked); only targets are wanted.
 class RecoveryRun(DeltaRun):
     def __init__(self, ctx: Context, out_dir: Path, old: DeltaRun) -> None:
-        cast = build_cast_index(list(ctx.chapters), ctx.seed.get("registry", {}), ctx.seed.get("aliases", {}), None)
+        cast = cached_cast_index(tuple(str(c) for c in ctx.chapters), canonical_json(ctx.seed))
         super().__init__(list(ctx.chapters), ctx.config, ctx.new_plan, out_dir, ctx.count, cast, ctx.seed.get("registry"), ctx.seed.get("aliases"))
         self.old_ready = dict(old.ready)
         self.targets = frozenset(
@@ -566,8 +586,8 @@ def recover(
                     break
         finally:
             write_atomic(out / "recovery_state.json", json.dumps(recovery_state(ctx, run, stop), indent=1, sort_keys=True))
-        if stop == "fallback_route":
-            refuse("server answered with a model other than the configured primary", "fallback_route")
+        if stop not in (None, "offline", "deadline", "transport_error"):
+            refuse(f"the run stopped on {stop}: the server answered with a model other than the configured primary", "route_mismatch")
     return recovery_state(ctx, run, stop)
 
 

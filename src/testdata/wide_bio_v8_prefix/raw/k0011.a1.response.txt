@@ -1,0 +1,470 @@
+{
+  "facts": [
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "look",
+      "v": "More robust boy with a digger beetle beast.",
+      "p": "000420"
+    },
+    {
+      "s": "Min",
+      "r": "min",
+      "k": "look",
+      "v": "Thin boy with a water snake beast.",
+      "p": "000420"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "maintained her neutral expression",
+      "p": "000420"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "maintained her impassive expression",
+      "p": "000440"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "voice cold as always",
+      "p": "000452"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "satisfaction evident in her usually cold voice",
+      "p": "000451"
+    },
+    {
+      "s": "Xiao",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "silver feathers gleaming faintly",
+      "p": "000424"
+    },
+    {
+      "s": "Xiao",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "silent flight technique",
+      "p": "000455"
+    },
+    {
+      "s": "Xiao",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "three silver rank powers",
+      "p": "000455"
+    },
+    {
+      "s": "Xiao",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "mist owl responded immediately, its presence vanishing like morning fog",
+      "p": "000432"
+    },
+    {
+      "s": "Xiao",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "mist owl allowed him to move like a spectre between shadows",
+      "p": "000433"
+    },
+    {
+      "s": "Ziao",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "Ziao's feathers shot through the improvised ceiling, finding several unprepared attackers",
+      "p": "000424"
+    },
+    {
+      "s": "Ziao",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "silver feathers danced between his fingers, each one humming with power",
+      "p": "000427"
+    },
+    {
+      "s": "Ziao",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "Ziao's feathers danced between his fingers with deadly grace",
+      "p": "000429"
+    },
+    {
+      "s": "Ziao",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "silver feathers became streaks of light as they sought vital points",
+      "p": "000429"
+    },
+    {
+      "s": "Ziao",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "Ziao's feathers shot through the improvised ceiling, finding several unprepared attackers",
+      "p": "000424"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair glowed with forced intensity",
+      "p": "000422"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair shone with an intense white glow",
+      "p": "000436"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "power",
+      "v": "Knowledge flowing naturally through his mushrooms",
+      "p": "000455"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "power",
+      "v": "manipulate the frequency in the immediate area around the students",
+      "p": "000425"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "power",
+      "v": "combined the natural reflection of mirror mantis plates with the dead Medusa's body using his Mush's"
+    ,
+      "p": "000432"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair barely pulsed",
+      "p": "000454"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair pulsed softly",
+      "p": "000454"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "power",
+      "v": "Knowledge flowing naturally through his golden mushrooms",
+      "p": "000455"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "use your digger beetle and dig",
+      "p": "000420"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "His manifested beetle vibrated, detecting movements above with uncanny precision",
+      "p": "000424"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the skinless shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "manipulate the shadow stalker body above them",
+      "p": "000436"
+    },
+    {
+      "s": "Taro",
+      "r": "taro",
+      "k": "power",
+      "v": "man

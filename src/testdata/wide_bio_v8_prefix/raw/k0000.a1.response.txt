@@ -1,0 +1,490 @@
+{
+  "facts": [
+    {
+      "s": "ceremony master",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "robust frame",
+      "p": "000001"
+    },
+    {
+      "s": "ceremony master",
+      "r": "ambiguous",
+      "k": "role",
+      "v": "ceremony master",
+      "p": "000001"
+    },
+    {
+      "s": "Ron Blackfire",
+      "r": "ron_blackfire",
+      "k": "look",
+      "v": "crimson scales erupt on arms",
+      "p": "000009"
+    },
+    {
+      "s": "Ron Blackfire",
+      "r": "ron_blackfire",
+      "k": "look",
+      "v": "nails harden into reddish claws",
+      "p": "000009"
+    },
+    {
+      "s": "Ron Blackfire",
+      "r": "ron_blackfire",
+      "k": "look",
+      "v": "canines lengthen into sharp fangs",
+      "p": "000009"
+    },
+    {
+      "s": "Ron Blackfire",
+      "r": "ron_blackfire",
+      "k": "look",
+      "v": "golden gleam appeared in his pupils",
+      "p": "000009"
+    },
+    {
+      "s": "Luna Starwaver",
+      "r": "luna_starwaver",
+      "k": "look",
+      "v": "eyes acquired a supernatural gleam",
+      "p": "000014"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "luminescent mushrooms began to sprout from his scalp",
+      "p": "000012"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "small, scrawny boy",
+      "p": "000003"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "red hair and green eyes",
+      "p": "000003"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "age",
+      "v": "10th birthday",
+      "p": "000001"
+    },
+    {
+      "s": "Luna Starwaver",
+      "r": "luna_starwaver",
+      "k": "age",
+      "v": "10th birthday",
+      "p": "000001"
+    },
+    {
+      "s": "Ron Blackfire",
+      "r": "ron_blackfire",
+      "k": "age",
+      "v": "10th birthday",
+      "p": "000001"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "age",
+      "v": "10-year-old",
+      "p": "000026"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "age",
+      "v": "60 years old",
+      "p": "000020"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "hair composed of leaves and vines",
+      "p": "000020"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "hands, weathered by decades working in kitchens",
+      "p": "000020"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "look and feel younger like a couple in their 40s",
+      "p": "000021"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "modest control over plants",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "detect dangers and defend against some monsters",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "40% extra vitality",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "adult strength and speed increased by 20% along with all his other attributes",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "mature iron rank plant",
+      "p": "000028"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "power",
+      "v": "10% increase in physical strength",
+      "p": "000009"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "role",
+      "v": "patenter's son",
+      "p": "000007"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "role",
+      "v": "tamer",
+      "p": "000008"
+    },
+    {
+      "s": "Ron Blackfire",
+      "r": "ron_blackfire",
+      "k": "power",
+      "v": "control over fire",
+      "p": "000009"
+    },
+    {
+      "s": "Ron Blackfire",
+      "r": "ron_blackfire",
+      "k": "power",
+      "v": "40% increase to his strength",
+      "p": "000009"
+    },
+    {
+      "s": "Ron Blackfire",
+      "r": "ron_blackfire",
+      "k": "power",
+      "v": "20% increase to his endurance, speed, and reflexes",
+      "p": "000009"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "role",
+      "v": "mature iron rank plants",
+      "p": "000016"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "role",
+      "v": "worked in the city's most modest kitchens",
+      "p": "000016"
+    },
+    {
+      "s": "Ren's mother",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "moved through the kitchen with the grace of years of experience",
+      "p": "000016"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "steps heavy from a long day's exhaustion in the kitchens",
+      "p": "000017"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "voice horse",
+      "p": "000018"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "exhausted faces",
+      "p": "000020"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "mature iron rank plants barely glowed at their wrists",
+      "p": "000020"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "role",
+      "v": "mature plants",
+      "p": "000021"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "40% increase in vitality",
+      "p": "000021"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "20% to all attributes",
+      "p": "000021"
+    },
+    {
+      "s": "Ren's mother",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "hand, rough from years of work",
+      "p": "000035"
+    },
+    {
+      "s": "Ren's mother",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "soft voice",
+      "p": "000035"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "mature iron rank plant",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "great 40% extra vitality",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "adult strength and speed increased by 20% along with all his other attributes",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "modest control over plants",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "detect dangers and defend against some monsters",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "role",
+      "v": "mature iron rank plant",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "mature iron rank plant",
+      "p": "000016"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "mature iron rank plants",
+      "p": "000016"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "hair composed of leaves and vines",
+      "p": "000020"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "hands, weathered by decades working in kitchens",
+      "p": "000020"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "look and feel younger like a couple in their 40s",
+      "p": "000021"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "40% increase in vitality",
+      "p": "000021"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "20% to all attributes",
+      "p": "000021"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "role",
+      "v": "mature plants",
+      "p": "000021"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "role",
+      "v": "mature iron rank plants",
+      "p": "000016"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "voice horse",
+      "p": "000018"
+    },
+    {
+      "s": "Ren's mother",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "moved through the kitchen with the grace of years of experience",
+      "p": "000016"
+    },
+    {
+      "s": "Ren's mother",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "hand, rough from years of work",
+      "p": "000035"
+    },
+    {
+      "s": "Ren's mother",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "soft voice",
+      "p": "000035"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "steps heavy from a long day's exhaustion in the kitchens",
+      "p": "000017"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "mature iron rank plant",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "great 40% extra vitality",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "adult strength and speed increased by 20% along with all his other attributes",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "modest control over plants",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "power",
+      "v": "detect dangers and defend against some monsters",
+      "p": "000028"
+    },
+    {
+      "s": "Ren's father",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "mature iron rank plant",
+      "p": "000016"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "mature iron rank plants",
+      "p": "000016"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "hair composed of leaves and vines",
+      "p": "000020"
+    },
+    {
+      "s": "Ren's parents",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "hands

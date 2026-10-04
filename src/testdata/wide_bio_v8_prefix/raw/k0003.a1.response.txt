@@ -1,0 +1,81 @@
+{
+  "facts": [
+    {
+      "s": "Luna",
+      "r": "luna_starwaver",
+      "k": "voice",
+      "v": "Her voice was cold, practical.",
+      "p": "000112"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "mushrooms in his hair that glow yellowish",
+      "p": "000112"
+    },
+    {
+      "s": "Ren",
+      "r": "ren",
+      "k": "look",
+      "v": "luminescent mushrooms in his hair",
+      "p": "000113"
+    },
+    {
+      "s": "Professor",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tall, thin man with a fused gold beast, a royal phoenix whose golden feathers intertwined with his w"
+    ,"p": "000115"
+    },
+    {
+      "s": "Lu",
+      "r": "lu",
+      "k": "look",
+      "v": "tall and quiet with a nightbat",
+      "p": "000118"
+    },
+    {
+      "s": "Lu",
+      "r": "lu",
+      "k": "education",
+      "v": "I failed two units.",
+      "p": "000119"
+    },
+    {
+      "s": "Lu",
+      "r": "lu",
+      "k": "voice",
+      "v": "Lou gave a dry laugh.",
+      "p": "000122"
+    },
+    {
+      "s": "Lu",
+      "r": "lu",
+      "k": "voice",
+      "v": "Loued his voice",
+      "p": "000123"
+    },
+    {
+      "s": "Professor",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "robust man with a silver rank two manticor manifesting in silver patterns across his skin.",
+      "p": "000130"
+    },
+    {
+      "s": "Professor",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "Weey began drawing a diagram on the board.",
+      "p": "000131"
+    },
+    {
+      "s": "Professor",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "tall, muscular man with scars that spoke of years of real experience.",
+      "p": "000145"
+    }
+  ]
+}

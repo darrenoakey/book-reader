@@ -1,0 +1,88 @@
+{
+  "facts": [
+    {
+      "s": "Lu",
+      "r": "lu",
+      "k": "voice",
+      "v": "Speaking quietly",
+      "p": "000187"
+    },
+    {
+      "s": "Professor Lynn",
+      "r": "professor_lynn",
+      "k": "look",
+      "v": "so attractive",
+      "p": "000187"
+    },
+    {
+      "s": "Professor Lynn",
+      "r": "professor_lynn",
+      "k": "voice",
+      "v": "Speaking quietly",
+      "p": "000187"
+    },
+    {
+      "s": "Lu",
+      "r": "lu",
+      "k": "voice",
+      "v": "Speaking quietly",
+      "p": "000190"
+    },
+    {
+      "s": "Lu",
+      "r": "lu",
+      "k": "voice",
+      "v": "Speaking quietly",
+      "p": "000192"
+    },
+    {
+      "s": "Professor Wei",
+      "r": "professor_lynn",
+      "k": "voice",
+      "v": "His voice dripped with amusement",
+      "p": "000195"
+    },
+    {
+      "s": "Professor May",
+      "r": "professor_may",
+      "k": "voice",
+      "v": "Speaking quietly",
+      "p": "000202"
+    },
+    {
+      "s": "Professor Song",
+      "r": "professor_song",
+      "k": "voice",
+      "v": "Speaking quietly",
+      "p": "000203"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "look",
+      "v": "shadow wolf making the darkest veins glow with a spectral radiance",
+      "p": "000206"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "sharp response",
+      "p": "000207"
+    },
+    {
+      "s": "Luna",
+      "r": "ambiguous",
+      "k": "voice",
+      "v": "cold voice",
+      "p": "000207"
+    },
+    {
+      "s": "Professor Yang",
+      "r": "professor_song",
+      "k": "voice",
+      "v": "Speaking quietly",
+      "p": "000200"
+    }
+  ]
+}

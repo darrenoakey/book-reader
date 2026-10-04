@@ -1,31 +1,18 @@
-"""Real-file tests for the mixed-profile recovery module.
+"""Tests for the mixed-profile recovery module on ACTUAL captured production artifacts.
 
-No model, network or transport is involved: base and recovery evidence is written as real raw response/meta files and ingested through the existing DeltaRun content-addressed replay path (the same path a salvaged saved response takes), so the seal, plan, union verifier and request contract are exercised end to end."""
+The success evidence is the real v8 production base: a hash-chained 12-record prefix of the actual 151-record sealed journal (src/testdata/wide_bio_v8_prefix: real plan.json, seed.json, journal and the real raw response/meta files the provider returned), the real 9 MB source, project chapters, proof config and tokenizer capture from the canonical checkout (read-only).  No provider output, token usage or salvage flag is invented.  Penalty-profile success evidence does not exist until the caretaker's pilot, so no recovery-ready state is fabricated: recovery coverage here is the real not_ready union.  Destructive tests clone the real bytes into namespaced temp directories and tamper with the clones; canonical inputs are never written."""
 
 import hashlib
 import json
 import shutil
-import time
+import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from src.wide_bio import (
-    ContractError,
-    build_counter,
-    canonical_json,
-    load_proof_config,
-    project_chapters,
-    sha256_text,
-    write_atomic,
-)
-from src.wide_bio_delta import (
-    DeltaRun,
-    DeltaSettings,
-    Established,
-    build_delta_plan,
-    prepare,
-)
+from src.wide_bio import ContractError, chat_transport, sha256_text
+from src.wide_bio_delta import DeltaSettings, Established, prepare
 from src.wide_bio_recovery import (
     MISSING,
     NEW_PROFILE,
@@ -47,251 +34,202 @@ from src.wide_bio_recovery import (
     verify_seal,
     verify_union,
 )
-from src.wide_bio_test import capture_file, make_config
 
-TEXT = (
-    "Ren was tall, with green eyes.\n\n"
-    "Later Ren wore a red cloak and was twelve years old.\n\n"
-    "Luna Starwaver, the Master, smiled.\n\n"
-)
-REGISTRY = {"ren": {"name": "Ren", "bio": "b", "look": "l", "facts": {"voice": ["calm"], "look": []}}}
-ALIASES = {"ren": "ren"}
-MODEL = "proof-model:1"
-SOURCE_SHA = hashlib.sha256(TEXT.encode()).hexdigest()
-
-
-def fact(name, ref, category, value, pid):
-    return {"subject": {"name": name, "ref": ref}, "category": category, "value": value, "paragraph_id": pid}
-
-
-READY0 = {"facts": [fact("Ren", "ren", "look", "tall, with green eyes", "000000")]}
-READY1 = {"facts": [fact("Ren", "ren", "look", "a red cloak", "000001"), fact("Ren", "ren", "age", "twelve years old", "000001")]}
-READY2 = {"facts": [fact("Luna Starwaver", "novel", "role", "the Master", "000002")]}
+HERE = Path(__file__).resolve().parent
+FIXTURE = HERE / "testdata" / "wide_bio_v8_prefix"
+COMMON = Path(
+    subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=HERE, capture_output=True, text=True, check=True).stdout.strip()
+).resolve().parent
+SOURCE = COMMON / "incoming" / "weakest_beast_tamer.txt"
+PROJECT = COMMON / "output" / "weakest_beast_tamer"
+CONFIG = COMMON / "local" / "wide-bio-proof.toml"
+CALIBRATION = COMMON / "local" / "wide-bio-proof" / "calibration-tf256k-valid.json"
+SOURCE_SHA = "dc4d515d6ecd37d8c43b23618c0285b4a0dbfa296d861337a7cd70ce52b8070a"
+BASE_PLAN_SHA = "1447a509670c89eaf95de96abbe0505c63973a7fdbf1a5565a19594d16b717b9"
+NEW_PLAN_SHA = "e1f218d26304d1bbff019cee26f2544b9aa61755d3deb3d93a510e8a867fe293"
+MODEL = "qwen3.6:35b-a3b"
+JOURNAL = [json.loads(line) for line in (FIXTURE / "journal.jsonl").read_text().splitlines()]
 
 
-class World:
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        _path, digest = capture_file(root)
-        self.config_path = make_config(root, digest, llm={"primary_style": "openai"})
-        self.project = root / "project"
-        (self.project / "chapters").mkdir(parents=True)
-        (self.project / "chapters" / "01-one.txt").write_text(TEXT, encoding="utf-8")
-        self.source = root / "source.txt"
-        self.source.write_text(TEXT, encoding="utf-8")
-        self.base = root / "base"
-        self.work = root / "work"
-        self.config = load_proof_config(self.config_path)
-        self.chapters = project_chapters(self.project)
-        self.count = build_counter(self.config)
-        self.seed = {"registry": REGISTRY, "aliases": ALIASES}
-        settings = DeltaSettings(1, 512, 1, 0.7, 1729, OLD_PROFILE)
-        self.old_plan = build_delta_plan(TEXT, self.chapters, self.config, self.count, settings, 0, sha_json(self.seed))
-        self.base_plan_sha = self.old_plan.artifact["plan_sha256"]
+def clone_base(dest: Path) -> Path:
+    shutil.copytree(FIXTURE, dest)
+    return dest
 
-    def run(self, plan, out, state_claims=()):
-        from src.cast_index import build_cast_index
 
-        cast = build_cast_index(list(self.chapters), REGISTRY, ALIASES, None)
-        run = DeltaRun(list(self.chapters), self.config, plan, out, self.count, cast, REGISTRY, ALIASES)
-        return run
+@pytest.fixture(scope="module")
+def ctx():
+    return load_context(PROJECT, SOURCE, CONFIG, (FIXTURE / "plan.json").read_bytes(), (FIXTURE / "seed.json").read_bytes(), SOURCE_SHA, BASE_PLAN_SHA)
 
-    def meta(self, prepared, raw, done="stop", eval_count=3):
-        return json.dumps(
-            {"model": MODEL, "done_reason": done, "prompt_eval_count": 7, "eval_count": eval_count, "request_sha256": prepared.request_sha256, "response_sha256": sha256_text(raw)},
-            sort_keys=True,
-        )
 
-    def write_base(self, kinds: dict[str, str]) -> None:
-        """kinds: chunk id -> 'ready' | 'truncated' (anything absent stays missing); journaled in order through the real DeltaRun."""
-        self.base.mkdir(parents=True, exist_ok=True)
-        write_atomic(self.base / "plan.json", json.dumps(self.old_plan.artifact, indent=2, sort_keys=True))
-        write_atomic(self.base / "seed.json", canonical_json(self.seed))
-        run = self.run(self.old_plan, self.base)
-        run.replay()
-        for chunk in self.old_plan.chunks:
-            kind = kinds.get(chunk.id)
-            if kind is None:
-                continue
-            prepared = run.prep(chunk, 1)
-            raw = '{"facts": [{"subject"' if kind == "truncated" else json.dumps({"k0000": READY0, "k0001": READY1, "k0002": READY2}[chunk.id])
-            r, m = run.raw_paths(chunk.id, 1)
-            write_atomic(r, raw)
-            write_atomic(m, self.meta(prepared, raw, "length" if kind == "truncated" else "stop", self.config.output_tokens if kind == "truncated" else 3))
-            assert run.process(chunk, None, time.monotonic, time.monotonic(), 175, 240) is None
+@pytest.fixture(scope="module")
+def sealed(tmp_path_factory, ctx):
+    root = tmp_path_factory.mktemp("recovery-real")
+    base = clone_base(root / "base")
+    manifest = seal(ctx, base, root / "work")
+    assert {p.relative_to(base): p.read_bytes() for p in base.rglob("*") if p.is_file()} == {p.relative_to(FIXTURE): p.read_bytes() for p in FIXTURE.rglob("*") if p.is_file()}
+    return manifest, root / "work"
 
-    def ctx(self):
-        return load_context(self.project, self.source, self.config_path, (self.base / "plan.json").read_bytes(), (self.base / "seed.json").read_bytes(), SOURCE_SHA, self.base_plan_sha)
 
-    def ctx_from_seal(self):
-        snap = self.work / "seal" / "snapshot"
-        return load_context(self.project, self.source, self.config_path, (snap / "plan.json").read_bytes(), (snap / "seed.json").read_bytes(), SOURCE_SHA, self.base_plan_sha)
-
-    def write_recovery(self, ctx, chunk_ids: list[str]) -> None:
-        """Real new-profile raw evidence for the chosen targets, journaled by RecoveryRun's own replay path."""
-        manifest, old = verify_seal(ctx, self.work)
-        out = recovery_dir(self.work)
-        run = RecoveryRun(ctx, out, old)
-        from src.wide_bio_recovery import bind_recovery
-
-        bind_recovery(self.work, ctx, build_recovery_plan(ctx, manifest, old))
-        run.replay()
-        for chunk in ctx.new_plan.chunks:
-            if chunk.id not in chunk_ids:
-                continue
-            prepared = run.prep(chunk, 1)
-            check_request_contract(ctx, prepared.payload)
-            raw = json.dumps({"k0001": READY1, "k0002": READY2, "k0000": READY0}[chunk.id])
-            r, m = run.raw_paths(chunk.id, 1)
-            write_atomic(r, raw)
-            write_atomic(m, self.meta(prepared, raw))
-            assert run.process(chunk, None, time.monotonic, time.monotonic(), 175, 240) is None
+@pytest.fixture(scope="module")
+def verified(sealed, ctx):
+    return verify_seal(ctx, sealed[1])
 
 
 @pytest.fixture
-def world(tmp_path: Path) -> World:
-    return World(tmp_path)
-
-
-def sealed(world: World, kinds=None):
-    world.write_base(kinds or {"k0000": "ready", "k0001": "truncated"})
-    return seal(world.ctx(), world.base, world.work)
+def work(sealed, tmp_path):
+    """A namespaced clone of the real sealed work directory, safe to tamper with."""
+    dest = tmp_path / "work"
+    shutil.copytree(sealed[1], dest)
+    return dest
 
 
 def test_profile_regex_accepts_exact_provider_descriptor_and_old_descriptors() -> None:
     for name in (OLD_PROFILE, NEW_PROFILE, "upstream-json-blanks32+presence-penalty-v1"):
         assert DeltaSettings(1, 1, 1, 0.7, 1, name, True, PRESENCE_PENALTY if "+" in name else None).provider_grammar_profile == name
-    for bad in ("+bad-profile", "Upper+case", "a+", "ab"):
+    for bad in ("+bad-profile", "Upper+case", "ab", "a b+c"):
         with pytest.raises(ContractError):
             DeltaSettings(1, 1, 1, 0.7, 1, bad)
 
 
-def test_new_plan_differs_only_by_profile_and_penalty(world) -> None:
-    sealed(world)
-    ctx = world.ctx()
-    assert ctx.old_plan.artifact == ctx.stored_plan and ctx.new_plan.artifact["plan_sha256"] != ctx.old_plan.artifact["plan_sha256"]
-    assert ctx.new_plan.artifact["presence_penalty"] == PRESENCE_PENALTY and ctx.new_plan.artifact["provider_grammar_profile"] == NEW_PROFILE
+def test_real_plan_fingerprints_are_preserved_and_new_plan_differs_only_by_profile_and_penalty(ctx) -> None:
+    assert ctx.old_plan.artifact == ctx.stored_plan and ctx.old_plan.artifact["plan_sha256"] == BASE_PLAN_SHA
+    assert ctx.new_plan.artifact["plan_sha256"] == NEW_PLAN_SHA
+    old, new = ctx.old_plan.artifact, ctx.new_plan.artifact
+    assert {key for key in old if old[key] != new.get(key)} | (set(new) - set(old)) == {"provider_grammar_profile", "presence_penalty", "plan_sha256"}
+    assert (old["provider_grammar_profile"], new["provider_grammar_profile"], new["presence_penalty"]) == (OLD_PROFILE, NEW_PROFILE, PRESENCE_PENALTY)
+    assert len(ctx.old_plan.chunks) == 246 and old["coverage"]["source_sha256"] == SOURCE_SHA
 
 
-def test_seal_dispositions_bind_hashes_and_never_write_base(world) -> None:
-    world.write_base({"k0000": "ready", "k0001": "truncated"})
-    before = {p.relative_to(world.base): p.read_bytes() for p in world.base.rglob("*") if p.is_file()}
-    manifest = seal(world.ctx(), world.base, world.work)
-    after = {p.relative_to(world.base): p.read_bytes() for p in world.base.rglob("*") if p.is_file()}
-    assert before == after
-    assert [c["disposition"] for c in manifest["chunks"]] == [OLD_READY, OLD_TRUNCATED, MISSING]
-    assert manifest["targets"] == ["k0001", "k0002"] and manifest["source_sha256"] == SOURCE_SHA
-    ready = manifest["chunks"][0]
-    assert ready["old_validation"]["claims"] == 1 and len(ready["old_attempts"][0]["request_sha256"]) == 64
-    assert ready["span_sha256"] == sha256_text(TEXT[ready["start"] : ready["end"]])
-    assert manifest["old_profile"]["profile"] == OLD_PROFILE and manifest["new_profile"]["profile"] == NEW_PROFILE
-    # old journal lines are copied into the sealed snapshot only, byte for byte, never into a new-profile journal
-    assert (world.work / "seal" / "snapshot" / "journal.jsonl").read_bytes() == (world.base / "journal.jsonl").read_bytes()
-    assert not (recovery_dir(world.work) / "journal.jsonl").exists()
-    verify_seal(world.ctx_from_seal(), world.work)
+def test_seal_dispositions_come_from_the_actual_journal(sealed) -> None:
+    manifest, work = sealed
+    by_id = {record["chunk_id"]: record for record in JOURNAL}
+    assert len(manifest["chunks"]) == 246 and manifest["journal"]["records"] == len(JOURNAL) == 12
+    for entry in manifest["chunks"]:
+        record = by_id.get(entry["id"])
+        if record is None:
+            assert entry["disposition"] == MISSING and entry["old_attempts"] == []
+            continue
+        assert entry["disposition"] == (OLD_READY if record["status"] == "ready" else OLD_TRUNCATED)
+        attempt = entry["old_attempts"][0]
+        assert (attempt["request_sha256"], attempt["response_sha256"], attempt["meta_sha256"], attempt["record_sha256"]) == tuple(record[k] for k in ("request_sha256", "response_sha256", "meta_sha256", "record_sha256"))
+        if record["status"] == "ready":
+            assert entry["old_validation"]["claims"] == record["counts"]["claims"] and entry["old_validation"]["pending"] == record["counts"]["pending"]
+        assert entry["span_sha256"] == sha256_text(SOURCE.read_text(encoding="utf-8")[entry["start"] : entry["end"]])
+    counts = manifest["dispositions"]
+    assert counts == {OLD_READY: 8, OLD_TRUNCATED: 4, MISSING: 234, "old_unresolved": 0}
+    assert manifest["targets"] == [e["id"] for e in manifest["chunks"] if e["disposition"] != OLD_READY]
+    assert manifest["source_sha256"] == SOURCE_SHA and manifest["base_plan_sha256"] == BASE_PLAN_SHA
+    assert manifest["new_profile"]["plan_sha256"] == NEW_PLAN_SHA and manifest["old_profile"]["profile"] == OLD_PROFILE
+    assert (work / "seal" / "snapshot" / "journal.jsonl").read_bytes() == (FIXTURE / "journal.jsonl").read_bytes()
+    assert not (recovery_dir(work) / "journal.jsonl").exists()
 
 
-def test_seal_snapshots_only_a_whole_line_prefix_of_a_growing_base(world) -> None:
-    world.write_base({"k0000": "ready", "k0001": "truncated"})
-    journal = world.base / "journal.jsonl"
-    whole = journal.read_bytes()
-    journal.write_bytes(whole + b'{"torn":')
-    manifest = seal(world.ctx(), world.base, world.work)
-    assert manifest["journal"]["records"] == 2
-    assert (world.work / "seal" / "snapshot" / "journal.jsonl").read_bytes() == whole
-    assert journal.read_bytes() == whole + b'{"torn":'
+def test_seal_cuts_a_growing_base_at_the_last_whole_line(ctx, tmp_path) -> None:
+    base = clone_base(tmp_path / "base")
+    journal = base / "journal.jsonl"
+    journal.write_bytes(journal.read_bytes() + b'{"seq":12,"torn":')
+    manifest = seal(ctx, base, tmp_path / "work")
+    assert manifest["journal"]["records"] == 12
+    assert (tmp_path / "work" / "seal" / "snapshot" / "journal.jsonl").read_bytes() == (FIXTURE / "journal.jsonl").read_bytes()
+    assert journal.read_bytes().endswith(b'"torn":')
 
 
-def test_seal_refusals(world) -> None:
-    world.write_base({"k0000": "ready"})
-    ctx = world.ctx()
+def test_seal_and_context_refusals(ctx, sealed, tmp_path) -> None:
+    base = clone_base(tmp_path / "base")
     with pytest.raises(ContractError) as error:
-        seal(ctx, world.base, world.base / "inside")
+        seal(ctx, base, base / "inside")
     assert error.value.code == "workdir_invalid"
-    seal(ctx, world.base, world.work)
     with pytest.raises(ContractError) as error:
-        seal(ctx, world.base, world.work)
+        seal(ctx, base, sealed[1])
     assert error.value.code == "seal_exists"
-    plan_bytes, seed_bytes = (world.base / "plan.json").read_bytes(), (world.base / "seed.json").read_bytes()
-    with pytest.raises(ContractError) as error:
-        load_context(world.project, world.source, world.config_path, plan_bytes, seed_bytes, "0" * 64, world.base_plan_sha)
-    assert error.value.code == "source_mismatch"
-    with pytest.raises(ContractError) as error:
-        load_context(world.project, world.source, world.config_path, plan_bytes, seed_bytes, SOURCE_SHA, "1" * 64)
-    assert error.value.code == "base_plan_mismatch"
-    penalised = json.loads(plan_bytes) | {"presence_penalty": 1.5}
-    with pytest.raises(ContractError) as error:
-        load_context(world.project, world.source, world.config_path, json.dumps(penalised).encode(), seed_bytes, SOURCE_SHA, world.base_plan_sha)
-    assert error.value.code == "base_profile_mismatch"
-    with pytest.raises(ContractError) as error:
-        load_context(world.project, world.source, world.config_path, plan_bytes, json.dumps({"registry": {}, "aliases": {}}).encode(), SOURCE_SHA, world.base_plan_sha)
-    assert error.value.code == "base_plan_mismatch"
+    plan_bytes, seed_bytes = (FIXTURE / "plan.json").read_bytes(), (FIXTURE / "seed.json").read_bytes()
+
+    def build(plan=plan_bytes, seed=seed_bytes, source=SOURCE_SHA, plan_sha=BASE_PLAN_SHA):
+        return load_context(PROJECT, SOURCE, CONFIG, plan, seed, source, plan_sha)
+
+    for call, code in (
+        (lambda: build(source="0" * 64), "source_mismatch"),
+        (lambda: build(plan_sha="1" * 64), "base_plan_mismatch"),
+        (lambda: build(plan=json.dumps(json.loads(plan_bytes) | {"presence_penalty": 1.5}).encode()), "base_profile_mismatch"),
+        (lambda: build(plan=json.dumps(json.loads(plan_bytes) | {"provider_grammar_profile": NEW_PROFILE}).encode()), "base_profile_mismatch"),
+    ):
+        with pytest.raises(ContractError) as error:
+            call()
+        assert error.value.code == code
 
 
-def test_tampered_base_raw_is_refused_at_seal(world) -> None:
-    world.write_base({"k0000": "ready"})
-    raw = world.base / "raw" / "k0000.a1.response.txt"
-    raw.write_text(raw.read_text() + " ", encoding="utf-8")
+def test_tampered_real_base_is_refused_at_seal(ctx, tmp_path) -> None:
+    base = clone_base(tmp_path / "base")
+    raw = base / "raw" / "k0001.a1.response.txt"
+    raw.write_bytes(raw.read_bytes() + b" ")
     with pytest.raises(ContractError) as error:
-        seal(world.ctx(), world.base, world.work)
+        seal(ctx, base, tmp_path / "work")
     assert error.value.code == "base_raw_mismatch"
+    shutil.rmtree(tmp_path / "work", ignore_errors=True)
+    base2 = clone_base(tmp_path / "base2")
+    lines = (base2 / "journal.jsonl").read_text().splitlines()
+    forged = json.loads(lines[1]) | {"status": "truncated"}
+    lines[1] = json.dumps(forged)
+    (base2 / "journal.jsonl").write_text("\n".join(lines) + "\n")
+    with pytest.raises(ContractError) as error:
+        seal(ctx, base2, tmp_path / "work2")
+    assert error.value.code == "base_journal_corrupt"
 
 
-def test_tampered_seal_is_refused(world) -> None:
-    sealed(world)
-    ctx = world.ctx_from_seal()
-    snap = world.work / "seal" / "snapshot"
-    raw = snap / "raw" / "k0000.a1.response.txt"
+def test_tampered_seal_is_refused(ctx, work) -> None:
+    snap = work / "seal" / "snapshot"
+    raw = snap / "raw" / "k0001.a1.response.txt"
     original = raw.read_bytes()
     raw.write_bytes(original + b" ")
     with pytest.raises(ContractError) as error:
-        verify_seal(ctx, world.work)
+        verify_seal(ctx, work)
     assert error.value.code == "seal_tampered"
     raw.write_bytes(original)
-    verify_seal(ctx, world.work)
-    manifest_path = world.work / "seal" / "manifest.json"
+    manifest_path = work / "seal" / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    manifest["chunks"][0]["disposition"] = MISSING
+    manifest["chunks"][1]["disposition"] = MISSING
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ContractError) as error:
-        verify_seal(ctx, world.work)
+        verify_seal(ctx, work)
     assert error.value.code == "seal_tampered"
     manifest["manifest_sha256"] = sha_json({k: v for k, v in manifest.items() if k != "manifest_sha256"})
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ContractError) as error:
-        verify_seal(ctx, world.work)
+        verify_seal(ctx, work)
     assert error.value.code == "seal_revalidation_mismatch"
 
 
-def test_recovery_targets_never_include_old_ready(world) -> None:
-    manifest = sealed(world)
-    assert recovery_targets(manifest) == ["k0001", "k0002"]
+def test_targets_never_include_old_ready_and_plan_is_bound(ctx, sealed, verified) -> None:
+    manifest, _ = sealed
+    plan = build_recovery_plan(ctx, manifest, verified[1])
+    ready = [e["id"] for e in manifest["chunks"] if e["disposition"] == OLD_READY]
+    assert not set(plan["targets"]) & set(ready) and plan["never_asked_old_ready"] == ready
+    assert plan["max_model_calls"] == len(plan["targets"]) == 238 and plan["old_unresolved"] == []
+    assert plan["seal_manifest_sha256"] == manifest["manifest_sha256"] and plan["new_plan_sha256"] == NEW_PLAN_SHA
     forged = json.loads(json.dumps(manifest))
-    forged["chunks"][0]["disposition"] = OLD_TRUNCATED
-    assert recovery_targets(forged) == ["k0000", "k0001", "k0002"]  # a forged manifest is caught by verify_seal, never here
-    ctx = world.ctx_from_seal()
-    plan = build_recovery_plan(ctx, manifest, verify_seal(ctx, world.work)[1])
-    assert plan["targets"] == ["k0001", "k0002"] and plan["never_asked_old_ready"] == ["k0000"] and plan["max_model_calls"] == 2
-    assert len(plan["first_target_request_sha256"]) == 64
+    forged["chunks"][1]["disposition"] = OLD_TRUNCATED
+    assert "k0001" in recovery_targets(forged)  # caught by verify_seal's hash and revalidation, as the tamper test proves
 
 
-def test_request_contract_is_exactly_the_penalty(world) -> None:
-    sealed(world)
-    ctx = world.ctx_from_seal()
-    _, old = verify_seal(ctx, world.work)
-    run = RecoveryRun(ctx, recovery_dir(world.work), old)
-    chunk = next(c for c in ctx.new_plan.chunks if c.id == "k0001")
-    payload = run.prep(chunk, 1).payload
-    check_request_contract(ctx, payload)
-    body = json.loads(payload)
-    assert body["presence_penalty"] == PRESENCE_PENALTY and body["temperature"] == 0.7 and body["seed"] == 1729
-    # the new request equals the old-profile request for the same chunk and state plus the single penalty field
-    old_chunk = next(c for c in ctx.old_plan.chunks if c.id == "k0001")
+def test_requests_equal_the_sealed_old_requests_plus_exactly_the_penalty(ctx, sealed, verified) -> None:
+    manifest, work = sealed
+    _, old = verified
+    run = RecoveryRun(ctx, recovery_dir(work), old)
+    entries = {entry["id"]: entry for entry in manifest["chunks"]}
+    for chunk_id in ("k0000", "k0002", "k0011"):  # the real old_truncated chunks, including ones preceded by old-ready claims
+        chunk = next(c for c in ctx.new_plan.chunks if c.id == chunk_id)
+        payload = run.prep(chunk, 1).payload
+        check_request_contract(ctx, payload)
+        body = json.loads(payload)
+        assert body["presence_penalty"] == PRESENCE_PENALTY and body["temperature"] == 0.7 and body["seed"] == 1729
+        stripped = json.dumps({k: v for k, v in body.items() if k != "presence_penalty"}).encode()
+        # the same request without the penalty is byte-for-byte the real request the provider answered in the base run
+        assert hashlib.sha256(stripped).hexdigest() == entries[chunk_id]["old_attempts"][0]["request_sha256"]
     state = Established()
-    state.seed(REGISTRY, ALIASES)
-    state.apply(old.ready["k0000"]["claims"])
-    old_payload = json.loads(prepare(ctx.config, ctx.old_plan, old_chunk, state, ctx.count).payload)
-    assert {k: v for k, v in body.items() if k != "presence_penalty"} == old_payload
+    state.seed(ctx.seed["registry"], ctx.seed["aliases"])
+    chunk = next(c for c in ctx.new_plan.chunks if c.id == "k0002")
+    assert run.prep(chunk, 1).user != prepare(ctx.config, ctx.new_plan, chunk, state, ctx.count).user  # old-ready claims are in the sequential state
+    payload = run.prep(chunk, 1).payload
     for mutate in (
         lambda b: b.pop("presence_penalty"),
         lambda b: b.update(presence_penalty=1.0),
@@ -309,8 +247,7 @@ def test_request_contract_is_exactly_the_penalty(world) -> None:
 
 
 def test_capability_check_fails_closed() -> None:
-    good = {"data": [{"id": MODEL, "capabilities": {"presence_penalty": "presence-penalty-v1"}}]}
-    require_presence_penalty_capability(good, MODEL)
+    require_presence_penalty_capability({"data": [{"id": MODEL, "capabilities": {"presence_penalty": "presence-penalty-v1"}}]}, MODEL)
     for document in (
         {"data": [{"id": MODEL}]},
         {"data": [{"id": MODEL, "capabilities": {"presence_penalty": "other"}}]},
@@ -324,110 +261,62 @@ def test_capability_check_fails_closed() -> None:
         assert error.value.code == "capability_unproven"
 
 
-def test_execute_path_refuses_before_any_request_without_capability(world) -> None:
-    sealed(world)
-    ctx = world.ctx_from_seal()
-    from src.wide_bio_test import calibration
+def test_execute_refuses_before_any_request_and_attempts_are_exactly_one(ctx, work) -> None:
+    import inspect
 
-    cal = calibration(ctx.config, ctx.config.tokenizer_sha256)
-    cal["fixed_overhead_tokens"] = 0
-    calls: list[str] = []
-
-    def transport(url, payload, timeout):  # records any attempted send
-        calls.append(url)
-        raise AssertionError("no request may be sent")
-
+    calibration = json.loads(CALIBRATION.read_text())
+    assert "max_attempts" not in inspect.signature(recover).parameters
+    for models in ({"data": [{"id": MODEL}]}, None):
+        with pytest.raises(ContractError) as error:
+            recover(ctx, work, chat_transport, calibration, models)  # real transport; refused before it can be called
+        assert error.value.code == "capability_unproven"
+    assert not (recovery_dir(work) / "journal.jsonl").exists()
+    loose = replace(ctx, new_plan=replace(ctx.new_plan, settings=replace(ctx.new_plan.settings, max_attempts=2)))
     with pytest.raises(ContractError) as error:
-        recover(ctx, world.work, transport, cal, {"data": [{"id": MODEL}]})
-    assert error.value.code in {"capability_unproven", "calibration_insufficient", "calibration_overhead_mismatch"}
-    assert calls == [] and not (recovery_dir(world.work) / "journal.jsonl").exists()
+        recover(loose, work, None)
+    assert error.value.code == "attempts_not_one"
 
 
-def test_recover_offline_resumes_and_union_needs_every_chunk(world) -> None:
-    sealed(world)
-    ctx = world.ctx_from_seal()
-    not_ready = verify_union(ctx, world.work)
-    assert not_ready["state"] == "not_ready" and not_ready["source_coverage_ready"] is False and not_ready["freeze_allowed"] is False
-    assert not_ready["blockers"] == ["k0001", "k0002"] and not_ready["verified_chunks"] == 1
-    world.write_recovery(ctx, ["k0001"])
-    state = recover(ctx, world.work, None)
-    assert state["new_ready"] == ["k0001"] and state["calls_total"] == 1 and state["stop"] == "offline"
-    partial = verify_union(ctx, world.work)
-    assert partial["state"] == "not_ready" and partial["blockers"] == ["k0002"]
-    assert partial["by_disposition"] == {"not_ready:missing": 1, "verified_new_accepted": 1, "verified_old_ready": 1}
-    world.write_recovery(ctx, ["k0002"])
-    full = verify_union(ctx, world.work)
-    assert full["state"] == "source_coverage_ready" and full["source_coverage_ready"] is True and full["full_candidate_accounting"].startswith("not_verified") and full["candidates"]["pending"] >= 0 and full["verified_chunks"] == 3 and full["blockers"] == []
-    assert full["source"]["tiled_exactly_once"] and full["source"]["verified_chars"] == len(TEXT)
-    rows = {row["id"]: row for row in full["rows"]}
-    assert rows["k0000"]["provenance"]["profile"] == OLD_PROFILE and rows["k0001"]["provenance"]["profile"] == NEW_PROFILE
-    assert rows["k0001"]["provenance"]["presence_penalty"] == PRESENCE_PENALTY and rows["k0002"]["accounting"]["claims"] == 1
-    assert full["candidates"]["claims"] == 4 and full["freeze_allowed"] is False
-    # the new journal holds only new-profile attempts for target chunks, never the old record
-    journal = [json.loads(line) for line in (recovery_dir(world.work) / "journal.jsonl").read_text().splitlines()]
-    assert [record["chunk_id"] for record in journal] == ["k0001", "k0002"]
-    assert recover(ctx, world.work, None)["new_ready"] == ["k0001", "k0002"]
+def test_real_union_is_not_ready_and_never_frees_a_freeze(ctx, sealed, work) -> None:
+    manifest, _ = sealed
+    state = recover(ctx, work, None)  # offline replay: nothing is sent
+    assert state["stop"] == "offline" and state["new_ready"] == [] and state["calls_total"] == 0
+    union = verify_union(ctx, work)
+    assert union["state"] == "not_ready" and union["source_coverage_ready"] is False and union["freeze_allowed"] is False
+    assert union["full_candidate_accounting"].startswith("not_verified")
+    assert union["verified_chunks"] == 8 and union["chunks"] == 246 and len(union["blockers"]) == 238
+    assert union["by_disposition"] == {"not_ready:missing": 234, "not_ready:old_truncated": 4, "verified_old_ready": 8}
+    old_ready = [e for e in manifest["chunks"] if e["disposition"] == OLD_READY]
+    assert union["candidates"]["claims"] == sum(e["old_validation"]["claims"] for e in old_ready)
+    assert union["candidates"]["pending"] == sum(e["old_validation"]["pending"] for e in old_ready)
+    assert union["source"]["tiled_exactly_once"] and union["source"]["verified_chars"] == sum(e["end"] - e["start"] for e in old_ready)
+    rows = {row["id"]: row for row in union["rows"]}
+    assert rows["k0001"]["provenance"]["profile"] == OLD_PROFILE and rows["k0001"]["provenance"]["request_sha256"]
+    assert rows["k0000"]["verified"] is False and rows["k0000"]["disposition"] == "not_ready:old_truncated"
 
 
-def test_recovery_state_is_chronological_union(world) -> None:
-    sealed(world, {"k0000": "ready", "k0001": "truncated"})
-    ctx = world.ctx_from_seal()
-    _, old = verify_seal(ctx, world.work)
-    run = RecoveryRun(ctx, recovery_dir(world.work), old)
-    chunk = next(c for c in ctx.new_plan.chunks if c.id == "k0001")
-    user = run.prep(chunk, 1).user
-    assert "tall, with green eyes" in user  # old-ready claim of the earlier chunk is already established
-    plain = Established()
-    plain.seed(REGISTRY, ALIASES)
-    assert "tall, with green eyes" not in prepare(ctx.config, ctx.new_plan, chunk, plain, ctx.count).user
-
-
-def test_union_refuses_tampered_recovery_evidence_and_foreign_binding(world) -> None:
-    sealed(world)
-    ctx = world.ctx_from_seal()
-    world.write_recovery(ctx, ["k0001"])
-    raw = recovery_dir(world.work) / "raw" / "k0001.a1.response.txt"
-    original = raw.read_bytes()
-    raw.write_bytes(original + b" ")
+def test_union_refuses_a_foreign_recovery_binding_and_stray_evidence(ctx, work) -> None:
+    recover(ctx, work, None)
+    out = recovery_dir(work)
+    (out / "journal.jsonl").write_bytes((work / "seal" / "snapshot" / "journal.jsonl").read_bytes())  # old records must never sit in the new-profile journal
     with pytest.raises(ContractError):
-        verify_union(ctx, world.work)
-    raw.write_bytes(original)
-    verify_union(ctx, world.work)
-    bound = recovery_dir(world.work) / "recovery_plan.json"
+        verify_union(ctx, work)
+    (out / "journal.jsonl").unlink()
+    bound = out / "recovery_plan.json"
     data = json.loads(bound.read_text())
+    (out / "journal.jsonl").write_bytes(b"")
     data["seal_manifest_sha256"] = "0" * 64
     bound.write_text(json.dumps(data))
     with pytest.raises(ContractError) as error:
-        verify_union(ctx, world.work)
+        verify_union(ctx, work)
     assert error.value.code == "recovery_mismatch"
 
 
-def test_command_line_seal_plan_verify_are_offline(world, capsys) -> None:
-    world.write_base({"k0000": "ready", "k0001": "truncated"})
-    common = [str(world.project), "--source", str(world.source), "--config", str(world.config_path), "--workdir", str(world.work), "--expect-source-sha256", SOURCE_SHA, "--expect-base-plan-sha256", world.base_plan_sha]
-    assert main(["seal", *common, "--base", str(world.base)]) == 0
+def test_command_line_is_offline_and_fail_closed(work, capsys) -> None:
+    common = [str(PROJECT), "--source", str(SOURCE), "--config", str(CONFIG), "--workdir", str(work), "--expect-source-sha256", SOURCE_SHA, "--expect-base-plan-sha256", BASE_PLAN_SHA]
     assert main(["plan", *common]) == 0
     out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert out["targets"] == 2 and "--execute" in out["caretaker_command"] and out["old_unresolved"] == []
-    assert main(["verify", *common]) == 3
-    assert main(["recover", *common]) == 3  # offline replay only: no --execute, so nothing is sent
-    assert main(["recover", *common, "--execute"]) == 2  # --execute needs a calibration; refused before any request
-    shutil.rmtree(world.work / "seal" / "snapshot" / "raw")
-    assert main(["verify", *common]) == 2
-
-
-def test_no_retry_knob_and_attempts_are_exactly_one(world, capsys) -> None:
-    import inspect
-
-    sealed(world)
-    assert "max_attempts" not in inspect.signature(recover).parameters
-    common = [str(world.project), "--source", str(world.source), "--config", str(world.config_path), "--workdir", str(world.work), "--expect-source-sha256", SOURCE_SHA, "--expect-base-plan-sha256", world.base_plan_sha]
+    assert out["targets"] == 238 and out["new_plan_sha256"] == NEW_PLAN_SHA and "--execute" in out["caretaker_command"] and "--max-attempts" not in out["caretaker_command"]
+    assert main(["recover", *common, "--execute"]) == 2  # needs a calibration
     with pytest.raises(SystemExit):
         main(["recover", *common, "--max-attempts", "2"])
-    ctx = world.ctx_from_seal()
-    from dataclasses import replace
-
-    loose = replace(ctx, new_plan=replace(ctx.new_plan, settings=replace(ctx.new_plan.settings, max_attempts=2)))
-    with pytest.raises(ContractError) as error:
-        recover(loose, world.work, None)
-    assert error.value.code == "attempts_not_one"

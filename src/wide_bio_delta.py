@@ -392,6 +392,7 @@ class DeltaSettings:
     seed: int | None = None
     provider_grammar_profile: str | None = None
     compact_wire: bool = False
+    presence_penalty: float | None = None
 
     def __post_init__(self) -> None:
         for name in ("target_tokens", "delta_tokens", "max_attempts"):
@@ -422,6 +423,8 @@ class DeltaSettings:
                 )
         if not isinstance(self.compact_wire, bool):
             raise ContractError("compact wire must be a boolean", "settings_invalid")
+        if self.presence_penalty is not None and (isinstance(self.presence_penalty, bool) or not isinstance(self.presence_penalty, (int, float)) or not 0.0 < self.presence_penalty <= 2.0):
+            raise ContractError("presence penalty must be a number in (0, 2]", "sampling_invalid")
         if self.provider_grammar_profile is not None:
             profile = self.provider_grammar_profile
             if (
@@ -1002,6 +1005,8 @@ def build_delta_plan(
         artifact["sampling"] = settings.sampling
     if settings.compact_wire:
         artifact["wire_format"] = "compact-v2"
+    if settings.presence_penalty is not None:
+        artifact["presence_penalty"] = float(settings.presence_penalty)
     if settings.provider_grammar_profile is not None:
         # The grammar is a server-side decoder contract, not a request field.
         # Its verified descriptor nevertheless changes every response surface,
@@ -1114,6 +1119,7 @@ def prepare(
         output_tokens or config.output_tokens,
         schema,
         plan.settings.seed,
+        plan.settings.presence_penalty,
     )
     return Prepared(
         url,
@@ -2761,6 +2767,12 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
             help="verified server-side JSON grammar descriptor; immutable plan provenance, never sent as a request option",
         )
         item.add_argument(
+            "--presence-penalty",
+            type=float,
+            default=None,
+            help="verified OpenAI presence penalty, immutable plan provenance",
+        )
+        item.add_argument(
             "--compact-wire",
             action="store_true",
             help="use the explicit compact s/r/k/v/p JSON fact wire contract; immutable plan provenance",
@@ -2853,6 +2865,7 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
             getattr(args, "sampling_seed", None),
             getattr(args, "provider_grammar_profile", None),
             getattr(args, "compact_wire", False),
+            getattr(args, "presence_penalty", None),
         )
         if args.command == "adaptive":
             return adaptive_command(args, settings, transport)

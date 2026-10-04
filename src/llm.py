@@ -204,10 +204,11 @@ def request_for(
     max_tokens: int,
     response_schema: dict | None,
     seed: int | None = None,
+    presence_penalty: float | None = None,
 ) -> tuple[str, bytes]:
-    if seed is not None and backend.style != "openai":
+    if (seed is not None or presence_penalty is not None) and backend.style != "openai":
         # only the OpenAI-compatible TensorFold request carries a verified top-level `seed`; never guess for another style.
-        raise ValueError("a request seed is supported only for the openai backend style")
+        raise ValueError("seed and presence penalty are supported only for the openai backend style")
     if backend.style == "ollama":
         request: dict = {
             "model": backend.model,
@@ -235,6 +236,8 @@ def request_for(
         }
     if seed is not None:
         request["seed"] = seed
+    if presence_penalty is not None:
+        request["presence_penalty"] = presence_penalty
     openai_base = backend.url.rstrip("/")
     endpoint = (
         f"{openai_base}/chat/completions"

@@ -1263,8 +1263,11 @@ class DeltaRun:
         return not self.attempts[chunk.id] or self.length_proven(chunk)
 
     # replay ---------------------------------------------------------
-    def replay(self) -> None:
+    def replay(self, before_chunk: str | None = None) -> None:
+        """Rebuild state from an immutable journal prefix without touching it."""
         for record in self.journal.load():
+            if record["chunk_id"] == before_chunk:
+                return
             chunk = self.by_id.get(record["chunk_id"])
             if chunk is None or record["attempt"] != len(self.attempts[chunk.id]) + 1:
                 raise ContractError(
@@ -1918,6 +1921,7 @@ def check_only_chunk(
     count: Counter,
     registry: dict | None,
     aliases: dict | None,
+    state: Established | None = None,
 ) -> None:
     by_id = {chunk.id: chunk for chunk in plan.chunks}
     if not plan.chunks or chunk_id not in by_id:
@@ -1931,10 +1935,11 @@ def check_only_chunk(
             f"--only-chunk needs a new output directory; {out_dir} already holds {used}",
             "only_chunk_output_not_new",
         )
-    state = Established()
-    state.seed(registry or {}, aliases or {})
+    prepared_state = state or Established()
+    if state is None:
+        prepared_state.seed(registry or {}, aliases or {})
     try:
-        prepared = prepare(config, plan, by_id[chunk_id], state, count)
+        prepared = prepare(config, plan, by_id[chunk_id], prepared_state, count)
     except TokenizerRefusal as error:
         raise ContractError(
             f"chunk {chunk_id} cannot be counted: {error}", "only_chunk_incompatible"
@@ -1964,11 +1969,12 @@ def run_delta(
     registry: dict | None = None,
     aliases: dict | None = None,
     only_chunk: str | None = None,
+    initial_state: Established | None = None,
 ) -> dict:
     check_output_dir(out_dir, chapters)
     if only_chunk is not None:
         check_only_chunk(
-            only_chunk, config, plan, out_dir, count, registry, aliases
+            only_chunk, config, plan, out_dir, count, registry, aliases, initial_state
         )
     if transport is not None:
         measured = validate_calibration(calibration or {}, config)
@@ -1987,6 +1993,8 @@ def run_delta(
     with run_lock(out_dir):
         ensure_plan_file(plan, out_dir)
         run = DeltaRun(chapters, config, plan, out_dir, count, cast, registry, aliases)
+        if initial_state is not None:
+            run.state = initial_state
         run.only_chunk = only_chunk
         started = clock()
         run.replay()
@@ -2024,6 +2032,50 @@ def run_delta(
                 "fallback_route",
             )
         return summary
+
+
+# ##################################################################
+# replay ablation preparation
+# rebuilds the exact established state before a saved chunk from immutable raw
+# evidence, then proves a new sampling request differs only in temperature.
+def prepare_temperature_ablation(
+    chapters: Sequence[Path],
+    config: ProofConfig,
+    old_plan: DeltaPlan,
+    new_plan: DeltaPlan,
+    prefix_out: Path,
+    chunk_id: str,
+    count: Counter,
+    registry: dict,
+    aliases: dict,
+) -> tuple[Prepared, Prepared, Established]:
+    if old_plan.settings.seed != new_plan.settings.seed:
+        raise ContractError("ablation must retain the same seed", "ablation_mismatch")
+    old = DeltaRun(
+        chapters,
+        config,
+        old_plan,
+        prefix_out,
+        count,
+        build_cast_index(list(chapters), registry, aliases, None),
+        registry,
+        aliases,
+    )
+    old.replay(chunk_id)
+    chunk = old.by_id.get(chunk_id)
+    if chunk is None:
+        raise ContractError("ablation chunk is unknown", "ablation_mismatch")
+    prior = old.prep(chunk, 1)
+    records = old.journal.load()
+    saved = next((record for record in records if record["chunk_id"] == chunk_id), None)
+    if not saved or saved.get("request_sha256") != prior.request_sha256:
+        raise ContractError("prefix does not reproduce the saved request", "ablation_mismatch")
+    prepared = prepare(config, new_plan, chunk, old.state, count)
+    old_body, new_body = json.loads(prior.payload), json.loads(prepared.payload)
+    old_temp, new_temp = old_body.pop("temperature", None), new_body.pop("temperature", None)
+    if old_temp == new_temp or old_body != new_body:
+        raise ContractError("ablation changed more than temperature", "ablation_mismatch")
+    return prior, prepared, old.state
 
 
 # ##################################################################
@@ -2587,6 +2639,40 @@ def adaptive_command(args, settings: DeltaSettings, transport: Transport) -> int
 
 
 # ##################################################################
+# temperature replay ablation
+# one fresh, prefix-proven call with the production request rebuilt exactly
+# except for the requested sampling temperature.
+def replay_ablation_command(args, settings: DeltaSettings, transport: Transport) -> int:
+    config = load_proof_config(args.config)
+    chapters = project_chapters(args.project.resolve())
+    check_output_dir(args.out, chapters)
+    old_seed = json.loads((args.prefix_out / "seed.json").read_text(encoding="utf-8"))
+    seed_bytes = canonical_json(old_seed).encode()
+    old_settings = DeltaSettings(
+        args.target_tokens, args.delta_tokens, 1, args.from_temperature, args.sampling_seed,
+        args.provider_grammar_profile, args.compact_wire,
+    )
+    count = build_counter(config)
+    source = read_source(args.source)
+    old_plan = build_delta_plan(source, chapters, config, count, old_settings, args.fixed_overhead, sha256_text(canonical_json(old_seed)))
+    stored = json.loads((args.prefix_out / "plan.json").read_text(encoding="utf-8"))
+    if stored != old_plan.artifact:
+        raise ContractError("prefix plan is not the exact old-temperature plan", "ablation_mismatch")
+    new_plan = build_delta_plan(source, chapters, config, count, settings, args.fixed_overhead, sha256_text(canonical_json(old_seed)))
+    if new_plan.settings.temperature == old_plan.settings.temperature:
+        raise ContractError("ablation needs a different temperature", "ablation_mismatch")
+    registry, aliases = old_seed["registry"], old_seed["aliases"]
+    prior, prepared, state = prepare_temperature_ablation(chapters, config, old_plan, new_plan, args.prefix_out, args.chunk, count, registry, aliases)
+    args.out.mkdir(parents=True, exist_ok=True)
+    same_or_absent(args.out / "seed.json", seed_bytes)
+    write_atomic(args.out / "ablation_provenance.json", canonical_json({"prefix_out": str(args.prefix_out), "prefix_plan_sha256": old_plan.artifact["plan_sha256"], "new_plan_sha256": new_plan.artifact["plan_sha256"], "chunk": args.chunk, "old_request_sha256": prior.request_sha256, "new_request_sha256": prepared.request_sha256, "old_temperature": old_plan.settings.temperature, "new_temperature": new_plan.settings.temperature}))
+    calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
+    summary = run_delta(chapters, config, new_plan, args.out, transport if args.execute else None, count, calibration, args.soft_deadline_s, args.hard_deadline_s, registry=registry, aliases=aliases, only_chunk=args.chunk, initial_state=state)
+    print(json.dumps(summary, sort_keys=True))
+    return 0 if summary["state"] == "ready" else 3
+
+
+# ##################################################################
 # main
 # plan/validate are offline; run needs --execute and a calibration record. Exit 0 = ready, 3 = not_ready (durable summary written), 2 = refused before any request. `transport` is injectable only for tests; the default is the single-route chat transport.
 def main(argv: list[str] | None = None, transport: Transport = chat_transport) -> int:
@@ -2691,6 +2777,25 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
         action="store_true",
         help="send the retry calls; without it nothing is sent",
     )
+    ab = sub.add_parser("replay-ablation", help="one prefix-proven temperature-only replay call")
+    ab.add_argument("project", type=Path)
+    ab.add_argument("--source", type=Path, required=True)
+    ab.add_argument("--config", type=Path, required=True)
+    ab.add_argument("--prefix-out", type=Path, required=True)
+    ab.add_argument("--out", type=Path, required=True)
+    ab.add_argument("--chunk", required=True)
+    ab.add_argument("--target-tokens", type=int, required=True)
+    ab.add_argument("--delta-tokens", type=int, required=True)
+    ab.add_argument("--from-temperature", type=float, required=True)
+    ab.add_argument("--sampling-temperature", type=float, required=True)
+    ab.add_argument("--sampling-seed", type=int, required=True)
+    ab.add_argument("--provider-grammar-profile", required=True)
+    ab.add_argument("--compact-wire", action="store_true")
+    ab.add_argument("--fixed-overhead", type=int, default=16)
+    ab.add_argument("--calibration", type=Path, required=True)
+    ab.add_argument("--soft-deadline-s", type=float, default=SOFT_DEADLINE_S)
+    ab.add_argument("--hard-deadline-s", type=float, default=HARD_DEADLINE_S)
+    ab.add_argument("--execute", action="store_true")
     fin = sub.add_parser(
         "finalize-adaptive",
         help="no-provider: verify a COMPLETED adaptive output and apply it to the current prepare-cast progress (never freezes while a gap or pending row remains)",
@@ -2729,6 +2834,8 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
         )
         if args.command == "adaptive":
             return adaptive_command(args, settings, transport)
+        if args.command == "replay-ablation":
+            return replay_ablation_command(args, settings, transport)
         if args.command == "prepare-cast":
             from src.cast_freeze import prepare_cast
 

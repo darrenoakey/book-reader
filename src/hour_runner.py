@@ -626,7 +626,7 @@ def record_hour_timing(
 # ##################################################################
 # run hour
 # hold the project-wide pipeline lock through the complete bounded production transaction.
-def run_hour(source: Path, hour_index: int = 1) -> Path:
+def run_hour(source: Path, hour_index: int = 1, lean_cast: bool = False) -> Path:
     source = source.resolve()
     project = get_output_dir(source)
     project.mkdir(parents=True, exist_ok=True)
@@ -634,7 +634,7 @@ def run_hour(source: Path, hour_index: int = 1) -> Path:
     started = time.monotonic()
     record_hour_timing(project, hour_index, "started", 0.0)
     try:
-        movie = _run_hour_locked(source, hour_index)
+        movie = _run_hour_locked(source, hour_index, lean_cast)
         record_hour_timing(project, hour_index, "complete", time.monotonic() - started)
         return movie
     except Exception:
@@ -647,7 +647,7 @@ def run_hour(source: Path, hour_index: int = 1) -> Path:
 # ##################################################################
 # run locked hour
 # produce one numbered hour and commit the exact next source cursor only after its movie succeeds.
-def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
+def _run_hour_locked(source: Path, hour_index: int = 1, lean_cast: bool = False) -> Path:
     if hour_index < 1:
         raise ValueError("hour index must be at least one")
     source = source.resolve()
@@ -677,7 +677,15 @@ def _run_hour_locked(source: Path, hour_index: int = 1) -> Path:
     # Completed Parts 1 and 2 are historical assets and may be returned above without
     # touching a registry. Every new production hour starts only after the whole-source
     # frozen manifest verifies the source and every voice/portrait anchor byte.
-    if hour_index >= 3:
+    if hour_index >= 3 and lean_cast:
+        lean = load_json_store(project / "lean_characters.json", "lean character summary")
+        if lean.get("mode") != "lean_existing_profiles_v1" or lean.get("source_sha256") != source_fingerprint(source):
+            raise RuntimeError("lean character summary does not match this source")
+        cast, aliases = lean.get("actors"), lean.get("aliases")
+        if not isinstance(cast, dict) or not isinstance(aliases, dict):
+            raise RuntimeError("lean character summary is malformed")
+        scoped_references = None
+    elif hour_index >= 3:
         from src.cast_freeze import (
             load_approved_cast,
             validated_scoped_references,

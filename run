@@ -100,7 +100,7 @@ _source = Path({str(source)!r})
 if {args.verify_only!r}:
     print(verify_hour_runtime(_source))
 else:
-    print(f"Completed hour {args.hour}: {{run_hour(_source, hour_index={args.hour!r})}}")
+    print(f"Completed hour {args.hour}: {{run_hour(_source, hour_index={args.hour!r}, lean_cast={args.lean_cast!r})}}")
 '''
     return run_venv([str(VENV_PYTHON), "-c", code])
 
@@ -299,6 +299,7 @@ def main(argv: list[str]) -> int:
     p_hour.add_argument("source", help="Full EPUB, Markdown, or text input")
     p_hour.add_argument("--hour", type=int, default=1, help="1-based production hour number")
     p_hour.add_argument("--verify-only", action="store_true", help="Verify the venv runtime import and source identity without production work")
+    p_hour.add_argument("--lean-cast", action="store_true", help="Hour 3+ use lean existing-profile cast summary; bypasses only whole-book cast evidence checks")
     p_hour.set_defaults(func=command_hour)
 
     p_prepare = sub.add_parser("prepare-cast", help="Resumably prepare and freeze the whole-source cast; required before Hour 3+")

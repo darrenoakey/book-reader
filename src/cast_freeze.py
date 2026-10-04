@@ -7161,7 +7161,7 @@ def prepare_lean_characters(source: Path) -> dict:
     }
     if not ANCHOR_IDS <= set(actors):
         raise OperationalError("cast_integrity", "existing project is missing original Part 1 canonical anchors")
-    artifact = {"mode": "lean_existing_profiles_v1", "source_sha256": source_fingerprint(source), "actors": actors}
+    artifact = {"mode": "lean_existing_profiles_v1", "source_sha256": source_fingerprint(source), "actors": actors, "aliases": progress.get("aliases", {actor_id: actor_id for actor_id in actors})}
     atomic_json(project / "lean_characters.json", artifact)
     return {"status": "lean_ready", "actors": len(actors), "artifact": str(project / "lean_characters.json")}
 

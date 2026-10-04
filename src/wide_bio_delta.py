@@ -645,6 +645,7 @@ def validate_delta_response(
         key = (outcome["subject_id"], outcome["category"], norm_slot(outcome["value"]))
         known = state.has_trait(key[0], key[1], outcome["value"])
         if known or key in seen:
+            citation = outcome["claim"](chunk, position)
             result["duplicates"].append(
                 {
                     "position": position,
@@ -654,6 +655,13 @@ def validate_delta_response(
                     "subject_id": key[0],
                     "category": key[1],
                     "value": outcome["value"],
+                    # Repetition is not silently discarded: retain the exact
+                    # independently validated source citation for audit and
+                    # future citation reconciliation.
+                    "witness": {
+                        key: citation[key]
+                        for key in ("paragraph_id", "paragraph_sha256", "quote", "quote_sha256", "source_offset", "witness")
+                    },
                 }
             )
             continue

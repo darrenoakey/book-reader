@@ -1350,6 +1350,11 @@ def test_compact_discriminative_json_is_fully_accepted_without_per_category_cap(
     assert [item["reason"] for item in result["duplicates"]] == [
         "duplicate_in_response"
     ] * 2
+    assert all(
+        duplicate["witness"]["paragraph_id"]
+        and duplicate["witness"]["quote"]
+        for duplicate in result["duplicates"]
+    )
     assert {claim["category"] for claim in result["claims"]} >= {
         "look",
         "kin",

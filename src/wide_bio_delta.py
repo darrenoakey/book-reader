@@ -77,7 +77,7 @@ from src.wide_bio import (
 )
 from src.wide_bio_tokenizer import TokenizerRefusal
 
-DELTA_VERSION = 2
+DELTA_VERSION = 3
 QUOTE_MAX = 240
 VALUE_MAX = 100
 REF_NOVEL = "novel"
@@ -214,7 +214,8 @@ SYSTEM_PROMPT = (
     "alias=another name the source explicitly gives the same character, voice=an explicit voice, manner of speech or personality trait, "
     "power=an explicit ability or power (one row per power). "
     "Report every distinct explicit trait of every character; several rows for one character and category are expected when the source states several. "
-    "Skip what the source does not state outright: no transient action, no speech, no inference. Do not repeat a trait twice. "
+    "Before emitting EACH row, compare its normalised (subject name, category, value) to every row already emitted. If it is the same trait, OMIT it even if another paragraph also contains it: emit one row using its earliest paragraph id. Do not loop or repeat a trait under different paragraph ids. "
+    "Return compact MINIFIED JSON: no indentation or explanatory text. Skip what the source does not state outright: no transient action, no speech, no inference. Do not repeat a trait twice. "
     "An 'Already established' section may list characters and traits already cited: do not repeat those traits, and use the "
     "listed [id] as `subject.ref` for those characters. It is only a de-duplication aid. Read every paragraph: still report "
     "every new trait of a known character, every character that is not listed (`ref` = novel), and any fact whose subject is "
@@ -305,7 +306,11 @@ def delta_schema(paragraph_ids: Sequence[str], shown_ids: Sequence[str]) -> dict
             "paragraph_id": {"type": "string", "enum": list(paragraph_ids)},
         },
     }
-    facts: dict = {"type": "array", "items": item}
+    facts: dict = {
+        "type": "array",
+        "description": "Each distinct normalised (subject name, category, value) appears at most once; use its earliest supporting paragraph id.",
+        "items": item,
+    }
     if not paragraph_ids:
         facts = {"type": "array", "maxItems": 0}
     return {

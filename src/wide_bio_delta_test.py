@@ -165,6 +165,7 @@ def test_schema_is_per_chunk_and_short(world) -> None:
         "voice",
         "power",
     }
+    assert "at most once" in schema["properties"]["facts"]["description"]
     assert delta_schema([], [])["properties"]["facts"]["maxItems"] == 0
 
 
@@ -1432,8 +1433,9 @@ def test_unknown_subject_stays_ambiguous_pending_and_is_never_forced_to_an_actor
 
 def test_plan_fingerprint_changes_and_old_runs_stay_incompatible(world) -> None:
     root, _, config, chapters, count, _seed, plan, *_ = world
-    assert DELTA_VERSION == 2 and plan.artifact["delta_version"] == 2
+    assert DELTA_VERSION == 3 and plan.artifact["delta_version"] == 3
     assert VALUE_MAX <= 100 and "SHORTEST" in SYSTEM_PROMPT
+    assert "earliest paragraph id" in SYSTEM_PROMPT and "MINIFIED JSON" in SYSTEM_PROMPT
     assert plan.artifact["compact_contract_sha256"]
     out = root / "old-run"
     out.mkdir()

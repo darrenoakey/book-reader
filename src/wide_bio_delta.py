@@ -959,7 +959,10 @@ class DeltaRun:
             return False
         if not self.adaptive:
             return len(self.attempts[chunk.id]) < self.plan.settings.max_attempts
-        return self.length_proven(chunk)
+        # A bounded parent may contain only a hash-chained prefix.  Untouched
+        # chunks receive their one base-cap first attempt; only a saved,
+        # raw-proven base-cap length response earns the one larger retry.
+        return not self.attempts[chunk.id] or self.length_proven(chunk)
 
     # replay ---------------------------------------------------------
     def replay(self) -> None:
@@ -1497,11 +1500,20 @@ def adopt_parent(
         raise ContractError(
             "parent journal is not JSON", "adaptive_parent_invalid"
         ) from error
-    if sorted(item["chunk_id"] for item in records) != sorted(
-        chunk.id for chunk in plan.chunks
-    ) or any(item["attempt"] != 1 for item in records):
+    known_chunk_ids = {chunk.id for chunk in plan.chunks}
+    if not records or any(not isinstance(item, dict) for item in records):
         raise ContractError(
-            "parent must hold exactly one first attempt for every chunk",
+            "parent must hold unique first attempts for known chunks only",
+            "adaptive_parent_invalid",
+        )
+    parent_chunk_ids = [item.get("chunk_id") for item in records]
+    if (
+        any(chunk_id not in known_chunk_ids for chunk_id in parent_chunk_ids)
+        or len(set(parent_chunk_ids)) != len(parent_chunk_ids)
+        or any(item.get("attempt") != 1 for item in records)
+    ): 
+        raise ContractError(
+            "parent must hold unique first attempts for known chunks only",
             "adaptive_parent_invalid",
         )
     copies: list[tuple[Path, bytes]] = []

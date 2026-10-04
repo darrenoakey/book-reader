@@ -845,6 +845,28 @@ def adaptive_args(base, parent, out, *extra):
     return ["adaptive", *base, "--from-out", str(parent), "--out", str(out), *extra]
 
 
+def test_adaptive_partial_parent_reuses_saved_rows_retries_length_and_continues_missing(
+    parent_run, capsys
+) -> None:
+    root, config, base, parent = parent_run
+    partial = root / "partial-parent"
+    before = tree(parent)
+    shutil.copytree(parent, partial)
+    records = (partial / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+    # A real bounded pass has only a valid hash-chain prefix, not invented records
+    # for the source chunks it has not reached yet.
+    (partial / "journal.jsonl").write_text("\n".join(records[:2]) + "\n", encoding="utf-8")
+    for suffix in (".response.txt", ".meta.json"):
+        (partial / "raw" / f"k0002.a1{suffix}").unlink()
+    calls: list = []
+    assert main(
+        adaptive_args(base, partial, root / "adaptive", "--execute"),
+        adaptive_transport(config, calls, stop_reply),
+    ) == 0
+    assert calls == [("k0001", 8192), ("k0002", config.output_tokens)]
+    assert tree(parent) == before
+
+
 def test_adaptive_offline_reuses_parent_without_calls_or_mutation(
     parent_run, capsys
 ) -> None:

@@ -198,8 +198,16 @@ def strip_think(text: str) -> str:
 # request payload
 # rebuild from the selected backend on every retry so model/style/context never leak from a previous route.
 def request_for(
-    backend: Backend, messages: list[dict], temperature: float, max_tokens: int, response_schema: dict | None
+    backend: Backend,
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+    response_schema: dict | None,
+    seed: int | None = None,
 ) -> tuple[str, bytes]:
+    if seed is not None and backend.style != "openai":
+        # only the OpenAI-compatible TensorFold request carries a verified top-level `seed`; never guess for another style.
+        raise ValueError("a request seed is supported only for the openai backend style")
     if backend.style == "ollama":
         request: dict = {
             "model": backend.model,
@@ -225,6 +233,8 @@ def request_for(
             "type": "json_schema",
             "json_schema": {"name": "response", "strict": True, "schema": response_schema},
         }
+    if seed is not None:
+        request["seed"] = seed
     openai_base = backend.url.rstrip("/")
     endpoint = (
         f"{openai_base}/chat/completions"

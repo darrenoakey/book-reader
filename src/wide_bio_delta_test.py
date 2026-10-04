@@ -31,6 +31,7 @@ from src.wide_bio_delta import (
     delta_schema,
     main,
     pinned_seed,
+    prepare,
     reconstruct_quote,
     run_delta,
     validate_delta_response,
@@ -1460,3 +1461,216 @@ def test_plan_fingerprint_changes_and_old_runs_stay_incompatible(world) -> None:
             registry=REGISTRY,
             aliases=ALIASES,
         )
+
+
+# ##################################################################
+# caretaker sampling proof: sampled plan fingerprint + one-chunk run
+# TensorFold's OpenAI endpoint takes top-level `temperature` and `seed` (verified in its request_options); the whitespace grammar bound is a server constant with no request field, so nothing is sent for it.
+@pytest.fixture
+def sampled(world):
+    root, _, _, _, _, _, _, project, source, digest = world
+    config_path = make_config(root, digest, llm={"primary_style": "openai"})
+    config = load_proof_config(config_path)
+    return root, config_path, config, project, source
+
+
+def sampling_args(sampled, out, *extra):
+    _root, config_path, _, project, source = sampled
+    return [
+        str(project),
+        "--source",
+        str(source),
+        "--config",
+        str(config_path),
+        "--out",
+        str(out),
+        "--target-tokens",
+        "1",
+        "--sampling-temperature",
+        "0.15",
+        "--sampling-seed",
+        "1729",
+        *extra,
+    ]
+
+
+def source_tree(path: Path) -> dict:
+    return {
+        str(item.relative_to(path)): item.read_bytes()
+        for item in sorted(path.rglob("*"))
+        if item.is_file()
+    }
+
+
+def test_sampling_changes_fingerprint_and_is_sent_only_where_openai_supports_it(
+    world, sampled
+) -> None:
+    _, _, _, chapters, count, _seed, plan, *_ = world
+    _, _, config, *_ = sampled
+    sampled_plan = build_delta_plan(
+        TEXT, chapters, config, count, DeltaSettings(1, 512, 1, 0.15, 1729), 0, "seed"
+    )
+    plain_openai = build_delta_plan(
+        TEXT, chapters, config, count, DeltaSettings(1, 512, 1), 0, "seed"
+    )
+    assert sampled_plan.artifact["sampling"] == {"temperature": 0.15, "seed": 1729}
+    assert "sampling" not in plain_openai.artifact
+    assert plain_openai.artifact["plan_sha256"] == plan.artifact["plan_sha256"]
+    assert (
+        sampled_plan.artifact["plan_sha256"] != plain_openai.artifact["plan_sha256"]
+    )
+    state = Established()
+    sent = prepare(config, sampled_plan, sampled_plan.chunks[0], state, count)
+    body = json.loads(sent.payload)
+    assert body["temperature"] == 0.15 and body["seed"] == 1729
+    assert sent.url.endswith("/v1/chat/completions")
+    assert not {"format", "options", "top_p", "top_k"} & body.keys()
+    unsampled = json.loads(
+        prepare(config, plain_openai, plain_openai.chunks[0], state, count).payload
+    )
+    assert unsampled["temperature"] == 0.0 and "seed" not in unsampled
+    # an ollama-style primary has no verified seed field: refused, never silently dropped
+    _, _, ollama_config, *_ = world
+    with pytest.raises(ContractError, match="openai-style"):
+        build_delta_plan(
+            TEXT,
+            chapters,
+            ollama_config,
+            count,
+            DeltaSettings(1, 512, 1, 0.15, 1729),
+            0,
+            "seed",
+        )
+    for bad in ((0.15, None), (None, 1729), (0.0, 1), (3.0, 1), (0.15, True)):
+        with pytest.raises(ContractError):
+            DeltaSettings(1, 512, 1, *bad)
+
+
+def test_only_chunk_sends_exactly_the_selected_chunk_with_temperature_and_seed(
+    sampled, capsys: pytest.CaptureFixture
+) -> None:
+    root, _, config, *_ = sampled
+    out = root / "proof"
+    sent = []
+
+    def transport(url: str, payload: bytes, timeout: float) -> dict:
+        sent.append((url, json.loads(payload)))
+        return {
+            "model": config.backend.model,
+            "done_reason": "stop",
+            "prompt_eval_count": 7,
+            "eval_count": 3,
+            "content": json.dumps(
+                {"facts": [fact("Ren", "ren", "look", "a red cloak", "000001")]}
+            ),
+        }
+
+    cal = root / "cal.json"
+    cal.write_text(json.dumps(calibration(config, config.tokenizer_sha256)))
+    argv = [
+        "run",
+        *sampling_args(sampled, out, "--calibration", str(cal), "--execute"),
+        "--only-chunk",
+        "k0001",
+    ]
+    assert main(argv, transport) == 3
+    summary = json.loads(capsys.readouterr().out)
+    assert len(sent) == 1
+    _url, body = sent[0]
+    assert body["temperature"] == 0.15 and body["seed"] == 1729
+    assert "Excerpt k0001" in body["messages"][1]["content"]
+    assert "Excerpt k0000" not in body["messages"][1]["content"]
+    assert summary["state"] == "not_ready" and summary["reason"] == "only_chunk_proof"
+    assert summary["only_chunk"] == "k0001" and summary["calls_total"] == 1
+    assert summary["chunk_status"] == {"missing": 2, "ready": 1}
+    assert summary["chunks"] == 3 and summary["source_fraction"] < 1.0
+    plan = json.loads((out / "plan.json").read_text())
+    assert len(plan["chunks"]) == 3 and plan["sampling"]["seed"] == 1729
+    assert plan["plan_sha256"] == summary["plan_sha256"]
+    results = json.loads((out / "chunk_results.json").read_text())
+    assert [item["status"] for item in results] == ["missing", "ready", "missing"]
+
+
+def test_only_chunk_refuses_invalid_id_nonfresh_out_and_sends_nothing(
+    sampled, capsys: pytest.CaptureFixture
+) -> None:
+    root, _, config, project, _source = sampled
+    sent = []
+
+    def transport(url: str, payload: bytes, timeout: float) -> dict:
+        sent.append(payload)
+        raise AssertionError("no provider call may happen on a refusal")
+
+    cal = root / "cal.json"
+    cal.write_text(json.dumps(calibration(config, config.tokenizer_sha256)))
+
+    def go(out, chunk):
+        return main(
+            [
+                "run",
+                *sampling_args(sampled, out, "--calibration", str(cal), "--execute"),
+                "--only-chunk",
+                chunk,
+            ],
+            transport,
+        )
+
+    for bad in ("k0009", "0001", "", "K0001"):
+        assert go(root / f"bad-{bad or 'empty'}", bad) == 2
+        assert "only_chunk_invalid" in capsys.readouterr().err
+    assert not sent
+    # a directory that already holds a journal is not new
+    used = root / "used"
+    used.mkdir()
+    (used / "journal.jsonl").write_text("")
+    before = source_tree(used)
+    assert go(used, "k0001") == 2
+    assert "only_chunk_output_not_new" in capsys.readouterr().err
+    after = source_tree(used)
+    assert after["journal.jsonl"] == before["journal.jsonl"] == b""
+    assert set(after) <= {"journal.jsonl", "seed.json", "run.pid", "run.exit"}
+    # output inside the book project is refused as before
+    assert go(project / "inside", "k0001") == 2
+    assert "output_inside_project" in capsys.readouterr().err
+    assert not sent
+
+
+def test_only_chunk_leaves_full_plan_and_source_integrity_unchanged(
+    sampled, capsys: pytest.CaptureFixture
+) -> None:
+    root, _, config, project, source = sampled
+    source_before, project_before = source.read_bytes(), source_tree(project)
+    full = root / "full-plan"
+    assert main(["plan", *sampling_args(sampled, full)]) == 0
+    full_plan = json.loads(capsys.readouterr().out)
+    out = root / "one"
+    cal = root / "cal.json"
+    cal.write_text(json.dumps(calibration(config, config.tokenizer_sha256)))
+
+    def transport(url: str, payload: bytes, timeout: float) -> dict:
+        return {
+            "model": config.backend.model,
+            "done_reason": "stop",
+            "prompt_eval_count": 7,
+            "eval_count": 3,
+            "content": json.dumps({"facts": []}),
+        }
+
+    assert (
+        main(
+            [
+                "run",
+                *sampling_args(sampled, out, "--calibration", str(cal), "--execute"),
+                "--only-chunk",
+                "k0002",
+            ],
+            transport,
+        )
+        == 3
+    )
+    capsys.readouterr()
+    one_plan = json.loads((out / "plan.json").read_text())
+    full_plan_file = json.loads((full / "plan.json").read_text())
+    assert one_plan == full_plan_file and one_plan["plan_sha256"] == full_plan["plan_sha256"]
+    assert source.read_bytes() == source_before == TEXT.encode()
+    assert source_tree(project) == project_before

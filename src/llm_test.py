@@ -202,3 +202,17 @@ def test_openai_usage_populates_call_telemetry(capsys: pytest.CaptureFixture[str
     emit_call_telemetry(backend, {"prompt_eval_count": 3, "eval_count": 4}, [], b"{}", 1, "", 1, 1, None)
     call = json.loads(capsys.readouterr().out)
     assert call["prompt_eval_count"] == 3 and call["eval_count"] == 4
+
+
+# ##################################################################
+# test openai seed field
+# a request seed exists only on the openai (TensorFold) payload as the top-level `seed`; ollama refuses it rather than guessing.
+def test_openai_payload_carries_seed_and_ollama_refuses_it() -> None:
+    openai = Backend("http://10.0.0.42:11436/v1", "10.0.0.42", "qwen3.6:35b-a3b", "openai", 262144, False)
+    messages = [{"role": "user", "content": "hello"}]
+    _, payload = request_for(openai, messages, 0.15, 64, None, 1729)
+    body = json.loads(payload)
+    assert body["seed"] == 1729 and body["temperature"] == 0.15
+    assert "seed" not in json.loads(request_for(openai, messages, 0.0, 64, None)[1])
+    with pytest.raises(ValueError, match="openai"):
+        request_for(BACKUP, messages, 0.15, 64, None, 1729)

@@ -329,6 +329,8 @@ class DeltaSettings:
     target_tokens: int
     delta_tokens: int = 1024
     max_attempts: int = 1
+    temperature: float | None = None
+    seed: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("target_tokens", "delta_tokens", "max_attempts"):
@@ -337,6 +339,32 @@ class DeltaSettings:
                 raise ContractError(
                     f"{name} must be a positive integer", "settings_invalid"
                 )
+        if (self.temperature is None) != (self.seed is None):
+            raise ContractError(
+                "sampling needs both a temperature and a seed (or neither)",
+                "sampling_invalid",
+            )
+        if self.temperature is not None:
+            # TensorFold treats temperature <= 0 as greedy and ignores the seed, so a sampled proof needs a positive temperature.
+            if (
+                isinstance(self.temperature, bool)
+                or not isinstance(self.temperature, (int, float))
+                or not 0.0 < self.temperature <= 2.0
+            ):
+                raise ContractError(
+                    "sampling temperature must be a number in (0, 2]",
+                    "sampling_invalid",
+                )
+            if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+                raise ContractError(
+                    "sampling seed must be an integer", "sampling_invalid"
+                )
+
+    @property
+    def sampling(self) -> dict | None:
+        if self.temperature is None:
+            return None
+        return {"temperature": float(self.temperature), "seed": self.seed}
 
 
 # ##################################################################
@@ -807,6 +835,11 @@ def build_delta_plan(
             f"fixed overhead must be an integer in 0..{MAX_FIXED_OVERHEAD_TOKENS}",
             "overhead_invalid",
         )
+    if settings.sampling is not None and config.backend.style != "openai":
+        raise ContractError(
+            "sampling temperature/seed are sent only to an openai-style (TensorFold) backend",
+            "sampling_unsupported",
+        )
     chunks, coverage = pack_by_tokens(source, chapters, count, settings.target_tokens)
     system_tokens = count(SYSTEM_PROMPT)
     entries, over = [], []
@@ -870,6 +903,9 @@ def build_delta_plan(
         "coverage": coverage,
         "chunks": entries,
     }
+    if settings.sampling is not None:
+        # present only when configured, so every unsampled plan keeps its existing fingerprint
+        artifact["sampling"] = settings.sampling
     artifact["plan_sha256"] = sha256_text(canonical_json(artifact))
     return DeltaPlan(source, tuple(chunks), settings, fixed_overhead, artifact)
 
@@ -969,9 +1005,10 @@ def prepare(
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user},
         ],
-        0.0,
+        plan.settings.temperature or 0.0,
         output_tokens or config.output_tokens,
         schema,
+        plan.settings.seed,
     )
     return Prepared(
         url,
@@ -1057,6 +1094,7 @@ class DeltaRun:
         self.attempts: dict[str, list[dict]] = {chunk.id: [] for chunk in plan.chunks}
         self.ready: dict[str, dict] = {}
         self.calls_this_invocation = 0
+        self.only_chunk: str | None = None
 
     # adaptive output policy ------------------------------------------
     @property
@@ -1410,6 +1448,7 @@ class DeltaRun:
             reason = (
                 error
                 or stop
+                or ("only_chunk_proof" if self.only_chunk else None)
                 or (
                     "output_length_exhausted"
                     if self.length_exhausted()
@@ -1439,7 +1478,7 @@ class DeltaRun:
             "calls_this_invocation": self.calls_this_invocation,
             "elapsed_s_this_invocation": round(elapsed_s, 3),
             "cast_status": "pending: nothing is merged into any registry or cast",
-        }
+        } | ({"only_chunk": self.only_chunk} if self.only_chunk else {})
 
     def call_budget(self, soft_s: float, hard_s: float) -> dict:
         settings = self.plan.settings
@@ -1761,6 +1800,48 @@ def ensure_plan_file(plan: DeltaPlan, out_dir: Path) -> None:
 
 
 # ##################################################################
+# only chunk
+# a caretaker sampling proof sends exactly one chunk of the FULL source plan. Every other chunk stays `missing`, so the run can never be ready and nothing here can count as coverage. Refusals happen before the output directory is touched.
+FRESH_FORBIDDEN = ("journal.jsonl", "raw", "summary.json", "claims.jsonl")
+
+
+def check_only_chunk(
+    chunk_id: str,
+    config: ProofConfig,
+    plan: DeltaPlan,
+    out_dir: Path,
+    count: Counter,
+    registry: dict | None,
+    aliases: dict | None,
+) -> None:
+    by_id = {chunk.id: chunk for chunk in plan.chunks}
+    if not plan.chunks or chunk_id not in by_id:
+        raise ContractError(
+            f"--only-chunk {chunk_id!r} is not a chunk of this plan ({len(plan.chunks)} chunks)",
+            "only_chunk_invalid",
+        )
+    used = [name for name in FRESH_FORBIDDEN if (out_dir / name).exists()]
+    if used:
+        raise ContractError(
+            f"--only-chunk needs a new output directory; {out_dir} already holds {used}",
+            "only_chunk_output_not_new",
+        )
+    state = Established()
+    state.seed(registry or {}, aliases or {})
+    try:
+        prepared = prepare(config, plan, by_id[chunk_id], state, count)
+    except TokenizerRefusal as error:
+        raise ContractError(
+            f"chunk {chunk_id} cannot be counted: {error}", "only_chunk_incompatible"
+        ) from error
+    if prepared.padded_tokens > config.input_budget:
+        raise ContractError(
+            f"chunk {chunk_id} needs {prepared.padded_tokens} tokens, over the input budget {config.input_budget}",
+            "only_chunk_incompatible",
+        )
+
+
+# ##################################################################
 # run delta
 # replays the journal, then asks for each chunk still missing, in order, never re-asking a ready or saved chunk, never more than `max_attempts` attempts per chunk, and never starting a request after the soft deadline. The hard deadline is a real wall-clock cut-off per request. Whatever happens (deadline, transport error, refusal, any exception) `summary.json` is rewritten as `not_ready` with its reason before control leaves. With transport=None nothing is sent (offline validation).
 def run_delta(
@@ -1777,8 +1858,13 @@ def run_delta(
     cast: CastIndex | None = None,
     registry: dict | None = None,
     aliases: dict | None = None,
+    only_chunk: str | None = None,
 ) -> dict:
     check_output_dir(out_dir, chapters)
+    if only_chunk is not None:
+        check_only_chunk(
+            only_chunk, config, plan, out_dir, count, registry, aliases
+        )
     if transport is not None:
         measured = validate_calibration(calibration or {}, config)
         if measured["fixed_overhead_tokens"] != plan.fixed_overhead:
@@ -1796,6 +1882,7 @@ def run_delta(
     with run_lock(out_dir):
         ensure_plan_file(plan, out_dir)
         run = DeltaRun(chapters, config, plan, out_dir, count, cast, registry, aliases)
+        run.only_chunk = only_chunk
         started = clock()
         run.replay()
         stop: str | None = None
@@ -1805,7 +1892,7 @@ def run_delta(
         )
         try:
             for chunk in plan.chunks:
-                if not run.wants(chunk):
+                if not run.wants(chunk) or (only_chunk and chunk.id != only_chunk):
                     continue
                 stop = run.process(chunk, transport, clock, started, soft_s, hard_s)
                 write_atomic(
@@ -2443,8 +2530,26 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
         item.add_argument(
             "--calibration", type=Path, default=None, required=name == "run"
         )
+        if name != "prepare-cast":
+            item.add_argument(
+                "--sampling-temperature",
+                type=float,
+                default=None,
+                help="explicit request temperature (> 0), part of the plan fingerprint; needs --sampling-seed and an openai-style primary",
+            )
+            item.add_argument(
+                "--sampling-seed",
+                type=int,
+                default=None,
+                help="explicit request seed, part of the plan fingerprint; needs --sampling-temperature",
+            )
     sub.choices["run"].add_argument(
         "--execute", action="store_true", help="required: sends requests to the primary"
+    )
+    sub.choices["run"].add_argument(
+        "--only-chunk",
+        default=None,
+        help="caretaker sampling proof: send only this chunk id (e.g. k0003) of the full plan into a NEW --out; every other chunk stays missing, so the run is never ready",
     )
     ad = sub.add_parser(
         "adaptive",
@@ -2503,6 +2608,8 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
             args.target_tokens,
             args.delta_tokens,
             getattr(args, "max_attempts", 1),
+            getattr(args, "sampling_temperature", None),
+            getattr(args, "sampling_seed", None),
         )
         if args.command == "adaptive":
             return adaptive_command(args, settings, transport)
@@ -2619,6 +2726,7 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
             args.hard_deadline_s,
             registry=seed["registry"],
             aliases=seed["aliases"],
+            only_chunk=getattr(args, "only_chunk", None),
         )
         code = 0 if summary["state"] == "ready" else 3
         if exit_file is not None:

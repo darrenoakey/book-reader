@@ -429,7 +429,7 @@ class DeltaSettings:
             profile = self.provider_grammar_profile
             if (
                 not isinstance(profile, str)
-                or not re.fullmatch(r"[a-z0-9][a-z0-9._:-]{2,200}", profile)
+                or not re.fullmatch(r"[a-z0-9][a-z0-9._:+-]{2,200}", profile)
             ):
                 raise ContractError(
                     "provider grammar profile must be a stable lowercase descriptor",

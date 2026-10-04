@@ -347,7 +347,7 @@ def test_recover_offline_resumes_and_union_needs_every_chunk(world) -> None:
     sealed(world)
     ctx = world.ctx_from_seal()
     not_ready = verify_union(ctx, world.work)
-    assert not_ready["state"] == "not_ready" and not_ready["freeze_allowed"] is False
+    assert not_ready["state"] == "not_ready" and not_ready["source_coverage_ready"] is False and not_ready["freeze_allowed"] is False
     assert not_ready["blockers"] == ["k0001", "k0002"] and not_ready["verified_chunks"] == 1
     world.write_recovery(ctx, ["k0001"])
     state = recover(ctx, world.work, None)
@@ -357,7 +357,7 @@ def test_recover_offline_resumes_and_union_needs_every_chunk(world) -> None:
     assert partial["by_disposition"] == {"not_ready:missing": 1, "verified_new_accepted": 1, "verified_old_ready": 1}
     world.write_recovery(ctx, ["k0002"])
     full = verify_union(ctx, world.work)
-    assert full["state"] == "ready" and full["verified_chunks"] == 3 and full["blockers"] == []
+    assert full["state"] == "source_coverage_ready" and full["source_coverage_ready"] is True and full["full_candidate_accounting"].startswith("not_verified") and full["candidates"]["pending"] >= 0 and full["verified_chunks"] == 3 and full["blockers"] == []
     assert full["source"]["tiled_exactly_once"] and full["source"]["verified_chars"] == len(TEXT)
     rows = {row["id"]: row for row in full["rows"]}
     assert rows["k0000"]["provenance"]["profile"] == OLD_PROFILE and rows["k0001"]["provenance"]["profile"] == NEW_PROFILE
@@ -414,3 +414,20 @@ def test_command_line_seal_plan_verify_are_offline(world, capsys) -> None:
     assert main(["recover", *common, "--execute"]) == 2  # --execute needs a calibration; refused before any request
     shutil.rmtree(world.work / "seal" / "snapshot" / "raw")
     assert main(["verify", *common]) == 2
+
+
+def test_no_retry_knob_and_attempts_are_exactly_one(world, capsys) -> None:
+    import inspect
+
+    sealed(world)
+    assert "max_attempts" not in inspect.signature(recover).parameters
+    common = [str(world.project), "--source", str(world.source), "--config", str(world.config_path), "--workdir", str(world.work), "--expect-source-sha256", SOURCE_SHA, "--expect-base-plan-sha256", world.base_plan_sha]
+    with pytest.raises(SystemExit):
+        main(["recover", *common, "--max-attempts", "2"])
+    ctx = world.ctx_from_seal()
+    from dataclasses import replace
+
+    loose = replace(ctx, new_plan=replace(ctx.new_plan, settings=replace(ctx.new_plan.settings, max_attempts=2)))
+    with pytest.raises(ContractError) as error:
+        recover(loose, world.work, None)
+    assert error.value.code == "attempts_not_one"

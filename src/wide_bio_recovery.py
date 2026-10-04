@@ -531,9 +531,10 @@ def recover(
     soft_s: float = SOFT_DEADLINE_S,
     hard_s: float = HARD_DEADLINE_S,
     clock: Callable[[], float] = time.monotonic,
-    max_attempts: int = 1,
 ) -> dict:
-    """Resume the recovery journal.  With transport=None nothing is sent (offline replay)."""
+    """Resume the recovery journal.  With transport=None nothing is sent (offline replay).  Exactly one attempt per target chunk: the attempt bound is not in the plan fingerprint, so no retry knob exists until a fingerprinted retry design does."""
+    if ctx.new_plan.settings.max_attempts != 1:
+        refuse("recovery allows exactly one attempt per chunk", "attempts_not_one")
     manifest, old = verify_seal(ctx, workdir)
     unresolved = [item["id"] for item in manifest["chunks"] if item["disposition"] == OLD_UNRESOLVED]
     if unresolved:
@@ -546,15 +547,6 @@ def recover(
     plan = build_recovery_plan(ctx, manifest, old)
     out = recovery_dir(workdir)
     check_output_dir(out, list(ctx.chapters))
-    new_plan = DeltaPlan(
-        ctx.new_plan.source,
-        ctx.new_plan.chunks,
-        DeltaSettings(*[getattr(ctx.new_plan.settings, name) for name in ("target_tokens", "delta_tokens")], max_attempts, *[getattr(ctx.new_plan.settings, name) for name in ("temperature", "seed", "provider_grammar_profile", "compact_wire", "presence_penalty")]),
-        ctx.new_plan.fixed_overhead,
-        ctx.new_plan.artifact,
-    )
-    ctx = Context(ctx.config, ctx.chapters, ctx.source, ctx.source_sha256, ctx.count, ctx.stored_plan, ctx.seed, ctx.old_plan, new_plan)
-
     def guarded(url: str, payload: bytes, timeout: float) -> dict:
         check_request_contract(ctx, payload)
         return transport(url, payload, timeout)
@@ -636,7 +628,9 @@ def verify_union(ctx: Context, workdir: Path) -> dict:
     for item in pending_all:
         reasons[item["pending_reason"]] = reasons.get(item["pending_reason"], 0) + 1
     return {
-        "state": "ready" if ready else "not_ready",
+        "state": "source_coverage_ready" if ready else "not_ready",
+        "source_coverage_ready": ready,
+        "full_candidate_accounting": "not_verified: counts/hashes only; the owner's existing candidate-accounting and reconcile gates must still run on the applied claims before any freeze",
         "blockers": blockers,
         "chunks": len(rows),
         "verified_chunks": sum(1 for row in rows if row["verified"]),
@@ -645,7 +639,7 @@ def verify_union(ctx: Context, workdir: Path) -> dict:
         "candidates": {"claims": len(claims_all), "pending": len(pending_all), "pending_reasons": reasons, "duplicate_claim_ids": duplicate_ids, "claims_sha256": sha_json(ids), "pending_sha256": sha_json([item["pending_id"] for item in pending_all])},
         "seal_manifest_sha256": manifest["manifest_sha256"],
         "new_plan_sha256": ctx.new_plan.artifact["plan_sha256"],
-        "cast_status": "never frozen or applied by this module; every pending identity remains a freeze blocker",
+        "cast_status": "never frozen or applied by this module; pending rows remain freeze blockers and owner integration is never an automatic apply",
         "freeze_allowed": False,
         "rows": rows,
     }
@@ -691,7 +685,6 @@ def main(argv: Sequence[str] | None = None, transport: Transport = chat_transpor
     rec = sub.add_parser("recover")
     add_common(rec, False)
     rec.add_argument("--calibration", type=Path, default=None)
-    rec.add_argument("--max-attempts", type=int, default=1)
     rec.add_argument("--soft-deadline-s", type=float, default=SOFT_DEADLINE_S)
     rec.add_argument("--hard-deadline-s", type=float, default=HARD_DEADLINE_S)
     rec.add_argument("--execute", action="store_true", help="the only flag that can send requests; never used by the module's own tests")
@@ -713,14 +706,14 @@ def main(argv: Sequence[str] | None = None, transport: Transport = chat_transpor
             result = verify_union(ctx, workdir)
             write_atomic(workdir / "union_verification.json", json.dumps(result, indent=1, sort_keys=True))
             print(json.dumps({key: value for key, value in result.items() if key != "rows"}, sort_keys=True))
-            return 0 if result["state"] == "ready" else 3
+            return 0 if result["source_coverage_ready"] else 3
         calibration = models = None
         if args.execute:
             if args.calibration is None:
                 refuse("--execute needs --calibration", "calibration_invalid")
             calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
             models = fetch_models(ctx.config)
-        state = recover(ctx, workdir, transport if args.execute else None, calibration, models, args.soft_deadline_s, args.hard_deadline_s, max_attempts=args.max_attempts)
+        state = recover(ctx, workdir, transport if args.execute else None, calibration, models, args.soft_deadline_s, args.hard_deadline_s)
         print(json.dumps(state, sort_keys=True))
         return 0 if set(state["target_status"].values()) <= {"ready"} else 3
     except (ContractError, TokenizerRefusal) as error:

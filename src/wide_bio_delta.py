@@ -239,6 +239,15 @@ SYSTEM_PROMPT = (
 )
 
 
+def prompt_for_wire(compact_wire: bool) -> str:
+    if not compact_wire:
+        return SYSTEM_PROMPT
+    return (
+        SYSTEM_PROMPT
+        + " COMPACT WIRE FORMAT: each fact uses exactly s=subject name, r=subject ref, k=category, v=literal value, p=paragraph id; do not emit subject/category/value/paragraph_id keys."
+    )
+
+
 # ##################################################################
 # text helpers
 # exact, deterministic normalisation shared by validation and replay.
@@ -307,8 +316,24 @@ def whole_word(needle: str, text: str) -> bool:
 # ##################################################################
 # per-chunk schema
 # every request constrains `paragraph_id` to that chunk's exact paragraph ids and `subject_ref` to novel, ambiguous and the established ids actually shown in that prompt; short quote/value lengths are part of the schema.
-def delta_schema(paragraph_ids: Sequence[str], shown_ids: Sequence[str]) -> dict:
-    item = {
+def delta_schema(
+    paragraph_ids: Sequence[str], shown_ids: Sequence[str], compact_wire: bool = False
+) -> dict:
+    if compact_wire:
+        item = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["s", "r", "k", "v", "p"],
+            "properties": {
+                "s": {"type": "string", "minLength": 1, "maxLength": 80, "description": "subject name"},
+                "r": {"type": "string", "enum": [REF_NOVEL, REF_AMBIGUOUS, *shown_ids], "description": "subject reference"},
+                "k": {"type": "string", "enum": list(CATEGORIES), "description": "category: voice=persistent acoustic quality; personality=enduring disposition; education=schooling/examination history; power=named supernatural/cultivation/beast/innate capability; role=occupation/rank/status."},
+                "v": {"type": "string", "minLength": 1, "maxLength": VALUE_MAX, "description": "literal value"},
+                "p": {"type": "string", "enum": list(paragraph_ids), "description": "paragraph id"},
+            },
+        }
+    else:
+        item = {
         "type": "object",
         "additionalProperties": False,
         "required": list(FACT_FIELDS),
@@ -360,6 +385,7 @@ class DeltaSettings:
     temperature: float | None = None
     seed: int | None = None
     provider_grammar_profile: str | None = None
+    compact_wire: bool = False
 
     def __post_init__(self) -> None:
         for name in ("target_tokens", "delta_tokens", "max_attempts"):
@@ -388,6 +414,8 @@ class DeltaSettings:
                 raise ContractError(
                     "sampling seed must be an integer", "sampling_invalid"
                 )
+        if not isinstance(self.compact_wire, bool):
+            raise ContractError("compact wire must be a boolean", "settings_invalid")
         if self.provider_grammar_profile is not None:
             profile = self.provider_grammar_profile
             if (
@@ -614,6 +642,7 @@ def validate_delta_response(
     state: Established,
     shown: Sequence[str],
     candidates: dict[str, bool],
+    compact_wire: bool = False,
 ) -> dict:
     result = {
         "chunk_id": chunk.id,
@@ -630,6 +659,18 @@ def validate_delta_response(
     facts = (
         data.get("facts") if isinstance(data, dict) and set(data) == {"facts"} else None
     )
+    if compact_wire and isinstance(facts, list):
+        facts = [
+            {
+                "subject": {"name": fact.get("s"), "ref": fact.get("r")},
+                "category": fact.get("k"),
+                "value": fact.get("v"),
+                "paragraph_id": fact.get("p"),
+            }
+            if isinstance(fact, dict) and set(fact) == {"s", "r", "k", "v", "p"}
+            else {}
+            for fact in facts
+        ]
     if not isinstance(facts, list):
         return {**result, "status": "invalid_shape"}
     by_id = {paragraph.id: paragraph for paragraph in chunk.paragraphs}
@@ -888,7 +929,7 @@ def build_delta_plan(
             "sampling_unsupported",
         )
     chunks, coverage = pack_by_tokens(source, chapters, count, settings.target_tokens)
-    system_tokens = count(SYSTEM_PROMPT)
+    system_tokens = count(prompt_for_wire(settings.compact_wire))
     entries, over = [], []
     for chunk in chunks:
         base = system_tokens + count(render_user(chunk, ""))
@@ -927,7 +968,7 @@ def build_delta_plan(
         "fixed_overhead_tokens": fixed_overhead,
         "input_budget": config.input_budget,
         "tokenizer_capture_sha256": config.tokenizer_sha256,
-        "system_prompt_sha256": sha256_text(SYSTEM_PROMPT),
+        "system_prompt_sha256": sha256_text(prompt_for_wire(settings.compact_wire)),
         "compact_contract_sha256": sha256_text(
             canonical_json(
                 {
@@ -942,7 +983,7 @@ def build_delta_plan(
             )
         ),
         "schema_template_sha256": sha256_text(
-            canonical_json(delta_schema(["p"], ["s"]))
+            canonical_json(delta_schema(["p"], ["s"], settings.compact_wire))
         ),
         "target_tokens": settings.target_tokens,
         "delta_tokens": settings.delta_tokens,
@@ -953,6 +994,8 @@ def build_delta_plan(
     if settings.sampling is not None:
         # present only when configured, so every unsampled plan keeps its existing fingerprint
         artifact["sampling"] = settings.sampling
+    if settings.compact_wire:
+        artifact["wire_format"] = "compact-v1"
     if settings.provider_grammar_profile is not None:
         # The grammar is a server-side decoder contract, not a request field.
         # Its verified descriptor nevertheless changes every response surface,
@@ -1027,6 +1070,7 @@ class Journal:
 class Prepared:
     url: str
     payload: bytes
+    compact_wire: bool
     user: str
     delta: Delta
     schema_sha256: str
@@ -1049,12 +1093,15 @@ def prepare(
 ) -> Prepared:
     delta = build_delta(state, chunk, plan.settings.delta_tokens, count)
     user = render_user(chunk, delta.text)
-    tokens = count(SYSTEM_PROMPT) + count(user)
-    schema = delta_schema([paragraph.id for paragraph in chunk.paragraphs], delta.shown)
+    system = prompt_for_wire(plan.settings.compact_wire)
+    tokens = count(system) + count(user)
+    schema = delta_schema(
+        [paragraph.id for paragraph in chunk.paragraphs], delta.shown, plan.settings.compact_wire
+    )
     url, payload = request_for(
         config.backend,
         [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
         plan.settings.temperature or 0.0,
@@ -1065,6 +1112,7 @@ def prepare(
     return Prepared(
         url,
         payload,
+        plan.settings.compact_wire,
         user,
         delta,
         sha256_text(canonical_json(schema)),
@@ -1305,7 +1353,12 @@ class DeltaRun:
                 "journal_inconsistent",
             )
         validation = validate_delta_response(
-            raw, chunk, self.state, prepared.delta.shown, self.candidates
+            raw,
+            chunk,
+            self.state,
+            prepared.delta.shown,
+            self.candidates,
+            prepared.compact_wire,
         )
         core = self.core(
             chunk,
@@ -2599,6 +2652,11 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
             default=None,
             help="verified server-side JSON grammar descriptor; immutable plan provenance, never sent as a request option",
         )
+        item.add_argument(
+            "--compact-wire",
+            action="store_true",
+            help="use the explicit compact s/r/k/v/p JSON fact wire contract; immutable plan provenance",
+        )
     sub.choices["run"].add_argument(
         "--execute", action="store_true", help="required: sends requests to the primary"
     )
@@ -2667,6 +2725,7 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
             getattr(args, "sampling_temperature", None),
             getattr(args, "sampling_seed", None),
             getattr(args, "provider_grammar_profile", None),
+            getattr(args, "compact_wire", False),
         )
         if args.command == "adaptive":
             return adaptive_command(args, settings, transport)

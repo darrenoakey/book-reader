@@ -1325,6 +1325,37 @@ def reasons(result):
     return [item["pending_reason"] for item in result["pending"]]
 
 
+def test_compact_wire_schema_and_decoder_preserve_canonical_fact_validation(dense) -> None:
+    chunk, state, candidates = dense
+    schema = delta_schema([paragraph.id for paragraph in chunk.paragraphs], [], True)
+    item = schema["properties"]["facts"]["items"]
+    assert item["required"] == ["s", "r", "k", "v", "p"]
+    raw = json.dumps(
+        {"facts": [{"s": "Mira Vale", "r": "novel", "k": "look", "v": "copper hair", "p": "000000"}]}
+    )
+    result = validate_delta_response(raw, chunk, state, [], candidates, True)
+    assert result["status"] == "ok"
+    assert [(claim["subject"], claim["category"], claim["value"]) for claim in result["claims"]] == [
+        ("Mira Vale", "look", "copper hair")
+    ]
+
+
+def test_compact_wire_is_distinct_plan_provenance_and_request_contract(world, sampled) -> None:
+    _, _, _, chapters, count, _seed, *_ = world
+    _, _, config, *_ = sampled
+    plain = build_delta_plan(TEXT, chapters, config, count, DeltaSettings(1, 512, 1), 0, "seed")
+    compact = build_delta_plan(
+        TEXT, chapters, config, count, DeltaSettings(1, 512, 1, None, None, None, True), 0, "seed"
+    )
+    assert compact.artifact["wire_format"] == "compact-v1"
+    assert compact.artifact["plan_sha256"] != plain.artifact["plan_sha256"]
+    body = json.loads(prepare(config, compact, compact.chunks[0], Established(), count).payload)
+    assert set(
+        body["response_format"]["json_schema"]["schema"]["properties"]["facts"]["items"]["properties"]
+    ) == {"s", "r", "k", "v", "p"}
+    assert "COMPACT WIRE FORMAT" in body["messages"][0]["content"]
+
+
 def test_compact_discriminative_json_is_fully_accepted_without_per_category_cap(
     dense,
 ) -> None:

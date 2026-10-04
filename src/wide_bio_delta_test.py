@@ -164,6 +164,7 @@ def test_schema_is_per_chunk_and_short(world) -> None:
         "age",
         "alias",
         "voice",
+        "personality",
         "power",
     }
     assert "at most once" in schema["properties"]["facts"]["description"]
@@ -1332,7 +1333,7 @@ def test_compact_discriminative_json_is_fully_accepted_without_per_category_cap(
         fact("Mira Vale", "novel", "age", "twenty-six years old", "000000"),
         fact("Mira Vale", "novel", "alias", "the Gull Queen", "000004"),
         fact("Mira Vale", "novel", "voice", "a voice like gravel", "000004"),
-        fact("Mira Vale", "novel", "voice", "gruff and patient", "000004"),
+        fact("Mira Vale", "novel", "personality", "gruff and patient", "000004"),
         fact("Tomas", "novel", "kin", "younger brother", "000002"),
         fact("Tomas", "novel", "kin", "half-brother of Ren", "000002"),
         fact("Tomas", "novel", "power", "call lightning", "000002"),
@@ -1435,10 +1436,11 @@ def test_unknown_subject_stays_ambiguous_pending_and_is_never_forced_to_an_actor
 
 def test_plan_fingerprint_changes_and_old_runs_stay_incompatible(world) -> None:
     root, _, config, chapters, count, _seed, plan, *_ = world
-    assert DELTA_VERSION == 4 and plan.artifact["delta_version"] == 4
+    assert DELTA_VERSION == 5 and plan.artifact["delta_version"] == 5
     assert VALUE_MAX <= 100 and "SHORTEST" in SYSTEM_PROMPT
     assert "earliest paragraph id" in SYSTEM_PROMPT and "MINIFIED JSON" in SYSTEM_PROMPT
-    assert "NEVER an explanation" in SYSTEM_PROMPT
+    assert "persistent acoustic/vocal quality" in SYSTEM_PROMPT
+    assert "personality" in SYSTEM_PROMPT
     assert plan.artifact["compact_contract_sha256"]
     out = root / "old-run"
     out.mkdir()

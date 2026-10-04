@@ -77,7 +77,7 @@ from src.wide_bio import (
 )
 from src.wide_bio_tokenizer import TokenizerRefusal
 
-DELTA_VERSION = 4
+DELTA_VERSION = 5
 QUOTE_MAX = 240
 VALUE_MAX = 100
 REF_NOVEL = "novel"
@@ -92,6 +92,7 @@ CATEGORIES = (
     "age",
     "alias",
     "voice",
+    "personality",
     "power",
 )
 # compact-density contract (delta v2). Raw 4096/8192 runs hit the output cap because the model returned long dialogue/action
@@ -106,8 +107,9 @@ VALUE_WORDS_MAX = {
     "beast": 8,
     "age": 8,
     "alias": 6,
-    "voice": 12,
-    "power": 12,
+    "voice": 8,
+    "personality": 8,
+    "power": 10,
 }
 QUOTE_MARKS = '"\u201c\u201d\u00ab\u00bb\u201e'
 # closed-class function words: a subject pronoun or a speech verb marks a clause or an utterance, never a trait phrase
@@ -216,8 +218,10 @@ SYSTEM_PROMPT = (
     f"Categories: {', '.join(CATEGORIES)}. look=physical appearance (one row per distinct feature: hair, eyes, build, clothing worn habitually), "
     "role=an explicit occupation, rank or title only, kin=an explicit named relationship (one row per relative), "
     "beast=an explicit creature or species, gender=explicit gender, age=an explicit age or age change, "
-    "alias=another name the source explicitly gives the same character, voice=a short voice/tone/personality label such as 'a voice like gravel' or 'gruff and patient' (NEVER an explanation of what anyone said), "
-    "power=a short named ability noun phrase such as 'call lightning' (NEVER an action or full clause; one row per power). "
+    "alias=another name the source explicitly gives the same character. voice=ONLY a persistent acoustic/vocal quality (pitch, tone, rasp, cadence or volume), such as 'a voice like gravel' or 'a soft voice'; NEVER what someone said, an explanation, advice, dialogue content, an occupation or a personality. "
+    "personality=an explicitly named enduring disposition such as 'gruff and patient', never a transient action. "
+    "power=ONLY a specific supernatural, cultivation, beast, innate or named-system capability such as 'call lightning' or 'speak with gulls'; NEVER an ordinary action, learned advice, dialogue, explanation or occupation. "
+    "role=ONLY an explicit occupation, formal rank, title or social status; NEVER speech, explaining, advice, or an action. "
     "Report every distinct explicit trait of every character; several rows for one character and category are expected when the source states several. "
     "Before emitting EACH row, compare its normalised (subject name, category, value) to every row already emitted. If it is the same trait, OMIT it even if another paragraph also contains it: emit one row using its earliest paragraph id. Do not loop or repeat a trait under different paragraph ids. "
     "Return compact MINIFIED JSON: no indentation or explanatory text. Skip what the source does not state outright: no transient action, no speech, no inference. Do not repeat a trait twice. "
@@ -310,7 +314,11 @@ def delta_schema(paragraph_ids: Sequence[str], shown_ids: Sequence[str]) -> dict
                     },
                 },
             },
-            "category": {"type": "string", "enum": list(CATEGORIES)},
+            "category": {
+                "type": "string",
+                "enum": list(CATEGORIES),
+                "description": "voice is acoustic quality only; personality is an enduring named disposition; power is a named supernatural/cultivation/beast/innate capability; role is occupation/rank/status only, never speech or action.",
+            },
             "value": {"type": "string", "minLength": 1, "maxLength": VALUE_MAX},
             "paragraph_id": {"type": "string", "enum": list(paragraph_ids)},
         },

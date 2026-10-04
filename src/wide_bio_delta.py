@@ -796,6 +796,8 @@ def prepare(
     chunk: DeltaChunk,
     state: Established,
     count: Counter,
+    output_tokens: int | None = None,
+    extra_overhead: int = 0,
 ) -> Prepared:
     delta = build_delta(state, chunk, plan.settings.delta_tokens, count)
     user = render_user(chunk, delta.text)
@@ -808,7 +810,7 @@ def prepare(
             {"role": "user", "content": user},
         ],
         0.0,
-        config.output_tokens,
+        output_tokens or config.output_tokens,
         schema,
     )
     return Prepared(
@@ -818,7 +820,7 @@ def prepare(
         delta,
         sha256_text(canonical_json(schema)),
         tokens,
-        padded(tokens + plan.fixed_overhead, config.tolerance_percent),
+        padded(tokens + plan.fixed_overhead + extra_overhead, config.tolerance_percent),
     )
 
 
@@ -896,6 +898,69 @@ class DeltaRun:
         self.ready: dict[str, dict] = {}
         self.calls_this_invocation = 0
 
+    # adaptive output policy ------------------------------------------
+    @property
+    def adaptive(self) -> dict | None:
+        return self.plan.artifact.get("adaptive")
+
+    def output_tokens_for(self, attempt: int) -> int:
+        policy = self.adaptive
+        if policy and attempt >= 2:
+            return policy["retry_output_tokens"]
+        return self.config.output_tokens
+
+    def budget_for(self, attempt: int) -> int:
+        return (
+            self.config.backend.num_ctx
+            - self.output_tokens_for(attempt)
+            - self.config.reserve_tokens
+        )
+
+    def prep(self, chunk: DeltaChunk, attempt: int) -> Prepared:
+        policy = self.adaptive
+        return prepare(
+            self.config,
+            self.plan,
+            chunk,
+            self.state,
+            self.count,
+            self.output_tokens_for(attempt),
+            policy["retry_margin_tokens"] if policy and attempt >= 2 else 0,
+        )
+
+    def length_proven(self, chunk: DeltaChunk) -> bool:
+        """True only for a single saved attempt at the base cap whose hashed raw meta says done_reason length with eval_count exactly the cap."""
+        records = self.attempts[chunk.id]
+        if len(records) != 1:
+            return False
+        record = records[0]
+        server = record["server"]
+        return (
+            record["status"] == "truncated"
+            and record["called"]
+            and server.get("model") == self.config.backend.model
+            and server.get("done_reason") == "length"
+            and server.get("eval_count") == self.config.output_tokens
+        )
+
+    def length_exhausted(self) -> list[str]:
+        """Chunks whose retry attempt also hit the length cap: typed pending, never retried, never salvaged."""
+        if not self.adaptive:
+            return []
+        return [
+            chunk.id
+            for chunk in self.plan.chunks
+            if len(self.attempts[chunk.id]) >= 2
+            and self.attempts[chunk.id][-1]["status"] == "truncated"
+        ]
+
+    def wants(self, chunk: DeltaChunk) -> bool:
+        if chunk.id in self.ready:
+            return False
+        if not self.adaptive:
+            return len(self.attempts[chunk.id]) < self.plan.settings.max_attempts
+        return self.length_proven(chunk)
+
     # replay ---------------------------------------------------------
     def replay(self) -> None:
         for record in self.journal.load():
@@ -908,7 +973,7 @@ class DeltaRun:
                 self.verify_without_response(chunk, record)
                 self.attempts[chunk.id].append(record)
                 continue
-            prepared = self.prepare_or_refuse(chunk)
+            prepared = self.prepare_or_refuse(chunk, record["attempt"])
             raw_path, meta_path = self.raw_paths(chunk.id, record["attempt"])
             try:
                 raw, meta_text = (
@@ -940,7 +1005,7 @@ class DeltaRun:
         if record["request_sha256"] is None:
             return
         try:
-            prepared = prepare(self.config, self.plan, chunk, self.state, self.count)
+            prepared = self.prep(chunk, record["attempt"])
         except TokenizerRefusal as error:
             raise ContractError(str(error), "journal_inconsistent") from error
         if prepared.request_sha256 != record["request_sha256"]:
@@ -949,9 +1014,9 @@ class DeltaRun:
                 "journal_inconsistent",
             )
 
-    def prepare_or_refuse(self, chunk: DeltaChunk) -> Prepared:
+    def prepare_or_refuse(self, chunk: DeltaChunk, attempt: int) -> Prepared:
         try:
-            return prepare(self.config, self.plan, chunk, self.state, self.count)
+            return self.prep(chunk, attempt)
         except TokenizerRefusal as error:
             raise ContractError(str(error), "journal_inconsistent") from error
 
@@ -1069,7 +1134,7 @@ class DeltaRun:
         raw_path, meta_path = self.raw_paths(chunk.id, attempt)
         tick = clock()
         try:
-            prepared = prepare(self.config, self.plan, chunk, self.state, self.count)
+            prepared = self.prep(chunk, attempt)
         except TokenizerRefusal as error:
             self.settle_without_response(
                 chunk,
@@ -1092,12 +1157,12 @@ class DeltaRun:
             self.journal.append(core, clock() - tick)
             self.absorb(chunk, core, validation)
             return core["status"] == "fallback_route" and "fallback_route" or None
-        if prepared.padded_tokens > self.config.input_budget:
+        if prepared.padded_tokens > self.budget_for(attempt):
             self.settle_without_response(
                 chunk,
                 "over_budget",
                 prepared,
-                f"{prepared.padded_tokens} > {self.config.input_budget}",
+                f"{prepared.padded_tokens} > {self.budget_for(attempt)}",
                 clock() - tick,
             )
             return None
@@ -1182,7 +1247,11 @@ class DeltaRun:
             reason = (
                 error
                 or stop
-                or ("offline_validation" if offline else "chunks_not_ready")
+                or (
+                    "output_length_exhausted"
+                    if self.length_exhausted()
+                    else ("offline_validation" if offline else "chunks_not_ready")
+                )
             )
         return {
             "plan_sha256": self.plan.artifact["plan_sha256"],
@@ -1202,6 +1271,7 @@ class DeltaRun:
                 name: number for name, number in reasons.items() if number
             },
             "duplicates": sum(len(item["duplicates"]) for item in validations),
+            "length_exhausted": self.length_exhausted(),
             "calls_total": self.calls_total(),
             "calls_this_invocation": self.calls_this_invocation,
             "elapsed_s_this_invocation": round(elapsed_s, 3),
@@ -1222,13 +1292,19 @@ class DeltaRun:
                     "base_prompt_tokens": entry["base_prompt_tokens"],
                     "max_delta_tokens": settings.delta_tokens,
                     "max_padded_prompt_tokens": entry["max_padded_prompt_tokens"],
-                    "max_output_tokens": self.config.output_tokens,
+                    "max_output_tokens": self.output_tokens_for(len(records) + 1)
+                    if self.adaptive
+                    else self.config.output_tokens,
                     "attempts_used": len(records),
                     "calls_used": sum(1 for record in records if record["called"]),
                     "ready": done,
-                    "max_calls_remaining": 0
-                    if done
-                    else max(0, settings.max_attempts - len(records)),
+                    "max_calls_remaining": (
+                        int(self.length_proven(self.by_id[entry["id"]]))
+                        if self.adaptive
+                        else max(0, settings.max_attempts - len(records))
+                    )
+                    if not done
+                    else 0,
                 }
             )
         metas = [
@@ -1241,7 +1317,11 @@ class DeltaRun:
             "plan_sha256": self.plan.artifact["plan_sha256"],
             "chunks": len(per_chunk),
             "max_attempts_per_chunk": settings.max_attempts,
-            "max_model_calls": len(per_chunk) * settings.max_attempts,
+            "max_model_calls": (
+                self.calls_total() + sum(i["max_calls_remaining"] for i in per_chunk)
+                if self.adaptive
+                else len(per_chunk) * settings.max_attempts
+            ),
             "calls_used": self.calls_total(),
             "max_calls_remaining": sum(
                 item["max_calls_remaining"] for item in per_chunk
@@ -1351,6 +1431,135 @@ class DeltaRun:
         }
 
 
+# ##################################################################
+# adaptive output retry
+# A new output directory that REFERENCES a finished base-cap (4096) run without ever writing to it. The parent plan must reproduce byte-for-byte from the current source/config/calibration/seed (source hash, chunk ranges, system prompt, schema template, base user hashes, overhead), the parent journal must be an untorn hash chain with exactly one attempt per chunk, and its journal + raw files are copied verbatim into the new directory, where the normal replay re-judges every saved response against its request/response hashes under identical rebuilt state (any dynamic-state or hash mismatch refuses). Only a chunk whose single attempt is raw-proven `done_reason: length` with eval_count exactly the base cap gets exactly ONE retry at RETRY_OUTPUT_TOKENS; a length at the retry cap stays typed pending (`output_length_exhausted`). No partial JSON is ever salvaged and nothing else is ever re-asked.
+RETRY_OUTPUT_TOKENS = 8192
+RETRY_MARGIN_TOKENS = 16
+
+
+def same_or_absent(path: Path, data: bytes) -> None:
+    if path.is_file():
+        if path.read_bytes() != data:
+            raise ContractError(
+                f"{path.name} in the adaptive output differs from the parent copy",
+                "adaptive_parent_mismatch",
+            )
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def adopt_parent(
+    plan: DeltaPlan, config: ProofConfig, parent: Path, out_dir: Path
+) -> DeltaPlan:
+    """Validate the parent run directory read-only, copy its journal/raw into `out_dir`, and return the adaptive plan."""
+    parent, out_resolved = parent.resolve(), out_dir.resolve()
+    if (
+        parent == out_resolved
+        or parent in out_resolved.parents
+        or out_resolved in parent.parents
+    ):
+        raise ContractError(
+            "adaptive output must be a new directory outside the parent",
+            "adaptive_output_invalid",
+        )
+    if not (
+        isinstance(config.output_tokens, int)
+        and config.output_tokens < RETRY_OUTPUT_TOKENS
+        and config.output_tokens + config.reserve_tokens < config.backend.num_ctx // 2
+        and RETRY_OUTPUT_TOKENS + config.reserve_tokens < config.backend.num_ctx // 2
+    ):
+        raise ContractError(
+            "retry output cap must exceed the base cap and fit the context",
+            "adaptive_output_invalid",
+        )
+    try:
+        parent_plan = json.loads((parent / "plan.json").read_text(encoding="utf-8"))
+        journal = (parent / "journal.jsonl").read_bytes()
+    except (OSError, ValueError) as error:
+        raise ContractError(
+            f"parent run directory is unreadable: {error}", "adaptive_parent_invalid"
+        ) from error
+    if parent_plan != plan.artifact:
+        raise ContractError(
+            "parent plan differs from the plan rebuilt from the current source, config, calibration and seed",
+            "adaptive_parent_mismatch",
+        )
+    if not journal.endswith(b"\n"):
+        raise ContractError(
+            "parent journal has a torn tail; it is never repaired in place",
+            "adaptive_parent_invalid",
+        )
+    try:
+        records = [json.loads(line) for line in journal.decode("utf-8").splitlines()]
+    except ValueError as error:
+        raise ContractError(
+            "parent journal is not JSON", "adaptive_parent_invalid"
+        ) from error
+    if sorted(item["chunk_id"] for item in records) != sorted(
+        chunk.id for chunk in plan.chunks
+    ) or any(item["attempt"] != 1 for item in records):
+        raise ContractError(
+            "parent must hold exactly one first attempt for every chunk",
+            "adaptive_parent_invalid",
+        )
+    copies: list[tuple[Path, bytes]] = []
+    for item in records:
+        if item["status"] in NO_RESPONSE:
+            continue
+        base = f"{item['chunk_id']}.a1"
+        for suffix in (".response.txt", ".meta.json"):
+            try:
+                data = (parent / "raw" / (base + suffix)).read_bytes()
+            except OSError as error:
+                raise ContractError(
+                    f"parent raw {base}{suffix} is unreadable",
+                    "adaptive_parent_invalid",
+                ) from error
+            copies.append((out_dir / "raw" / (base + suffix), data))
+    mine = out_dir / "journal.jsonl"
+    if mine.is_file() and not mine.read_bytes().startswith(journal):
+        raise ContractError(
+            "adaptive journal does not extend the parent journal",
+            "adaptive_parent_mismatch",
+        )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not mine.is_file():
+        mine.write_bytes(journal)
+    for path, data in copies:
+        same_or_absent(path, data)
+    policy = {
+        "base_output_tokens": config.output_tokens,
+        "retry_output_tokens": RETRY_OUTPUT_TOKENS,
+        "retry_margin_tokens": RETRY_MARGIN_TOKENS,
+        "max_retries_per_chunk": 1,
+        "retry_only_if": "single attempt, done_reason length, eval_count == base_output_tokens",
+        "parent_plan_sha256": plan.artifact["plan_sha256"],
+        "parent_journal_sha256": sha256_text(journal.decode("utf-8")),
+        "parent_journal_head": records[-1]["record_sha256"],
+        "parent_chunks": {
+            item["chunk_id"]: {
+                key: item[key]
+                for key in (
+                    "status",
+                    "request_sha256",
+                    "response_sha256",
+                    "meta_sha256",
+                    "server",
+                )
+            }
+            for item in records
+        },
+    }
+    artifact = {
+        key: value for key, value in plan.artifact.items() if key != "plan_sha256"
+    } | {"adaptive": policy}
+    artifact["plan_sha256"] = sha256_text(canonical_json(artifact))
+    settings = DeltaSettings(plan.settings.target_tokens, plan.settings.delta_tokens, 2)
+    return DeltaPlan(plan.source, plan.chunks, settings, plan.fixed_overhead, artifact)
+
+
 @contextlib.contextmanager
 def run_lock(out_dir: Path) -> Iterator[None]:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1424,10 +1633,7 @@ def run_delta(
         )
         try:
             for chunk in plan.chunks:
-                if (
-                    chunk.id in run.ready
-                    or len(run.attempts[chunk.id]) >= plan.settings.max_attempts
-                ):
+                if not run.wants(chunk):
                     continue
                 stop = run.process(chunk, transport, clock, started, soft_s, hard_s)
                 write_atomic(
@@ -1799,6 +2005,64 @@ class WideBioHook:
         return {**result, "accounting_rows": accounting["rows"]}
 
 
+def adaptive_command(args, settings: DeltaSettings, transport: Transport) -> int:
+    config = load_proof_config(args.config)
+    project = args.project.resolve()
+    chapters = project_chapters(project)
+    check_output_dir(args.out, chapters)
+    try:
+        calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ContractError(
+            "calibration record is not readable JSON", "calibration_invalid"
+        ) from error
+    overhead = validate_calibration(calibration, config)["fixed_overhead_tokens"]
+    try:
+        seed_bytes = (args.from_out / "seed.json").read_bytes()
+    except OSError as error:
+        raise ContractError(
+            "parent seed.json is unreadable", "adaptive_parent_invalid"
+        ) from error
+    args.out.mkdir(parents=True, exist_ok=True)
+    same_or_absent(args.out / "seed.json", seed_bytes)
+    seed = json.loads(seed_bytes)
+    count = build_counter(config)
+    base = build_delta_plan(
+        read_source(args.source),
+        chapters,
+        config,
+        count,
+        settings,
+        overhead,
+        sha256_text(canonical_json(seed)),
+    )
+    plan = adopt_parent(base, config, args.from_out, args.out)
+    exit_file = args.out / "run.exit"
+    if args.execute:
+        write_atomic(args.out / "run.pid", str(os.getpid()))
+    try:
+        summary = run_delta(
+            chapters,
+            config,
+            plan,
+            args.out,
+            transport if args.execute else None,
+            count,
+            calibration,
+            args.soft_deadline_s,
+            args.hard_deadline_s,
+            registry=seed["registry"],
+            aliases=seed["aliases"],
+        )
+    except BaseException:
+        write_atomic(exit_file, "2")
+        raise
+    code = 0 if summary["state"] == "ready" else 3
+    write_atomic(exit_file, str(code))
+    print(json.dumps(summary, sort_keys=True))
+    return code
+
+
 # ##################################################################
 # main
 # plan/validate are offline; run needs --execute and a calibration record. Exit 0 = ready, 3 = not_ready (durable summary written), 2 = refused before any request. `transport` is injectable only for tests; the default is the single-route chat transport.
@@ -1851,6 +2115,32 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
     sub.choices["run"].add_argument(
         "--execute", action="store_true", help="required: sends requests to the primary"
     )
+    ad = sub.add_parser(
+        "adaptive",
+        help="new output dir that reuses a finished base-cap run read-only and retries only raw-proven length chunks once at the larger cap",
+    )
+    ad.add_argument("project", type=Path)
+    ad.add_argument("--source", type=Path, required=True)
+    ad.add_argument("--config", type=Path, required=True)
+    ad.add_argument(
+        "--from-out",
+        type=Path,
+        required=True,
+        help="finished base-cap run directory (never written)",
+    )
+    ad.add_argument(
+        "--out", type=Path, required=True, help="NEW adaptive output directory"
+    )
+    ad.add_argument("--target-tokens", type=int, required=True)
+    ad.add_argument("--delta-tokens", type=int, default=1024)
+    ad.add_argument("--calibration", type=Path, required=True)
+    ad.add_argument("--soft-deadline-s", type=float, default=SOFT_DEADLINE_S)
+    ad.add_argument("--hard-deadline-s", type=float, default=HARD_DEADLINE_S)
+    ad.add_argument(
+        "--execute",
+        action="store_true",
+        help="send the retry calls; without it nothing is sent",
+    )
     pc = sub.choices["prepare-cast"]
     pc.add_argument(
         "--execute",
@@ -1867,8 +2157,12 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
     exit_file = None
     try:
         settings = DeltaSettings(
-            args.target_tokens, args.delta_tokens, args.max_attempts
+            args.target_tokens,
+            args.delta_tokens,
+            getattr(args, "max_attempts", 1),
         )
+        if args.command == "adaptive":
+            return adaptive_command(args, settings, transport)
         if args.command == "prepare-cast":
             from src.cast_freeze import prepare_cast
 

@@ -625,9 +625,7 @@ def required_run(root, config_path, config, source, facts, ask=forbidden_ask):
         True,
         one_chunk_transport(config, facts, calls),
     )
-    result = prepare_cast(
-        source, ask=ask, wide_bio=hook, wide_bio_required=True
-    )
+    result = prepare_cast(source, ask=ask, wide_bio=hook, wide_bio_required=True)
     return result, calls
 
 
@@ -762,3 +760,228 @@ def test_required_offline_scan_is_preparing_and_never_asks(world) -> None:
             and result["wide_bio"]["state"] == "not_ready"
         )
         assert not (project / MANIFEST_NAME).exists()
+
+
+# ##################################################################
+# adaptive output retry: a finished base-cap run is reused read-only; only a raw-proven length chunk is retried once at the larger cap
+def tree(path: Path) -> dict:
+    return {
+        str(item.relative_to(path)): item.read_bytes()
+        for item in sorted(path.rglob("*"))
+        if item.is_file()
+    }
+
+
+def adaptive_transport(config, calls, retry_reply):
+    """Real prompts, scripted model: k0001 hits the base cap (done_reason length, eval_count == cap); the 8192 reply is `retry_reply`."""
+    inner = scripted(config, [])
+
+    def transport(url: str, payload: bytes, timeout: float) -> dict:
+        body = json.loads(payload)
+        cap = body["options"]["num_predict"]
+        chunk = re.search(r"Excerpt (k\d+)", body["messages"][1]["content"]).group(1)
+        calls.append((chunk, cap))
+        if chunk == "k0001" and cap == config.output_tokens:
+            return {
+                "model": config.backend.model,
+                "done_reason": "length",
+                "prompt_eval_count": 7,
+                "eval_count": cap,
+                "content": '{"facts":[{"subject":{"name":"Ren"',
+            }
+        if chunk == "k0001":
+            return retry_reply(inner, url, payload, timeout, cap)
+        return inner(url, payload, timeout)
+
+    return transport
+
+
+def stop_reply(inner, url, payload, timeout, cap):
+    return inner(url, payload, timeout)
+
+
+def length_reply(config):
+    def reply(inner, url, payload, timeout, cap):
+        return {
+            "model": config.backend.model,
+            "done_reason": "length",
+            "prompt_eval_count": 7,
+            "eval_count": cap,
+            "content": '{"facts":[{"subject"',
+        }
+
+    return reply
+
+
+@pytest.fixture
+def parent_run(world):
+    root, config_path, config, _, _, _, _, project, source, digest = world
+    cal = root / "cal.json"
+    cal.write_text(json.dumps(calibration(config, digest)), encoding="utf-8")
+    calls: list = []
+    parent = root / "parent"
+    base = [
+        str(project),
+        "--source",
+        str(source),
+        "--config",
+        str(config_path),
+        "--target-tokens",
+        "1",
+        "--delta-tokens",
+        "512",
+        "--calibration",
+        str(cal),
+    ]
+    code = main(
+        ["run", *base, "--out", str(parent), "--execute"],
+        adaptive_transport(config, calls, stop_reply),
+    )
+    assert code == 3 and [c[1] for c in calls] == [config.output_tokens] * 3
+    return root, config, base, parent
+
+
+def adaptive_args(base, parent, out, *extra):
+    return ["adaptive", *base, "--from-out", str(parent), "--out", str(out), *extra]
+
+
+def test_adaptive_offline_reuses_parent_without_calls_or_mutation(
+    parent_run, capsys
+) -> None:
+    root, _config, base, parent = parent_run
+    before = tree(parent)
+    capsys.readouterr()
+    assert main(adaptive_args(base, parent, root / "ad")) == 3
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["chunk_status"] == {"ready": 2, "truncated": 1}
+    assert summary["calls_this_invocation"] == 0 and summary["calls_total"] == 3
+    assert tree(parent) == before
+    ledger = json.loads((root / "ad" / "plan.json").read_text())["adaptive"]
+    assert ledger["parent_chunks"]["k0001"]["server"]["done_reason"] == "length"
+    assert ledger["retry_output_tokens"] == 8192
+
+
+def test_adaptive_retries_only_proven_length_chunk_once_at_8192(
+    parent_run, capsys
+) -> None:
+    root, config, base, parent = parent_run
+    before = tree(parent)
+    calls: list = []
+    transport = adaptive_transport(config, calls, stop_reply)
+    out = root / "ad"
+    assert main(adaptive_args(base, parent, out, "--execute"), transport) == 0
+    assert calls == [("k0001", 8192)]
+    summary = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert summary["state"] == "ready" and summary["calls_this_invocation"] == 1
+    assert tree(parent) == before
+    # ready chunks were reused from the parent raw files: their journal records are byte-identical
+    old = (parent / "journal.jsonl").read_text().splitlines()
+    new = (out / "journal.jsonl").read_text().splitlines()
+    assert new[: len(old)] == old and len(new) == len(old) + 1
+    assert json.loads(new[-1])["attempt"] == 2
+    # a rerun neither re-asks nor changes anything
+    assert main(adaptive_args(base, parent, out, "--execute"), transport) == 0
+    assert calls == [("k0001", 8192)]
+
+
+def test_adaptive_length_at_8192_stays_typed_pending_and_is_never_retried(
+    parent_run, capsys
+) -> None:
+    root, config, base, parent = parent_run
+    calls: list = []
+    transport = adaptive_transport(config, calls, length_reply(config))
+    out = root / "ad"
+    assert main(adaptive_args(base, parent, out, "--execute"), transport) == 3
+    summary = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert summary["reason"] == "output_length_exhausted"
+    assert summary["length_exhausted"] == ["k0001"] and summary["claims"] > 0
+    assert main(adaptive_args(base, parent, out, "--execute"), transport) == 3
+    assert calls == [("k0001", 8192)]
+
+
+def test_adaptive_length_without_exact_cap_eval_count_is_not_retried(
+    parent_run, capsys
+) -> None:
+    root, config, base, parent = parent_run
+    forged = root / "forged"
+    shutil.copytree(parent, forged)
+    for meta_path in (forged / "raw").glob("k0001.a1.meta.json"):
+        meta = json.loads(meta_path.read_text())
+        meta["eval_count"] = config.output_tokens - 1
+        meta_path.write_text(json.dumps(meta, sort_keys=True))
+    capsys.readouterr()
+    calls: list = []
+    transport = adaptive_transport(config, calls, stop_reply)
+    # the edited meta no longer reproduces the parent journal's meta hash, so it is refused outright
+    assert main(adaptive_args(base, forged, root / "ad", "--execute"), transport) == 2
+    assert "journal_inconsistent" in capsys.readouterr().err and calls == []
+
+
+@pytest.mark.parametrize("target", ["response", "meta_request", "journal", "plan"])
+def test_adaptive_refuses_tampered_or_mismatched_parent(
+    parent_run, capsys, target
+) -> None:
+    root, config, base, parent = parent_run
+    bad = root / "bad"
+    shutil.copytree(parent, bad)
+    if target == "response":
+        path = bad / "raw" / "k0000.a1.response.txt"
+        path.write_text(path.read_text() + " ")
+    elif target == "meta_request":
+        path = bad / "raw" / "k0002.a1.meta.json"
+        meta = json.loads(path.read_text())
+        meta["request_sha256"] = "0" * 64
+        path.write_text(json.dumps(meta, sort_keys=True))
+    elif target == "journal":
+        path = bad / "journal.jsonl"
+        path.write_bytes(path.read_bytes()[:-5])
+    else:
+        path = bad / "plan.json"
+        plan = json.loads(path.read_text())
+        plan["system_prompt_sha256"] = "0" * 64
+        path.write_text(json.dumps(plan))
+    capsys.readouterr()
+    calls: list = []
+    code = main(
+        adaptive_args(base, bad, root / "ad", "--execute"),
+        adaptive_transport(config, calls, stop_reply),
+    )
+    assert code == 2 and calls == []
+    assert json.loads(capsys.readouterr().err)["refused"] in {
+        "journal_inconsistent",
+        "adaptive_parent_invalid",
+        "adaptive_parent_mismatch",
+    }
+
+
+def test_adaptive_refuses_other_chunking_and_output_inside_parent(
+    parent_run, capsys
+) -> None:
+    root, config, base, parent = parent_run
+    other = list(base)
+    other[other.index("--target-tokens") + 1] = "100000"
+    capsys.readouterr()
+    calls: list = []
+    transport = adaptive_transport(config, calls, stop_reply)
+    assert main(adaptive_args(other, parent, root / "ad", "--execute"), transport) == 2
+    assert json.loads(capsys.readouterr().err)["refused"] == "adaptive_parent_mismatch"
+    assert main(adaptive_args(base, parent, parent, "--execute"), transport) == 2
+    assert (
+        main(adaptive_args(base, parent, parent / "sub", "--execute"), transport) == 2
+    )
+    assert calls == []
+
+
+def test_adaptive_input_budget_guard_uses_retry_cap_and_margin(parent_run) -> None:
+    root, config, base, parent = parent_run
+    out = root / "ad"
+    assert main(adaptive_args(base, parent, out)) == 3
+    plan = json.loads((out / "plan.json").read_text())
+    assert plan["adaptive"]["retry_margin_tokens"] == 16
+    assert (
+        config.backend.num_ctx - 8192 - config.reserve_tokens
+        > plan["input_budget"] - 8192 - 1
+    )
+    assert max(c["max_padded_prompt_tokens"] for c in plan["chunks"]) < (
+        config.backend.num_ctx - 8192 - config.reserve_tokens
+    )

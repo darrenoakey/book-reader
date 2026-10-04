@@ -7151,7 +7151,10 @@ def required_wide_bio(
 def prepare_lean_characters(source: Path) -> dict:
     source = source.resolve()
     project = get_output_dir(source)
-    base = load_object(project / "characters.json", "characters profile")
+    progress_path = project / PROGRESS_NAME
+    progress = load_object(progress_path, "cast preparation progress") if progress_path.exists() else {}
+    registry = progress.get("registry") if progress.get("source_sha256") == source_fingerprint(source) else None
+    base = registry if isinstance(registry, dict) and registry else load_object(project / "characters.json", "characters profile")
     actors = {
         actor_id: {"name": info.get("name", actor_id), "bio": info.get("bio", ""), "look": info.get("look", "")}
         for actor_id, info in base.items()

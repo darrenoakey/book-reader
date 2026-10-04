@@ -29,6 +29,8 @@ MOVIE_PATHS = {
     "src/cast_freeze_test.py",
     "src/cast_index.py",
     "src/cast_index_test.py",
+    "src/identity_group_report.py",
+    "src/identity_group_report_test.py",
     "src/wide_bio.py",
     "src/wide_bio_test.py",
     "src/wide_bio_delta.py",
@@ -119,6 +121,7 @@ RECOVERY_TESTS = (
     "src/script_generate_test.py",
     "src/step_runner_test.py",
     "src/title_page_test.py",
+    "src/identity_group_report_test.py",
 )
 
 
@@ -178,6 +181,8 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "src/cast_freeze_test.py": ("src/cast_freeze_test.py",),
     "src/cast_index.py": ("src/cast_index_test.py",),
     "src/cast_index_test.py": ("src/cast_index_test.py",),
+    "src/identity_group_report.py": ("src/identity_group_report_test.py", "src/cast_freeze_test.py"),
+    "src/identity_group_report_test.py": ("src/identity_group_report_test.py",),
     "src/wide_bio.py": ("src/wide_bio_test.py", "src/wide_bio_tokenizer_test.py", "src/cast_index_test.py"),
     "src/wide_bio_test.py": ("src/wide_bio_test.py",),
     "src/wide_bio_delta.py": ("src/wide_bio_delta_test.py", "src/wide_bio_test.py", "src/cast_index_test.py"),

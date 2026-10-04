@@ -77,7 +77,7 @@ from src.wide_bio import (
 )
 from src.wide_bio_tokenizer import TokenizerRefusal
 
-DELTA_VERSION = 7
+DELTA_VERSION = 8
 QUOTE_MAX = 240
 VALUE_MAX = 100
 REF_NOVEL = "novel"
@@ -183,7 +183,11 @@ VOICE_REPORT_WORDS = frozenset(
 )
 # These denote a momentary speech delivery event, not a standing acoustic profile.
 VOICE_TRANSIENT_DELIVERY_WORDS = frozenset(
-    {"lowered", "raised", "trembled", "shook", "cracked", "caught", "dropped", "laughed", "laugh", "laughing"}
+    {"lowered", "raised", "trembled", "shook", "cracked", "caught", "dropped", "laughed", "laugh", "laughing", "murmured", "mumbled", "gasped", "panted", "nodded", "began"}
+)
+LOOK_ACTION_PATTERNS = (
+    re.compile(r"\b(?:drew|drawing)\s+(?:a\s+)?diagrams?\b", re.IGNORECASE),
+    re.compile(r"\bmade\s+(?:an?\s+)?announcement\b", re.IGNORECASE),
 )
 ROLE_EDUCATION_WORDS = frozenset({"failed", "exam", "exams", "unit", "units", "course", "courses", "semester"})
 LEADING_WORDS = frozenset(
@@ -222,10 +226,10 @@ SYSTEM_PROMPT = (
     "`value` is the SHORTEST phrase copied exactly, unmodified and contiguous, from the paragraph named by `paragraph_id` "
     "(one of the [[P id]] markers) that states the trait; it is the evidence itself, so never paraphrase it and never copy "
     "a sentence, a quotation, dialogue, an action or a general observation. "
-    f"Categories: {', '.join(CATEGORIES)}. look=physical appearance (one row per distinct feature: hair, eyes, build, clothing worn habitually), "
+    f"Categories: {', '.join(CATEGORIES)}. look=physical appearance (one row per distinct feature: hair, eyes, build, clothing worn habitually), never an action such as drawing a diagram or making an announcement, "
     "role=an explicit occupation, rank or title only, kin=an explicit named relationship (one row per relative), "
     "beast=an explicit creature or species, gender=explicit gender, age=an explicit age or age change, "
-    "alias=another name the source explicitly gives the same character. voice=ONLY a persistent acoustic/vocal quality (pitch, tone, rasp, cadence or volume), such as 'a voice like gravel' or 'a soft voice'; NEVER what someone said, an explanation, advice, dialogue content, an occupation or a personality. A momentary delivery such as 'lowered his voice', 'raised her voice', 'trembled', or 'a dry laugh' is NOT a voice fact: omit it. "
+    "alias=another name the source explicitly gives the same character. voice=ONLY a persistent acoustic/vocal quality (pitch, tone, rasp, cadence or volume), such as 'a voice like gravel' or 'a soft voice'; NEVER what someone said, an explanation, advice, dialogue content, an occupation or a personality. A momentary delivery or gesture such as 'lowered his voice', 'murmured', 'gasped', 'nodded', or 'a dry laugh' is NOT a voice fact: omit it. "
     "personality=an explicitly named enduring disposition such as 'gruff and patient', never a transient action. education=an explicit schooling, examination, course, unit or qualification history such as 'failed two units', never an occupation. "
     "power=ONLY a specific supernatural, cultivation, beast, innate or named-system capability such as 'call lightning' or 'speak with gulls'; NEVER an ordinary action, learned advice, dialogue, explanation or occupation. "
     "role=ONLY an explicit occupation, formal rank, title or social status; NEVER speech, explaining, advice, or an action. "
@@ -290,6 +294,8 @@ def compactness_problem(
         or lowered & VOICE_TRANSIENT_DELIVERY_WORDS
         or "that" in lowered
     ):
+        return "category_incompatible_value"
+    if category == "look" and any(pattern.search(value) for pattern in LOOK_ACTION_PATTERNS):
         return "category_incompatible_value"
     if category == "role" and lowered & ROLE_EDUCATION_WORDS:
         return "category_incompatible_value"
@@ -2664,14 +2670,17 @@ def replay_ablation_command(args, settings: DeltaSettings, transport: Transport)
     registry, aliases = old_seed["registry"], old_seed["aliases"]
     prior, prepared, state = prepare_temperature_ablation(chapters, config, old_plan, new_plan, args.prefix_out, args.chunk, count, registry, aliases)
     if not args.execute:
-        stored_new = json.loads((args.out / "plan.json").read_text(encoding="utf-8"))
+        try:
+            stored_new = json.loads((args.out / "plan.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ContractError("ablation output plan is unreadable", "ablation_mismatch") from error
         if stored_new != new_plan.artifact:
             raise ContractError("ablation output plan does not match replay request", "ablation_mismatch")
         verify = DeltaRun(chapters, config, new_plan, args.out, count, build_cast_index(list(chapters), registry, aliases, None), registry, aliases)
         verify.state = state
         verify.only_chunk = args.chunk
         verify.replay()
-        records = verify.attempts[args.chunk]
+        records = verify.attempts.get(args.chunk, [])
         if len(records) != 1 or not records[0]["called"]:
             raise ContractError("ablation output has no single saved target call", "ablation_mismatch")
         print(json.dumps({"state": "verified", "chunk": args.chunk, "request_sha256": prepared.request_sha256, "response_sha256": records[0]["response_sha256"]}, sort_keys=True))

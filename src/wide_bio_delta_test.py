@@ -1520,9 +1520,14 @@ def test_captured_transient_voice_delivery_and_misclassified_education_are_pendi
     # speaking event is not a persistent cast voice; academic history is not
     # an occupation.  The response validator keeps such source-backed rows as
     # typed pending rather than silently dropping or reclassifying them.
-    for value in ("lowered his voice", "raised her voice", "voice trembled", "dry laugh"):
+    for value in ("lowered his voice", "raised her voice", "voice trembled", "dry laugh", "murmured", "mumbled", "gasped", "panted", "began", "nodded"):
         assert compactness_problem("voice", value, "Lu", ()) == "category_incompatible_value"
-    assert compactness_problem("voice", "a rough voice", "Lu", ()) is None
+    for value in ("a rough voice", "a gravelly voice", "a hoarse voice"):
+        assert compactness_problem("voice", value, "Lu", ()) is None
+    for value in ("drew diagrams", "made an announcement"):
+        assert compactness_problem("look", value, "Lu", ()) == "category_incompatible_value"
+    for value in ("long black hair", "silver markings", "a tall build", "wolf manifestation"):
+        assert compactness_problem("look", value, "Lu", ()) is None
     assert compactness_problem("role", "failed two units", "Lu", ()) == "category_incompatible_value"
     assert compactness_problem("education", "failed two units", "Lu", ()) is None
     # This power is deliberately not treated as a voice/action clause.
@@ -1531,7 +1536,7 @@ def test_captured_transient_voice_delivery_and_misclassified_education_are_pendi
 
 def test_plan_fingerprint_changes_and_old_runs_stay_incompatible(world) -> None:
     root, _, config, chapters, count, _seed, plan, *_ = world
-    assert DELTA_VERSION == 7 and plan.artifact["delta_version"] == 7
+    assert DELTA_VERSION == 8 and plan.artifact["delta_version"] == 8
     assert VALUE_MAX <= 100 and "SHORTEST" in SYSTEM_PROMPT
     assert "earliest paragraph id" in SYSTEM_PROMPT and "MINIFIED JSON" in SYSTEM_PROMPT
     assert "persistent acoustic/vocal quality" in SYSTEM_PROMPT

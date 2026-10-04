@@ -304,3 +304,68 @@ def test_native_fault_then_next_valid_chapter_persists_across_restart() -> None:
         assert [row["item"] for row in restarted] == ["01-bad.txt"]
         assert restarted[0]["code"] == "canonical_script_invalid"
         assert restarted[0]["checkpoint"] == {"next_chapter": 1, "next_piece": 0}
+
+
+# ##################################################################
+# deferred-image hour tests (real files, namespaced output project)
+def _deferred_book():
+    import shutil
+    import uuid
+
+    from src.epub_extract import get_output_dir
+
+    source = Path(tempfile.mkdtemp()) / f"deferred_test_{uuid.uuid4().hex[:10]}.txt"
+    source.write_text("Chapter 1\n\nIt began.\n\nChapter 2\n\nIt went on.\n", encoding="utf-8")
+    project = get_output_dir(source)
+    project.mkdir(parents=True, exist_ok=True)
+    return source, project, lambda: shutil.rmtree(project, ignore_errors=True)
+
+
+def test_modes_exclusive_and_render_needs_saved_audio() -> None:
+    from src.hour_runner import run_hour
+
+    source, project, cleanup = _deferred_book()
+    try:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            run_hour(source, 3, defer_images=True, render_images=True)
+        with pytest.raises(RuntimeError, match="no saved audio"):
+            run_hour(source, 3, render_images=True)
+        assert not (project / ".pipeline.lock").exists()
+    finally:
+        cleanup()
+
+
+def test_next_hour_requires_previous_audio_complete() -> None:
+    from src.hour_runner import run_hour
+
+    source, project, cleanup = _deferred_book()
+    try:
+        atomic = project / "hours.json"
+        atomic.write_text(
+            json.dumps({"source": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                        "hours": {"2": {"complete": False}}}),
+            encoding="utf-8",
+        )
+        with pytest.raises(RuntimeError, match="previous hour audio is not complete"):
+            run_hour(source, 3, defer_images=True)
+    finally:
+        cleanup()
+
+
+def test_saved_audio_tamper_refused_and_text_located() -> None:
+    from src.hour_runner import file_digest, locate_text, render_saved_hour
+
+    _source, project, cleanup = _deferred_book()
+    try:
+        audio = project / "hours" / "hour-003" / "audio"
+        audio.mkdir(parents=True)
+        tone_wav(audio / "hour-00000.wav", 1)
+        timeline = audio / "hour-00000.timeline.json"
+        timeline.write_text(json.dumps({"lines": [{"index": 0, "speaker": "x", "text": "I lost the bet. It's official!", "start": 0.0, "end": 1.0}]}))
+        entry = {"audio_complete": True, "audio_sha256": file_digest(audio / "hour-00000.wav"), "timeline_sha256": "0" * 64}
+        with pytest.raises(RuntimeError, match="refusing to retime"):
+            render_saved_hour(project, {"hours": {"3": entry}}, "3", "t")
+        hits = locate_text(project, "i lost the bet.  it's OFFICIAL")
+        assert [h["hour"] for h in hits] == ["hour-003"] and hits[0]["start"] == 0.0
+    finally:
+        cleanup()

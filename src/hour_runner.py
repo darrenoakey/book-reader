@@ -391,7 +391,7 @@ def prepare_hour_directory(
         if hour_dir.name.startswith("hour-")
         else 0
     )
-    scene_seconds = HOUR_SCENE_SECONDS.get(hour_number, SCENE_SECONDS)
+    scene_seconds = HOUR_SCENE_SECONDS.get(hour_number, 1.0 if hour_number >= 3 else SCENE_SECONDS)
     (hour_dir / "scene_seconds.txt").write_text(
         f"{scene_seconds:g}\n", encoding="utf-8"
     )
@@ -626,7 +626,15 @@ def record_hour_timing(
 # ##################################################################
 # run hour
 # hold the project-wide pipeline lock through the complete bounded production transaction.
-def run_hour(source: Path, hour_index: int = 1, lean_cast: bool = False) -> Path:
+def run_hour(
+    source: Path,
+    hour_index: int = 1,
+    lean_cast: bool = False,
+    defer_images: bool = False,
+    render_images: bool = False,
+) -> Path:
+    if defer_images and render_images:
+        raise ValueError("--defer-images and --render-images are mutually exclusive")
     source = source.resolve()
     project = get_output_dir(source)
     project.mkdir(parents=True, exist_ok=True)
@@ -634,7 +642,7 @@ def run_hour(source: Path, hour_index: int = 1, lean_cast: bool = False) -> Path
     started = time.monotonic()
     record_hour_timing(project, hour_index, "started", 0.0)
     try:
-        movie = _run_hour_locked(source, hour_index, lean_cast)
+        movie = _run_hour_locked(source, hour_index, lean_cast, defer_images, render_images)
         record_hour_timing(project, hour_index, "complete", time.monotonic() - started)
         return movie
     except Exception:
@@ -661,7 +669,58 @@ def load_lean_cast(source: Path, project: Path) -> tuple[dict, dict]:
 # ##################################################################
 # run locked hour
 # produce one numbered hour and commit the exact next source cursor only after its movie succeeds.
-def _run_hour_locked(source: Path, hour_index: int = 1, lean_cast: bool = False) -> Path:
+def audio_done(entry: dict | None) -> bool:
+    return bool(entry and (entry.get("complete") or entry.get("audio_complete")))
+
+
+# ##################################################################
+# file digest
+# bind saved hour audio and timeline bytes so later image rendering cannot retime or rescript them.
+def file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# ##################################################################
+# render saved hour
+# attach storyboards and images to the SAVED selected audio+timeline, then mark the movie complete.
+def render_saved_hour(project: Path, ledger: dict, key: str, title: str) -> Path:
+    entry = ledger["hours"][key]
+    hour_dir = project / "hours" / f"hour-{int(key):03d}"
+    wav = hour_dir / "audio" / "hour-00000.wav"
+    if file_digest(wav) != entry["audio_sha256"] or file_digest(wav.with_suffix(".timeline.json")) != entry["timeline_sha256"]:
+        raise RuntimeError("saved hour audio or timeline changed since it was recorded; refusing to retime")
+    movie = render_hour(hour_dir, title)
+    entry.update(
+        {
+            "complete": True,
+            "movie": str(movie.relative_to(project)),
+            "duration_seconds": round(probe_duration(movie), 3),
+        }
+    )
+    atomic_json(project / "hours.json", ledger)
+    return movie
+
+
+# ##################################################################
+# locate text
+# find which saved hour audio timeline actually speaks the text, with its start second.
+def locate_text(project: Path, text: str) -> list[dict]:
+    needle = " ".join(text.lower().split())
+    found = []
+    for timeline in sorted((project / "hours").glob("hour-*/audio/hour-00000.timeline.json")):
+        for line in json.loads(timeline.read_text(encoding="utf-8"))["lines"]:
+            if needle in " ".join(str(line["text"]).lower().split()):
+                found.append({"hour": timeline.parent.parent.name, "start": line["start"], "text": line["text"]})
+    return found
+
+
+def _run_hour_locked(
+    source: Path,
+    hour_index: int = 1,
+    lean_cast: bool = False,
+    defer_images: bool = False,
+    render_images: bool = False,
+) -> Path:
     if hour_index < 1:
         raise ValueError("hour index must be at least one")
     source = source.resolve()
@@ -677,11 +736,17 @@ def _run_hour_locked(source: Path, hour_index: int = 1, lean_cast: bool = False)
         raise RuntimeError(
             "completed hour ledger points at a missing or oversized movie"
         )
+    if prior and prior.get("audio_complete"):
+        if defer_images:
+            return project / "hours" / f"hour-{hour_index:03d}" / "audio" / "hour-00000.wav"
+        return render_saved_hour(project, ledger, key, source_chapters(source, project)[0])
+    if render_images:
+        raise RuntimeError("no saved audio for this hour; run it with --defer-images first")
     if hour_index > 1:
         previous = ledger["hours"].get(str(hour_index - 1))
-        if not previous or not previous.get("complete"):
+        if not audio_done(previous):
             raise RuntimeError(
-                "previous hour is not complete; refusing to duplicate or skip story content"
+                "previous hour audio is not complete; refusing to duplicate or skip story content"
             )
         chapter_cursor = int(previous["next_chapter"])
         piece_cursor = int(previous["next_piece"])
@@ -742,6 +807,15 @@ def _run_hour_locked(source: Path, hour_index: int = 1, lean_cast: bool = False)
                 aliases,
                 scoped_references,
             )
+            if hour_index >= 3 and lean_cast:
+                # Active-only assets: voices/appearances/profiles for speakers actually in this chapter.
+                from src.catchup_runner import (
+                    ensure_active_voices,
+                    refresh_local_metadata,
+                )
+
+                ensure_active_voices(project, script, cast)
+                refresh_local_metadata(project, hour_dir, script, cast)
             start_piece = piece_cursor if chapter_index == chapter_cursor else 0
             candidates, _ = synthesize_window(project, script, remaining, start_piece)
             if not candidates:
@@ -810,11 +884,12 @@ def _run_hour_locked(source: Path, hour_index: int = 1, lean_cast: bool = False)
     output = audio_dir / "hour-00000.wav"
     concat_wavs([item["path"] for item in all_selected], output)
     write_timeline(output, all_selected)
-    movie = render_hour(hour_dir, title)
     ledger["hours"][key] = {
-        "complete": True,
-        "movie": str(movie.relative_to(project)),
-        "duration_seconds": round(probe_duration(movie), 3),
+        "complete": False,
+        "audio_complete": True,
+        "audio_sha256": file_digest(output),
+        "timeline_sha256": file_digest(output.with_suffix(".timeline.json")),
+        "audio_seconds": round(wav_duration(output), 3),
         "next_chapter": next_chapter,
         "next_piece": next_piece,
         "source_chapters": [
@@ -823,4 +898,6 @@ def _run_hour_locked(source: Path, hour_index: int = 1, lean_cast: bool = False)
         ],
     }
     atomic_json(project / "hours.json", ledger)
-    return movie
+    if defer_images:
+        return output
+    return render_saved_hour(project, ledger, key, title)

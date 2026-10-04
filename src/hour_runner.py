@@ -198,7 +198,7 @@ async def extend_cast(
 # ##################################################################
 # extend voices
 # create Breeze descriptions only for identities not already established in the shared voice map.
-async def extend_voices(project: Path, cast: dict) -> None:
+async def extend_voices(project: Path, cast: dict, active_only: bool = False) -> None:
     path = project / "voices.json"
     voices = load_json_store(path, "voices", default={})
     missing = [
@@ -211,7 +211,7 @@ async def extend_voices(project: Path, cast: dict) -> None:
         for char_id, info in described:
             voices[char_id] = info
         atomic_json(path, voices)
-    prepare_breeze_voices(project)
+    prepare_breeze_voices(project, only=set(cast) if active_only else None)
 
 
 APPEARANCE_BATCH_SIZE = 3

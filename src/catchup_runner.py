@@ -85,7 +85,7 @@ def ensure_active_voices(project: Path, script: Path, cast: dict) -> list[str]:
     )
     if missing:
         subset = {name: active[name] for name in missing}
-        asyncio.run(extend_voices(project, subset))
+        asyncio.run(extend_voices(project, subset, active_only=True))
     extend_appearances(project, active)
     return missing
 

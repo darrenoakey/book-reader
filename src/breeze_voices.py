@@ -28,8 +28,8 @@ REFERENCE_TEXT = "Listen to me. I have waited my whole life for this moment, and
 
 # ##################################################################
 # prepare breeze voices
-# design one reference clip per character; returns breeze_voices.json path
-def prepare_breeze_voices(output_dir: Path) -> Path:
+# design one reference clip per character (or only the `only` ids); returns breeze_voices.json path
+def prepare_breeze_voices(output_dir: Path, only: set[str] | None = None) -> Path:
     from src.arbiter_tts import tts_breeze_design_to_file
 
     voices_json = output_dir / "voices.json"
@@ -45,6 +45,8 @@ def prepare_breeze_voices(output_dir: Path) -> Path:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     for index, (char_id, info) in enumerate(sorted(descriptions.items())):
+        if only is not None and char_id not in only:
+            continue
         ref_wav = voices_dir / f"{char_id}.wav"
         description = (info or {}).get("description") or "A clear neutral voice."
         if char_id in manifest and ref_wav.exists() and ref_wav.stat().st_size >= 100:

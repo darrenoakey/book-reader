@@ -114,3 +114,21 @@ def test_prepare_reuses_finished_voices() -> None:
         assert json.loads(path.read_text(encoding="utf-8")) == manifest
         loaded = load_breeze_manifest(out)
         assert Path(loaded["ann"]["ref_wav"]).exists()
+
+
+# ##################################################################
+# test prepare active only skips unrelated missing voices
+# an `only` filter never synthesizes or lists a described voice outside the active set
+def test_prepare_only_skips_non_active_missing_voice() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        (out / "voices.json").write_text(
+            json.dumps({"ann": {"description": "bright"}, "bob": {"description": "gruff"}}),
+            encoding="utf-8",
+        )
+        manifest = {"ann": {"ref_wav": "voices/ann.wav", "ref_text": REFERENCE_TEXT, "description": "ann"}}
+        _write_wav(out / "voices" / "ann.wav")
+        (out / "breeze_voices.json").write_text(json.dumps(manifest), encoding="utf-8")
+        path = prepare_breeze_voices(out, only={"ann"})
+        assert json.loads(path.read_text(encoding="utf-8")) == manifest
+        assert not (out / "voices" / "bob.wav").exists()

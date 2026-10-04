@@ -1506,6 +1506,15 @@ def source_tree(path: Path) -> dict:
     }
 
 
+def test_prepare_cast_exposes_sampled_production_flags(capsys: pytest.CaptureFixture) -> None:
+    with pytest.raises(SystemExit) as exit_code:
+        main(["prepare-cast", "--help"])
+    assert exit_code.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--sampling-temperature" in help_text
+    assert "--sampling-seed" in help_text
+
+
 def test_sampling_changes_fingerprint_and_is_sent_only_where_openai_supports_it(
     world, sampled
 ) -> None:

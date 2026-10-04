@@ -2547,19 +2547,18 @@ def main(argv: list[str] | None = None, transport: Transport = chat_transport) -
         item.add_argument(
             "--calibration", type=Path, default=None, required=name == "run"
         )
-        if name != "prepare-cast":
-            item.add_argument(
-                "--sampling-temperature",
-                type=float,
-                default=None,
-                help="explicit request temperature (> 0), part of the plan fingerprint; needs --sampling-seed and an openai-style primary",
-            )
-            item.add_argument(
-                "--sampling-seed",
-                type=int,
-                default=None,
-                help="explicit request seed, part of the plan fingerprint; needs --sampling-temperature",
-            )
+        item.add_argument(
+            "--sampling-temperature",
+            type=float,
+            default=None,
+            help="explicit request temperature (> 0), part of the plan fingerprint; needs --sampling-seed and an openai-style primary",
+        )
+        item.add_argument(
+            "--sampling-seed",
+            type=int,
+            default=None,
+            help="explicit request seed, part of the plan fingerprint; needs --sampling-temperature",
+        )
     sub.choices["run"].add_argument(
         "--execute", action="store_true", help="required: sends requests to the primary"
     )

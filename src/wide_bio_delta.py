@@ -77,7 +77,7 @@ from src.wide_bio import (
 )
 from src.wide_bio_tokenizer import TokenizerRefusal
 
-DELTA_VERSION = 5
+DELTA_VERSION = 6
 QUOTE_MAX = 240
 VALUE_MAX = 100
 REF_NOVEL = "novel"
@@ -93,6 +93,7 @@ CATEGORIES = (
     "alias",
     "voice",
     "personality",
+    "education",
     "power",
 )
 # compact-density contract (delta v2). Raw 4096/8192 runs hit the output cap because the model returned long dialogue/action
@@ -109,6 +110,7 @@ VALUE_WORDS_MAX = {
     "alias": 6,
     "voice": 8,
     "personality": 8,
+    "education": 10,
     "power": 10,
 }
 QUOTE_MARKS = '"\u201c\u201d\u00ab\u00bb\u201e'
@@ -179,6 +181,11 @@ PHRASE_CATEGORIES = frozenset(CATEGORIES)
 VOICE_REPORT_WORDS = frozenset(
     {"explain", "explained", "explaining", "say", "said", "telling", "told", "replying", "replied", "asking", "asked", "arguing", "argued"}
 )
+# These denote a momentary speech delivery event, not a standing acoustic profile.
+VOICE_TRANSIENT_DELIVERY_WORDS = frozenset(
+    {"lowered", "raised", "trembled", "shook", "cracked", "caught", "dropped", "laughed", "laugh", "laughing"}
+)
+ROLE_EDUCATION_WORDS = frozenset({"failed", "exam", "exams", "unit", "units", "course", "courses", "semester"})
 LEADING_WORDS = frozenset(
     ["the", "a", "an", "his", "her", "their", "its", "my", "your", "our"]
 )
@@ -218,8 +225,8 @@ SYSTEM_PROMPT = (
     f"Categories: {', '.join(CATEGORIES)}. look=physical appearance (one row per distinct feature: hair, eyes, build, clothing worn habitually), "
     "role=an explicit occupation, rank or title only, kin=an explicit named relationship (one row per relative), "
     "beast=an explicit creature or species, gender=explicit gender, age=an explicit age or age change, "
-    "alias=another name the source explicitly gives the same character. voice=ONLY a persistent acoustic/vocal quality (pitch, tone, rasp, cadence or volume), such as 'a voice like gravel' or 'a soft voice'; NEVER what someone said, an explanation, advice, dialogue content, an occupation or a personality. "
-    "personality=an explicitly named enduring disposition such as 'gruff and patient', never a transient action. "
+    "alias=another name the source explicitly gives the same character. voice=ONLY a persistent acoustic/vocal quality (pitch, tone, rasp, cadence or volume), such as 'a voice like gravel' or 'a soft voice'; NEVER what someone said, an explanation, advice, dialogue content, an occupation or a personality. A momentary delivery such as 'lowered his voice', 'raised her voice', 'trembled', or 'a dry laugh' is NOT a voice fact: omit it. "
+    "personality=an explicitly named enduring disposition such as 'gruff and patient', never a transient action. education=an explicit schooling, examination, course, unit or qualification history such as 'failed two units', never an occupation. "
     "power=ONLY a specific supernatural, cultivation, beast, innate or named-system capability such as 'call lightning' or 'speak with gulls'; NEVER an ordinary action, learned advice, dialogue, explanation or occupation. "
     "role=ONLY an explicit occupation, formal rank, title or social status; NEVER speech, explaining, advice, or an action. "
     "Report every distinct explicit trait of every character; several rows for one character and category are expected when the source states several. "
@@ -270,8 +277,12 @@ def compactness_problem(
     ):
         return "clause_value"
     if category == "voice" and (
-        lowered & VOICE_REPORT_WORDS or "that" in lowered
+        lowered & VOICE_REPORT_WORDS
+        or lowered & VOICE_TRANSIENT_DELIVERY_WORDS
+        or "that" in lowered
     ):
+        return "category_incompatible_value"
+    if category == "role" and lowered & ROLE_EDUCATION_WORDS:
         return "category_incompatible_value"
     known = {norm_space(name).casefold() for name in [subject, *names]}
     if category not in ("alias", "role") and norm_space(value).casefold() in known:
@@ -317,7 +328,7 @@ def delta_schema(paragraph_ids: Sequence[str], shown_ids: Sequence[str]) -> dict
             "category": {
                 "type": "string",
                 "enum": list(CATEGORIES),
-                "description": "voice is acoustic quality only; personality is an enduring named disposition; power is a named supernatural/cultivation/beast/innate capability; role is occupation/rank/status only, never speech or action.",
+                "description": "voice is a persistent acoustic quality only, never a momentary delivery; personality is an enduring named disposition; education is schooling/examination history; power is a named supernatural/cultivation/beast/innate capability; role is occupation/rank/status only, never speech, action or education.",
             },
             "value": {"type": "string", "minLength": 1, "maxLength": VALUE_MAX},
             "paragraph_id": {"type": "string", "enum": list(paragraph_ids)},

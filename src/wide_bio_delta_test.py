@@ -28,6 +28,7 @@ from src.wide_bio_delta import (
     WideBioHook,
     apply_to_cast,
     build_delta_plan,
+    compactness_problem,
     delta_schema,
     main,
     pinned_seed,
@@ -165,6 +166,7 @@ def test_schema_is_per_chunk_and_short(world) -> None:
         "alias",
         "voice",
         "personality",
+        "education",
         "power",
     }
     assert "at most once" in schema["properties"]["facts"]["description"]
@@ -1434,13 +1436,27 @@ def test_unknown_subject_stays_ambiguous_pending_and_is_never_forced_to_an_actor
     assert result["claims"] == [] and reasons(result) == ["ambiguous_subject"]
 
 
+def test_captured_transient_voice_delivery_and_misclassified_education_are_pending() -> None:
+    # Exact literal values from the bounded k0003 v5 production capture.  A
+    # speaking event is not a persistent cast voice; academic history is not
+    # an occupation.  The response validator keeps such source-backed rows as
+    # typed pending rather than silently dropping or reclassifying them.
+    for value in ("lowered his voice", "raised her voice", "voice trembled", "dry laugh"):
+        assert compactness_problem("voice", value, "Lu", ()) == "category_incompatible_value"
+    assert compactness_problem("voice", "a rough voice", "Lu", ()) is None
+    assert compactness_problem("role", "failed two units", "Lu", ()) == "category_incompatible_value"
+    assert compactness_problem("education", "failed two units", "Lu", ()) is None
+    # This power is deliberately not treated as a voice/action clause.
+    assert compactness_problem("power", "speak with gulls", "Tomas", ()) is None
+
+
 def test_plan_fingerprint_changes_and_old_runs_stay_incompatible(world) -> None:
     root, _, config, chapters, count, _seed, plan, *_ = world
-    assert DELTA_VERSION == 5 and plan.artifact["delta_version"] == 5
+    assert DELTA_VERSION == 6 and plan.artifact["delta_version"] == 6
     assert VALUE_MAX <= 100 and "SHORTEST" in SYSTEM_PROMPT
     assert "earliest paragraph id" in SYSTEM_PROMPT and "MINIFIED JSON" in SYSTEM_PROMPT
     assert "persistent acoustic/vocal quality" in SYSTEM_PROMPT
-    assert "personality" in SYSTEM_PROMPT
+    assert "personality" in SYSTEM_PROMPT and "momentary delivery" in SYSTEM_PROMPT
     assert plan.artifact["compact_contract_sha256"]
     out = root / "old-run"
     out.mkdir()

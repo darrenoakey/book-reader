@@ -20,6 +20,7 @@ from src.audio_synth import concat_wavs, wav_duration, write_timeline
 from src.epub_extract import get_output_dir
 from src.hour_runner import (
     AUDIO_MAX_SECONDS,
+    FINAL_RESOLUTION,
     HOUR_MAX_SECONDS,
     atomic_json,
     chapter_order,
@@ -29,13 +30,18 @@ from src.hour_runner import (
     load_lean_cast,
     load_ledger,
     prepare_hour_directory,
-    render_hour,
     script_for_chapter,
     source_chapters,
     source_fingerprint,
     synthesize_window,
 )
-from src.movie_assemble import probe_duration
+from src.movie_assemble import assemble_movie, probe_duration
+from src.movie_images import (
+    generate_character_refs,
+    generate_missing_character_refs,
+    generate_scene_images,
+)
+from src.movie_storyboard import build_storyboard
 from src.pipeline import acquire_lock, release_lock
 
 CATCHUP_SCENE_SECONDS = 1.0
@@ -96,6 +102,29 @@ def refresh_local_metadata(project: Path, directory: Path, script: Path, cast: d
             local[name] = {key: cast[name][key] for key in ("name", "bio", "look") if key in cast[name]}
     atomic_json(path, local)
     (directory / "scene_seconds.txt").write_text(f"{CATCHUP_SCENE_SECONDS:g}\n", encoding="utf-8")
+
+
+# ##################################################################
+# render catchup
+# storyboard, create only the scene-requested portraits that are absent (shared refs are never overwritten), then images and movie.
+def render_catchup(directory: Path, title: str) -> Path:
+    wav = directory / "audio" / "hour-00000.wav"
+    if wav_duration(wav) > HOUR_MAX_SECONDS + 0.0001:
+        raise RuntimeError("catch-up audio exceeds the hard 3600s cap")
+    build_storyboard(directory, title)
+    storyboard = json.loads((directory / "storyboard.json").read_text(encoding="utf-8"))
+    needed = [
+        cid for cid, look in sorted(storyboard["appearances"].items())
+        if look and look != "NONE" and cid != "narrator" and not (directory / "refs" / f"{cid}.png").is_file()
+    ]
+    if needed:
+        generate_missing_character_refs(directory, needed)
+    generate_character_refs(directory)
+    generate_scene_images(directory)
+    movie = assemble_movie(directory, title, resolution=FINAL_RESOLUTION)
+    if probe_duration(movie) > HOUR_MAX_SECONDS:
+        raise RuntimeError("catch-up movie exceeds the hard 3600s cap")
+    return movie
 
 
 # ##################################################################
@@ -190,7 +219,7 @@ def _run_locked(source: Path, project: Path, chapter_number: int, defer_images: 
         return None
     if file_digest(wav) != prior["audio_sha256"] or file_digest(wav.with_suffix(".timeline.json")) != prior["timeline_sha256"]:
         raise RuntimeError("saved catch-up audio changed since its timeline was recorded")
-    movie = render_hour(directory, title)
+    movie = render_catchup(directory, title)
     duration = probe_duration(movie)
     state = {**prior, "images_complete": True, "movie": str(movie.relative_to(project)), "duration_seconds": round(duration, 3)}
     write_state(project, directory, label, state)

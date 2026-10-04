@@ -90,3 +90,14 @@ def test_refresh_adds_active_lean_actor_and_keeps_scene_seconds(book) -> None:
     assert "newbie" in json.loads((directory / "voices.json").read_text())
     assert (directory / "scene_seconds.txt").read_text() == "1\n"
     assert json.loads((project / "characters.json").read_text()) == {"old": {"name": "Old"}}
+
+
+def test_render_catchup_requires_audio_before_any_portrait_work(book) -> None:
+    from src.catchup_runner import render_catchup
+
+    _source, project = book
+    directory = project / "catchup" / "chapter-1"
+    directory.mkdir(parents=True)
+    with pytest.raises((OSError, RuntimeError, ValueError)):
+        render_catchup(directory, "t")
+    assert not (directory / "refs").exists()

@@ -321,6 +321,17 @@ BREEZE_BATCH_WINDOW = 4  # max_concurrent 1 on the model; keep a shallow queue
 
 
 # ##################################################################
+# staged input unreadable
+# the one known transient transport denial: HTTP 400 saying a staged input path is unreadable because the file arrived empty.
+STAGE_RETRY_LIMIT = 4
+
+
+def is_empty_staged_input_rejection(error: Exception) -> bool:
+    text = str(error).lower()
+    return "http 400" in text and "unreadable" in text and "empty" in text
+
+
+# ##################################################################
 # tts breeze many
 # synthesize many speaker-attributed lines by BATCHING them into multi-item
 # tts-breeze jobs (clone mode: each item carries its character's staged
@@ -364,22 +375,34 @@ def tts_breeze_many(jobs: list[dict], output_dir: Path) -> list[Path]:
                     staged[speaker] = (stage_file(Path(voice["ref_wav"])), voice["ref_text"])
             return staged
 
-        staged = _stage()
-        params = {
-            "items": [
-                {
-                    "text": j["text"],
-                    "ref_audio_file": staged[j["speaker"]][0],
-                    "ref_text": staged[j["speaker"]][1],
-                    "seed": zlib.crc32(j["text"].encode("utf-8")) % 100000,
-                }
-                for j in batch
-            ],
-            "gap_seconds": 0.0,
-            "force": True,
-        }
+        def _params(staged: dict) -> dict:
+            return {
+                "items": [
+                    {
+                        "text": j["text"],
+                        "ref_audio_file": staged[j["speaker"]][0],
+                        "ref_text": staged[j["speaker"]][1],
+                        "seed": zlib.crc32(j["text"].encode("utf-8")) % 100000,
+                    }
+                    for j in batch
+                ],
+                "gap_seconds": 0.0,
+                "force": True,
+            }
+
+        params = _params(_stage())
+        stage_failures = 0
         while True:
-            jid = _submit(client, "tts-breeze", params, why=f"narrate {len(batch)} lines")
+            try:
+                jid = _submit(client, "tts-breeze", params, why=f"narrate {len(batch)} lines")
+            except RuntimeError as error:
+                stage_failures += 1
+                if not is_empty_staged_input_rejection(error) or stage_failures > STAGE_RETRY_LIMIT:
+                    raise
+                log.warning("breeze staged input arrived empty (%s) — restaging fresh", error)
+                time.sleep(2 * stage_failures)
+                params = _params(_stage())
+                continue
             try:
                 res = client.poll(jid, interval=2.0, timeout=31536000)
                 meta = res.get("result", {}) if isinstance(res, dict) else {}
@@ -391,7 +414,7 @@ def tts_breeze_many(jobs: list[dict], output_dir: Path) -> list[Path]:
                         item_samples and len(item_samples),
                         len(data),
                     )
-                    staged = _stage()
+                    params = _params(_stage())
                     continue
                 with wave.open(io.BytesIO(data)) as w:
                     frames = w.readframes(w.getnframes())
@@ -411,7 +434,7 @@ def tts_breeze_many(jobs: list[dict], output_dir: Path) -> list[Path]:
                 msg = str(e).lower()
                 if "failed" in msg or "cancelled" in msg or "timed out" in msg:
                     log.warning("breeze batch job died (%s) — resubmitting", e)
-                    staged = _stage()
+                    params = _params(_stage())
                     continue
                 log.warning("breeze batch transient (%s) — retrying", e)
                 time.sleep(5)

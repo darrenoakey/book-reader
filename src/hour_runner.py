@@ -524,8 +524,11 @@ def script_for_chapter(
             ) from error
     from src.hourly_spans import generate_hourly_script_sync
 
+    names = {
+        cid: str(info.get("name") or "") for cid, info in cast.items() if isinstance(info, dict)
+    }
     generate_hourly_script_sync(
-        chapter, canonical, sorted(cast), aliases, scoped_references
+        chapter, canonical, sorted(cast), aliases, scoped_references, names
     )
     payload = canonical.read_bytes()
     atomic_json(

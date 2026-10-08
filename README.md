@@ -28,7 +28,7 @@ Give it an EPUB (or a plain `.md` / `.txt` story) and it produces:
 | 2 | `characters` | LLM identifies every character + physical description |
 | 3 | `voices` | LLM writes a voice description per character |
 | 4 | `clone` | Breeze voice-designs a reference clip per character |
-| 5 | `scripts` | LLM converts chapters to speaker-attributed dialogue |
+| 5 | `scripts` | fine-tuned scriptor model (Qwen3-0.6B) splits prose into narrator/character lines |
 | 6 | `audio` | Breeze clones each line (batched), concatenated per chapter |
 | 7 | `m4b` | Chaptered M4B with cover + chapter chimes |
 | 8 | `storyboard` | ~30s scenes aligned to line boundaries + image prompts |
@@ -54,6 +54,23 @@ Give it an EPUB (or a plain `.md` / `.txt` story) and it produces:
 `./run hour SOURCE --hour N` produces exactly one durable production hour from a full source. It extracts the source once, analyzes and scripts only the chapters needed for that hour, and records the next chapter/piece cursor in `hours.json` only after the 854×480 movie succeeds. The output is `output/<source-stem>/hours/hour-NNN/movie/movie.mp4` and is rejected if it exceeds 3600 seconds. Chapter order is numeric even after chapter 99.
 
 The project-root `characters.json`, `voices.json`, `breeze_voices.json`, `voices/`, and `refs/` are shared across hours. Existing identities, Breeze reference clips, and portraits are never replaced; later hours append new cast only. Hour scenes are 20 seconds (about three images per minute), generated only through the sanctioned `qwen-image` / Qwen-Image-2.1 Diffusers route at 864×480, centre-cropped and rendered as an 854×480 Ken Burns movie. No IGS route is used. Hourly scenes condition only on the clean style reference and canonical character portraits; they never use a previous scene as an image reference.
+
+## Speaker attribution (scriptor)
+
+Chapter scripts come from `scriptor`, a Qwen3-0.6B LoRA fine-tune trained in `~/src/scriptor` on PDNC/LitBank gold
+annotations plus synthetic stories (including transcripts with no quote marks). `src/scriptor_attribution.py` sends
+~2200-character passages with the previous 10 script lines and a narrowed speaker list; the model returns
+`{"speaker": "words"}` JSONL, and every script line is then cut from the chapter itself, so a script always rebuilds
+the source byte-for-byte. It is served by native Ollama as `scriptor:v1-1000` on the boringstack (`10.0.0.42:11434`)
+with this Mac's Ollama as the ICMP-gated backup; override in `local/config.toml`:
+
+```toml
+[scriptor]
+model = "scriptor:v1-1000"
+```
+
+On held-out PDNC novels it attributes 88.6% of words correctly (previous qwen3.6-35b span classifier: 62.7%), with
+narration misread as speech at 1.3% (was 10.2%) and speech misread as narration at 0.6% (was 18.3%).
 
 ## The inspect UI
 

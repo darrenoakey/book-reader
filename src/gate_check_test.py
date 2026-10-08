@@ -44,6 +44,7 @@ def test_select_tests() -> None:
         "src/hourly_spans_test.py",
         "src/script_generate_test.py",
         "src/llm_test.py",
+        "src/scriptor_attribution_test.py",
     )
     assert "src/movie_images_test.py" not in schema
     assert "src/movie_assemble_test.py" not in schema
@@ -265,7 +266,7 @@ def test_every_data_recovery_reference_is_selected() -> None:
         suite = name if name.endswith("_test") else f"{name}_test"
         if (ROOT / "src" / f"{suite}.py").exists():
             assert f"src/{suite}.py" in selected, f"data_recovery change misses {suite}"
-    # hourly_spans imports only llm, so it is not a recovery consumer; its suite
+    # hourly_spans imports only llm and scriptor_attribution, so it is not a recovery consumer; its suite
     # runs through the script_generate edge instead of the recovery set.
     assert "hourly_spans" not in consumers
     assert "src/hourly_spans_test.py" in select_tests(["src/hourly_spans.py"])

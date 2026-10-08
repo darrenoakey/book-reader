@@ -82,6 +82,14 @@ def load_scriptor_config(path: Path = CONFIG_PATH) -> RouterConfig:
     return RouterConfig(backend("primary", PRIMARY_URL, "10.0.0.42"), backend("backup", BACKUP_URL, "127.0.0.1"), 1)
 
 
+def scriptor_enabled(path: Path = CONFIG_PATH) -> bool:
+    """Opt-in switch: production keeps its existing classifier unless [scriptor] enabled = true."""
+    if not path.is_file():
+        return False
+    with path.open("rb") as stream:
+        return tomllib.load(stream).get("scriptor", {}).get("enabled", False) is True
+
+
 def scriptor_chat(config: RouterConfig) -> Chat:
     def chat(messages: list[dict]) -> str:
         system, user = messages[0]["content"], messages[1]["content"]

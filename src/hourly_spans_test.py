@@ -1,23 +1,57 @@
 import pytest
 
-from src.hourly_spans import classify_spans, generate_hourly_script_sync, immutable_spans
+from src.hourly_spans import (
+    classify_spans,
+    generate_hourly_script_sync,
+    immutable_spans,
+    parse_assignments,
+    parse_speakers,
+    speaker_array_schema,
+)
 
 
-def test_spans_preserve_source() -> None:
+def test_spans_preserve_source_and_complete_bijection() -> None:
     text = "Klein said Look at the failure egg. He laughed."
     spans = immutable_spans(text)
-    assert "".join(spans) == text and len(spans) == 2
+    assert "".join(spans) == text
+    parsed = parse_assignments(
+        '{"index": 0, "speaker_id": "klein"}\n{"index": 1, "speaker_id": "narrator"}', 0, 2, {"narrator", "klein"}
+    )
+    assert parsed == {0: "klein", 1: "narrator"}
+    pretty_stream = """{
+  "index": 0,
+  "speaker_id": "klein"
+}
+{
+  "index": 1,
+  "speaker_id": "narrator"
+}"""
+    assert parse_assignments(pretty_stream, 0, 2, {"narrator", "klein"}) == {0: "klein", 1: "narrator"}
+    assert parse_assignments(
+        '[{"index": 0, "speaker_id": "klein"}, {"index": 1, "speaker_id": "narrator"}]', 0, 2, {"narrator", "klein"}
+    ) == {0: "klein", 1: "narrator"}
     with pytest.raises(ValueError):
-        immutable_spans("  \n ")
+        parse_assignments(pretty_stream + " trailing", 0, 2, {"narrator", "klein"})
+
+
+def test_schema_speaker_array_requires_one_valid_id_per_span() -> None:
+    schema = speaker_array_schema(["narrator", "klein"], 2)
+    assert schema["minItems"] == schema["maxItems"] == 2
+    assert schema["items"]["enum"] == ["narrator", "klein"]
+    assert parse_speakers('["klein", "narrator"]', 2, {"narrator", "klein"}) == ["klein", "narrator"]
+    with pytest.raises(ValueError):
+        parse_speakers('["klein"]', 2, {"narrator", "klein"})
+    with pytest.raises(ValueError):
+        parse_speakers('["klein", "unknown"]', 2, {"narrator", "klein"})
 
 
 # ##################################################################
-# scoped reference notes
+# scoped references reach the span prompt only at their exact mention
 # a reference bound to chapter hash, span hash and offset annotates just that span and never becomes a global alias.
 def test_scoped_reference_notes_bind_exact_mention_and_reject_mismatch() -> None:
     import hashlib
 
-    from src.hourly_spans import scoped_reference_notes
+    from src.hourly_spans import classification_prompt, scoped_reference_notes
 
     text = "Young Ren smiled. Young stood up. Young left."
     spans = immutable_spans(text)
@@ -39,6 +73,9 @@ def test_scoped_reference_notes_bind_exact_mention_and_reject_mismatch() -> None
         scoped_reference_notes(text, spans, speakers, [{**reference, "span_start": 3}])
     with pytest.raises(ValueError, match="valid speakers"):
         scoped_reference_notes(text, spans, {"narrator"}, [reference])
+    prompt = classification_prompt(["narrator", "young_ren"], "", notes[1], "1: " + spans[1])
+    assert "span 1" in prompt and "ONLY to that exact mention" in prompt
+    assert "young_ren->" not in prompt and "Approved aliases that must use their canonical speaker ID: (none)" in prompt
 
 
 # ##################################################################
@@ -49,14 +86,29 @@ def test_classify_spans_live_splits_quote_from_tag(tmp_path) -> None:
     import json
 
     text = 'Bob looked up. "Yellow," Bob said, "is the colour of the sun."\n\n"Not at night," Alice replied.'
-    lines = asyncio.run(classify_spans(text, ["narrator", "bob", "alice"], names={"bob": "Bob", "alice": "Alice"}))
+    lines = asyncio.run(
+        classify_spans(text, ["narrator", "bob", "alice"], names={"bob": "Bob", "alice": "Alice"}, use_scriptor=True)
+    )
     assert "".join(next(iter(line.values())) for line in lines) == text
     assert [next(iter(line)) for line in lines] == ["narrator", "bob", "narrator", "bob", "alice", "narrator"]
     assert lines[1] == {"bob": ' "Yellow,"'} and lines[4] == {"alice": '\n\n"Not at night,"'}
     chapter = tmp_path / "01-one.txt"
     chapter.write_text(text, encoding="utf-8")
-    script = generate_hourly_script_sync(chapter, tmp_path / "01-one.jsonl", ["narrator", "bob", "alice"])
+    script = generate_hourly_script_sync(
+        chapter, tmp_path / "01-one.jsonl", ["narrator", "bob", "alice"], use_scriptor=True
+    )
     rows = [json.loads(line) for line in script.read_text(encoding="utf-8").splitlines()]
     assert "".join(next(iter(row.values())) for row in rows) == text
     with pytest.raises(ValueError):
-        asyncio.run(classify_spans(text, ["bob"]))
+        asyncio.run(classify_spans(text, ["bob"], use_scriptor=True))
+
+
+def test_scriptor_is_opt_in(tmp_path) -> None:
+    from src.scriptor_attribution import scriptor_enabled
+
+    config = tmp_path / "config.toml"
+    assert scriptor_enabled(tmp_path / "missing.toml") is False
+    config.write_text('[llm]\nmodel = "x"\n', encoding="utf-8")
+    assert scriptor_enabled(config) is False
+    config.write_text("[scriptor]\nenabled = true\n", encoding="utf-8")
+    assert scriptor_enabled(config) is True

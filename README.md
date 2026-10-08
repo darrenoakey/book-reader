@@ -28,7 +28,7 @@ Give it an EPUB (or a plain `.md` / `.txt` story) and it produces:
 | 2 | `characters` | LLM identifies every character + physical description |
 | 3 | `voices` | LLM writes a voice description per character |
 | 4 | `clone` | Breeze voice-designs a reference clip per character |
-| 5 | `scripts` | fine-tuned scriptor model (Qwen3-0.6B) splits prose into narrator/character lines |
+| 5 | `scripts` | LLM converts chapters to speaker-attributed dialogue (opt-in: fine-tuned scriptor model) |
 | 6 | `audio` | Breeze clones each line (batched), concatenated per chapter |
 | 7 | `m4b` | Chaptered M4B with cover + chapter chimes |
 | 8 | `storyboard` | ~30s scenes aligned to line boundaries + image prompts |
@@ -62,10 +62,12 @@ annotations plus synthetic stories (including transcripts with no quote marks). 
 ~2200-character passages with the previous 10 script lines and a narrowed speaker list; the model returns
 `{"speaker": "words"}` JSONL, and every script line is then cut from the chapter itself, so a script always rebuilds
 the source byte-for-byte. It is served by native Ollama as `scriptor:v1-1000` on the boringstack (`10.0.0.42:11434`)
-with this Mac's Ollama as the ICMP-gated backup; override in `local/config.toml`:
+with this Mac's Ollama as the ICMP-gated backup. It is OPT-IN so an in-progress production keeps its existing
+qwen span classifier; enable it in `local/config.toml`:
 
 ```toml
 [scriptor]
+enabled = true
 model = "scriptor:v1-1000"
 ```
 

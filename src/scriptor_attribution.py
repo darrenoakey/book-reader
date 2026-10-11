@@ -5,6 +5,9 @@ The model reads a passage plus the previous script lines and a speaker list, and
 script line is a raw slice of the chapter, so "".join(lines) == chapter byte-for-byte whatever the
 model emits. The prompt format below must match scriptor's training format exactly
 (scriptor/doc.py SYSTEM_PROMPT, user_message, speaker_listing, clip_previous).
+
+Production switch, audio boundary and the procedure for moving to a newer scriptor model:
+docs/SCRIPTOR_PRODUCTION.md.
 """
 
 from __future__ import annotations

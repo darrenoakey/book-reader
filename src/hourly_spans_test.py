@@ -112,3 +112,18 @@ def test_scriptor_is_opt_in(tmp_path) -> None:
     assert scriptor_enabled(config) is False
     config.write_text("[scriptor]\nenabled = true\n", encoding="utf-8")
     assert scriptor_enabled(config) is True
+
+
+# ##################################################################
+# attribution label
+# the provenance recorded in hourly script metadata follows the same opt-in switch and names the configured scriptor model.
+def test_attribution_label_follows_scriptor_switch(tmp_path) -> None:
+    from src.hourly_spans import attribution_label
+
+    config = tmp_path / "config.toml"
+    assert attribution_label(path=tmp_path / "missing.toml") == {"engine": "span-classifier"}
+    config.write_text('[scriptor]\nenabled = true\nmodel = "scriptor:v9"\n', encoding="utf-8")
+    assert attribution_label(path=config) == {"engine": "scriptor", "model": "scriptor:v9"}
+    assert attribution_label(use_scriptor=False, path=config) == {"engine": "span-classifier"}
+    config.write_text('[scriptor]\nenabled = false\nmodel = "scriptor:v9"\n', encoding="utf-8")
+    assert attribution_label(path=config) == {"engine": "span-classifier"}

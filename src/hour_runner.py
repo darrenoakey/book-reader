@@ -522,8 +522,9 @@ def script_for_chapter(
                 "canonical_script_unreadable",
                 f"existing canonical script {canonical.name} is unreadable",
             ) from error
-    from src.hourly_spans import generate_hourly_script_sync
+    from src.hourly_spans import attribution_label, generate_hourly_script_sync
 
+    attribution = attribution_label()
     names = {
         cid: str(info.get("name") or "") for cid, info in cast.items() if isinstance(info, dict)
     }
@@ -537,6 +538,7 @@ def script_for_chapter(
             "mode": "immutable-spans",
             "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
             "sha256": hashlib.sha256(payload).hexdigest(),
+            "attribution": attribution,
             **(
                 {
                     "scoped_references_sha256": hashlib.sha256(

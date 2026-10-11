@@ -10,6 +10,7 @@ from pathlib import Path
 
 from src.llm import ask
 from src.scriptor_attribution import (
+    CONFIG_PATH,
     characters_for,
     load_scriptor_config,
     partition_chapter,
@@ -200,6 +201,16 @@ async def classify_spans(
     if scriptor_enabled() if use_scriptor is None else use_scriptor:
         return await classify_spans_scriptor(text, speaker_ids, approved_aliases, scoped_references, names)
     return await classify_spans_llm(text, speaker_ids, approved_aliases, scoped_references)
+
+
+# ##################################################################
+# attribution label
+# names the engine that writes new hourly scripts so each chapter's metadata records which scriptor
+# version (or the legacy span classifier) produced it; computed from the same switch classify_spans uses.
+def attribution_label(use_scriptor: bool | None = None, path: Path = CONFIG_PATH) -> dict[str, str]:
+    if scriptor_enabled(path) if use_scriptor is None else use_scriptor:
+        return {"engine": "scriptor", "model": load_scriptor_config(path).primary.model}
+    return {"engine": "span-classifier"}
 
 
 def generate_hourly_script_sync(

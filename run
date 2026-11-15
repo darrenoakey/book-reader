@@ -106,6 +106,29 @@ else:
 
 
 # ##################################################################
+# command extend
+# append newly released story text to a produced hourly source and re-bind its ledger, lean cast and EOF target.
+def command_extend(args: argparse.Namespace) -> int:
+    ensure_venv()
+    source = Path(args.source).resolve()
+    continuation = Path(args.continuation).resolve()
+    for path in (source, continuation):
+        if not path.is_file():
+            print(f"Error: input file not found: {path}")
+            return 1
+    installed = command_install(args)
+    if installed:
+        return installed
+    code = f'''
+import json
+from pathlib import Path
+from src.source_extend import extend_source
+print(json.dumps(extend_source(Path({str(source)!r}), Path({str(continuation)!r})), indent=2))
+'''
+    return run_venv([str(VENV_PYTHON), "-c", code])
+
+
+# ##################################################################
 # command prepare cast
 # run or verify the durable whole-source native-Ollama cast preparation before any Hour 3+ production.
 def command_prepare_cast(args: argparse.Namespace) -> int:
@@ -303,6 +326,11 @@ def main(argv: list[str]) -> int:
     p_hour.add_argument("--defer-images", action="store_true", help="Produce only the hour audio+timeline and ledger audio_complete; no images")
     p_hour.add_argument("--render-images", action="store_true", help="Render images/movie for an audio_complete hour from its saved audio and timeline")
     p_hour.set_defaults(func=command_hour)
+
+    p_extend = sub.add_parser("extend", help="Append newly released text to a produced hourly source and re-bind the project")
+    p_extend.add_argument("source", help="Hourly-produced .txt/.md source to extend in place")
+    p_extend.add_argument("continuation", help="Text file containing only the new story text")
+    p_extend.set_defaults(func=command_extend)
 
     p_prepare = sub.add_parser("prepare-cast", help="Resumably prepare and freeze the whole-source cast; required before Hour 3+")
     p_prepare.add_argument("source", help="Full EPUB, Markdown, or text input")

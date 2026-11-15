@@ -79,6 +79,8 @@ MOVIE_PATHS = {
     "src/demo_outputs.py",
     "src/demo_outputs_test.py",
     "src/kokoro_voices_test.py",
+    "src/source_extend.py",
+    "src/source_extend_test.py",
     "src/pipeline_test.py",
     "src/step_runner_test.py",
     "src/tts_engine_test.py",
@@ -133,6 +135,7 @@ RECOVERY_TESTS = (
     "src/step_runner_test.py",
     "src/title_page_test.py",
     "src/identity_group_report_test.py",
+    "src/source_extend_test.py",
 )
 
 
@@ -171,6 +174,8 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "jeff_book.py": ("jeff_book_test.py",),
     "jeff_book_test.py": ("jeff_book_test.py",),
     "src/kokoro_voices_test.py": ("src/kokoro_voices_test.py",),
+    "src/source_extend.py": ("src/source_extend_test.py",),
+    "src/source_extend_test.py": ("src/source_extend_test.py",),
     "src/tts_engine_test.py": ("src/tts_engine_test.py",),
     "src/voice_acoustic_test.py": ("src/voice_acoustic_test.py",),
     "src/voice_clone_test.py": ("src/voice_clone_test.py",),

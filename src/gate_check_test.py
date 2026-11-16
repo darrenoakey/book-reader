@@ -35,7 +35,9 @@ def test_select_tests() -> None:
         "src/movie_resolution_test.py",
         "src/dep_install_test.py",
         "src/gate_check_test.py",
+        "src/noveliser_import_test.py::test_cli_import_only",
         "src/pipeline_test.py",
+        "src/noveliser_import_test.py",
         "src/step_runner_test.py",
     )
     assert "src/movie_images_test.py" not in entry
@@ -55,6 +57,7 @@ def test_select_tests() -> None:
         "src/movie_resolution_test.py",
         "src/dep_install_test.py",
         "src/gate_check_test.py",
+        "src/noveliser_import_test.py::test_cli_import_only",
     )
     assert select_tests(["src/hour_continue.py", "src/hour_continue_test.py"]) == ("src/hour_continue_test.py",)
     assert select_tests(["src/audio_synth.py", "src/audio_synth_test.py"]) == (
@@ -65,6 +68,8 @@ def test_select_tests() -> None:
         "src/arbiter_tts_test.py",
         "src/movie_images_test.py",
     )
+    noveliser = select_tests(["src/noveliser_import.py", "src/testdata/noveliser_arrangement/metadata.json"])
+    assert noveliser == ("src/noveliser_import_test.py", "src/pipeline_test.py", "src/step_runner_test.py")
     assert select_tests(["requirements.txt"]) is None
     assert select_tests([]) is None
     assert select_tests(["README.md"]) is None
@@ -239,6 +244,7 @@ def test_branch_tests_select_themselves_and_unknown_fails_closed() -> None:
         "src/demo_outputs_test.py",
         "src/pipeline_test.py",
         "src/step_runner_test.py",
+        "src/noveliser_import_test.py",
     ):
         assert select_tests([path]) == (path,), path
     assert select_tests(["jeff_book.py"]) == ("jeff_book_test.py",)

@@ -2,7 +2,7 @@ import json
 import os
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from colorama import Fore, Style, init
@@ -15,6 +15,7 @@ from src.m4b_assemble import assemble_m4b
 from src.movie_assemble import DEFAULT_RESOLUTION, assemble_movie, movie_has_resolution
 from src.movie_images import generate_character_refs, generate_scene_images
 from src.movie_storyboard import build_storyboard
+from src.noveliser_import import MANIFEST_NAME, import_noveliser, summary, verify_cast_frozen, verify_import
 from src.script_generate import generate_scripts_sync
 from src.state import is_step_complete, mark_step_complete
 from src.text_ingest import extract_any
@@ -26,7 +27,7 @@ init(autoreset=True)
 @contextmanager
 def _time_step(output_dir: Path, step: str):
     t0 = time.time()
-    started = datetime.now(timezone.utc).isoformat()
+    started = datetime.now(UTC).isoformat()
     try:
         yield
     finally:
@@ -92,29 +93,72 @@ def run_pipeline(epub_path: Path, resolution: int = DEFAULT_RESOLUTION) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     lock = acquire_lock(output_dir)
     try:
+        if (output_dir / MANIFEST_NAME).exists():
+            raise SystemExit(
+                f"{output_dir.name} was imported from a noveliser project; run ./run noveliser <project> "
+                "(re-scripting it would discard the supplied speaker attribution)"
+            )
         return _run_pipeline_locked(epub_path, output_dir, resolution)
     finally:
         release_lock(lock)
 
 
-def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int) -> Path:
+# ##################################################################
+# run noveliser pipeline
+# import a finished noveliser project's speaker-attributed script (or resume it), then run
+# the normal production steps; extract/characters/scripts never call an LLM for it.
+def run_noveliser_pipeline(
+    project: Path,
+    resolution: int = DEFAULT_RESOLUTION,
+    speaker_aliases: dict[str, str] | None = None,
+    reimport: bool = False,
+    import_only: bool = False,
+    style: str | None = None,
+    scene_seconds: float = 0.0,
+) -> Path | None:
+    project = project.resolve()
+    output_dir = get_output_dir(project)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock = acquire_lock(output_dir)
+    try:
+        manifest = import_noveliser(project, output_dir, speaker_aliases, reimport)
+        print(summary(manifest))
+        if style:
+            (output_dir / "style.txt").write_text(style, encoding="utf-8")
+        if scene_seconds:
+            (output_dir / "scene_seconds.txt").write_text(str(scene_seconds), encoding="utf-8")
+        if import_only:
+            return None
+        return _run_pipeline_locked(project, output_dir, resolution, imported=manifest)
+    finally:
+        release_lock(lock)
+
+
+def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int, imported: dict | None = None) -> Path:
     print(f"{Fore.CYAN}Book Reader Pipeline{Style.RESET_ALL}")
     print(f"  Input: {epub_path}")
     print(f"  Output: {output_dir}")
     pipeline_t0 = time.time()
-    print_step(1, "Extract chapters")
-    if is_step_complete(output_dir, "extract"):
+    if imported is not None:
+        print_step(1, "Noveliser import (supplied speakers, no re-attribution)")
+        print_done(f"{len(imported['chapters'])} chapters, {imported['total_lines']} lines verified against source")
+        title, author = imported["title"], imported["author"]
+    elif is_step_complete(output_dir, "extract"):
+        print_step(1, "Extract chapters")
         print_skip("Already extracted")
         title_line = (output_dir / "chapters" / "00-intro.txt").read_text().split(" by ", 1)
         title = title_line[0].strip()
         author = title_line[1].split(", narrated by")[0].strip() if len(title_line) > 1 else "Unknown"
     else:
+        print_step(1, "Extract chapters")
         with _time_step(output_dir, "extract"):
             title, author, written = extract_any(epub_path, output_dir)
         print_done(f"Extracted {len(written)} chapter files")
         mark_step_complete(output_dir, "extract")
     print_step(2, "Analyze characters with Claude Haiku")
-    if is_step_complete(output_dir, "characters"):
+    if imported is not None:
+        print_skip(f"Cast imported from noveliser and frozen ({len(imported['identities'])} identities)")
+    elif is_step_complete(output_dir, "characters"):
         print_skip("Characters already analyzed")
     else:
         with _time_step(output_dir, "characters"):
@@ -129,6 +173,8 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int) -> 
             generate_voices_sync(output_dir)
         print_done("Voice descriptions generated")
         mark_step_complete(output_dir, "voices_desc")
+    if imported is not None:
+        verify_cast_frozen(output_dir, imported)
     print_step(4, f"Prepare character voices ({tts_engine.engine_name()})")
     if is_step_complete(output_dir, "voices_clone"):
         print_skip("Voices already prepared")
@@ -138,7 +184,12 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int) -> 
         print_done(f"Prepared {n_voices} character voices")
         mark_step_complete(output_dir, "voices_clone")
     print_step(5, "Generate scripts with Claude Haiku")
-    if is_step_complete(output_dir, "scripts"):
+    if imported is not None:
+        verify_import(output_dir)
+        print_done("Imported noveliser scripts verified exact (no LLM re-attribution)")
+        if not is_step_complete(output_dir, "scripts"):
+            mark_step_complete(output_dir, "scripts")
+    elif is_step_complete(output_dir, "scripts"):
         print_skip("Scripts already generated")
     else:
         with _time_step(output_dir, "scripts"):
@@ -211,7 +262,7 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int) -> 
             json.dumps(
                 {
                     "step": "TOTAL",
-                    "started": datetime.now(timezone.utc).isoformat(),
+                    "started": datetime.now(UTC).isoformat(),
                     "seconds": round(total, 2),
                 }
             )

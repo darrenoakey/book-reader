@@ -86,6 +86,8 @@ MOVIE_PATHS = {
     "src/tts_engine_test.py",
     "src/voice_acoustic_test.py",
     "src/voice_clone_test.py",
+    "src/noveliser_import.py",
+    "src/noveliser_import_test.py",
 }
 MOVIE_TESTS = (
     "src/movie_assemble_test.py",
@@ -109,6 +111,7 @@ MOVIE_TESTS = (
     "src/movie_images_test.py",
     "src/llm_test.py::test_load_local_toml_config",
     "src/script_generate_test.py",
+    "src/noveliser_import_test.py",
 )
 
 
@@ -136,6 +139,7 @@ RECOVERY_TESTS = (
     "src/title_page_test.py",
     "src/identity_group_report_test.py",
     "src/source_extend_test.py",
+    "src/noveliser_import_test.py",
 )
 
 
@@ -149,6 +153,7 @@ IMPACT: dict[str, tuple[str, ...]] = {
         "src/movie_resolution_test.py",
         "src/dep_install_test.py",
         "src/gate_check_test.py",
+        "src/noveliser_import_test.py::test_cli_import_only",
     ),
     "greenline.toml": ("src/gate_check_test.py",),
     "src/movie_assemble.py": (
@@ -160,9 +165,11 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "src/m4b_assemble_test.py": ("src/m4b_assemble_test.py",),
     "src/movie_resolution.py": ("src/movie_resolution_test.py", "src/movie_assemble_test.py"),
     "src/movie_resolution_test.py": ("src/movie_resolution_test.py",),
-    "src/pipeline.py": ("src/movie_resolution_test.py", "src/pipeline_test.py"),
+    "src/pipeline.py": ("src/movie_resolution_test.py", "src/pipeline_test.py", "src/noveliser_import_test.py"),
     "src/pipeline_test.py": ("src/pipeline_test.py",),
-    "src/step_runner.py": ("src/movie_resolution_test.py", "src/step_runner_test.py"),
+    "src/step_runner.py": ("src/movie_resolution_test.py", "src/step_runner_test.py", "src/noveliser_import_test.py"),
+    "src/noveliser_import.py": ("src/noveliser_import_test.py", "src/pipeline_test.py", "src/step_runner_test.py"),
+    "src/noveliser_import_test.py": ("src/noveliser_import_test.py",),
     "src/step_runner_test.py": ("src/step_runner_test.py",),
     "src/data_recovery.py": RECOVERY_TESTS,
     "src/data_recovery_test.py": ("src/data_recovery_test.py",),
@@ -253,6 +260,12 @@ for _fixture in sorted((ROOT / "src/testdata/wide_bio_v8_prefix").rglob("*")):
         _name = _fixture.relative_to(ROOT).as_posix()
         MOVIE_PATHS.add(_name)
         IMPACT[_name] = ("src/wide_bio_recovery_test.py",)
+
+# The real noveliser project the importer tests replay.
+for _fixture in sorted((ROOT / "src/testdata/noveliser_arrangement").glob("*.json")):
+    _name = _fixture.relative_to(ROOT).as_posix()
+    MOVIE_PATHS.add(_name)
+    IMPACT[_name] = ("src/noveliser_import_test.py",)
 
 
 # ##################################################################

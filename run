@@ -82,6 +82,41 @@ run_pipeline(Path("{epub_path}"), resolution={args.resolution!r})
 
 
 # ##################################################################
+# command noveliser
+# import a finished noveliser project's speaker-attributed script directly (no re-attribution),
+# then run the normal production steps unless --import-only.
+def command_noveliser(args: argparse.Namespace) -> int:
+    ensure_venv()
+    project = Path(args.project).resolve()
+    if not project.is_dir():
+        print(f"Error: noveliser project folder not found: {project}")
+        return 1
+    installed = command_install(args)
+    if installed:
+        return installed
+    code = f'''
+import sys
+from pathlib import Path
+from src.noveliser_import import NoveliserImportError, parse_aliases
+from src.pipeline import run_noveliser_pipeline
+try:
+    run_noveliser_pipeline(
+        Path({str(project)!r}),
+        resolution={args.resolution!r},
+        speaker_aliases=parse_aliases({args.speaker_alias!r}),
+        reimport={args.reimport!r},
+        import_only={args.import_only!r},
+        style={args.style!r},
+        scene_seconds={args.scene_seconds!r},
+    )
+except NoveliserImportError as error:
+    print(f"noveliser import refused: {{error}}", file=sys.stderr)
+    sys.exit(2)
+'''
+    return run_venv([str(VENV_PYTHON), "-c", code])
+
+
+# ##################################################################
 # command hour
 # dispatch bounded production inside the venv so optional GPU client imports never run in the ambient facade interpreter.
 def command_hour(args: argparse.Namespace) -> int:
@@ -223,7 +258,7 @@ def command_step(args: argparse.Namespace) -> int:
     ensure_venv()
     epub_path = Path(args.epub).resolve()
     if not epub_path.exists():
-        print(f"Error: EPUB file not found: {epub_path}")
+        print(f"Error: input file not found: {epub_path}")
         return 1
     installed = command_install(args)
     if installed:
@@ -318,6 +353,16 @@ def main(argv: list[str]) -> int:
     p_create.add_argument("--resolution", type=int, choices=sorted(SUPPORTED_RESOLUTIONS), default=DEFAULT_RESOLUTION, help="Movie vertical resolution (default: 480)")
     p_create.set_defaults(func=command_create)
 
+    p_nov = sub.add_parser("noveliser", help="Use a finished noveliser project's speaker-attributed script directly (no re-attribution)")
+    p_nov.add_argument("project", help="noveliser output folder (metadata.json, characters.json, audio_chapter_N.json)")
+    p_nov.add_argument("--import-only", action="store_true", help="Import and verify only; no LLM, TTS, image or movie work")
+    p_nov.add_argument("--speaker-alias", action="append", default=None, metavar="LABEL=NAME", help="Explicitly map an ambiguous script label onto an exact characters.json name (or narrator); repeatable")
+    p_nov.add_argument("--reimport", action="store_true", help="Source changed: archive the existing project (never deleted) and import afresh; frozen voices carry over only for an identical cast")
+    p_nov.add_argument("--style", default=None, help="Visual style for the movie (writes the project's style.txt override)")
+    p_nov.add_argument("--scene-seconds", type=float, default=0.0, help="Seconds per scene image (default 30; writes scene_seconds.txt)")
+    p_nov.add_argument("--resolution", type=int, choices=sorted(SUPPORTED_RESOLUTIONS), default=DEFAULT_RESOLUTION, help="Movie vertical resolution (default: 480)")
+    p_nov.set_defaults(func=command_noveliser)
+
     p_hour = sub.add_parser("hour", help="Produce one resumable, no-longer-than-3600s 480p movie hour")
     p_hour.add_argument("source", help="Full EPUB, Markdown, or text input")
     p_hour.add_argument("--hour", type=int, default=1, help="1-based production hour number")
@@ -366,7 +411,7 @@ def main(argv: list[str]) -> int:
             "storyboard", "titlepage", "refimages", "sceneimages", "movie",
         ],
     )
-    p_step.add_argument("epub", help="Path to EPUB file (or .md/.txt story)")
+    p_step.add_argument("epub", help="Path to EPUB file (or .md/.txt story, or an imported noveliser project folder)")
     p_step.add_argument("--max-chapters", type=int, default=0, help="Limit to first N chapters")
     p_step.add_argument("--resolution", type=int, choices=sorted(SUPPORTED_RESOLUTIONS), default=DEFAULT_RESOLUTION, help="Movie vertical resolution (default: 480)")
     p_step.set_defaults(func=command_step)

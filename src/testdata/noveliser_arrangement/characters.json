@@ -1,0 +1,59 @@
+{
+  "characters": [
+    {
+      "name": "Elena Marchetti",
+      "biography": "Raised above her grandparents' neighborhood grocery in Chicago, Elena learned to associate love with practical labor: repaired shelves, packed lunches, and showing up early. She became an architect specializing in adaptive reuse, determined to preserve the character of buildings without embalming them. Three years ago, her fiancé and fellow architect presented her design as his own; when she confronted him, he called her impossible to collaborate with. She ended both relationships but quietly absorbed his accusation. After a New Orleans site visit, a storm cancels her flight home before a career-defining partnership presentation. At her hotel bar, she encounters Marcus, whose improvisational approach to music—and apparently everything else—offends her professional principles and considerably improves her evening.",
+      "role": "protagonist",
+      "traits": [],
+      "wound": "Her fiancé stole professional credit and recast her justified anger as proof that she was too demanding to love or work beside.",
+      "lie": "If I remain indispensable and control the terms, nobody can exploit me or make me foolish for trusting them.",
+      "want": "Complete her partnership presentation from the stranded hotel and return to Chicago without letting an inconvenient attraction derail her plans.",
+      "need": "Accept that boundaries and vulnerability can coexist, and that being loved does not require being useful, flawless, or in control.",
+      "arc": "positive change"
+    },
+    {
+      "name": "Marcus Reid",
+      "biography": "Marcus grew up in South London with a Jamaican-born mother who taught mathematics and an English-born father who tuned pianos. Church music, his father's record collection, and school practice rooms gave him overlapping musical educations. He built a respected touring career through harmonic daring, immaculate timing, and a stage manner that makes large rooms feel intimate. At thirty-one, he accepted a year-long tour without seriously consulting his long-term partner; their subsequent separation confirmed the abandonment he had helped create. He is in New Orleans for a guest performance when the storm strands him at the hotel. Beneath his effortless charm, he is exhausted by a life organized around departures.",
+      "role": "protagonist",
+      "traits": [],
+      "wound": "His father's intermittent absences taught him to distrust promises; his adult partner's departure reinforced that fear without forcing him to examine his own evasions.",
+      "lie": "If I never ask anyone to stay and never promise to stay myself, loss cannot make a fool of me.",
+      "want": "Deliver a standout performance on the hotel's Sunday jazz broadcast to support his application for a stable Chicago residency rather than another exhausting international tour.",
+      "need": "Understand that freedom includes choosing commitments, and that asking for love is not the same as surrendering autonomy.",
+      "arc": "positive change"
+    },
+    {
+      "name": "Vivian Shaw",
+      "biography": "The daughter of a Birmingham bus driver and a district nurse, Vivian entered music through venue administration rather than performance. She founded her agency after a celebrated pianist abandoned a tour she had personally guaranteed, leaving her with debt and a reputation she spent years rebuilding. She has managed Marcus for nine years, securing fair contracts and shielding him from an industry happy to mistake charm for consent. Accompanying him to New Orleans, she intends to finalize a lucrative international tour before its Monday deadline. She regards the uncertain Chicago residency—and his sudden investment in Elena—as potential threats to a hard-won recovery, not as competing visions of happiness.",
+      "role": "antagonist",
+      "traits": [],
+      "wound": "An artist's broken commitment nearly bankrupted her and taught her that someone else's freedom could become her catastrophe.",
+      "lie": "If I eliminate uncertainty and make myself indispensable, the people I protect cannot abandon me or destroy what we have built.",
+      "want": "Obtain Marcus's signature on the international touring agreement before Monday and keep the weekend focused on that outcome.",
+      "need": "Accept that loyalty requires informed choice, not engineered dependence, and that Marcus's different priorities are not a betrayal.",
+      "arc": "positive change"
+    },
+    {
+      "name": "Camille Baptiste",
+      "biography": "Camille grew up in Gentilly and worked her way from banquet service to managing the hotel's bar and intimate music program. Divorced and sharing custody of a teenage daughter, she takes pride in making hospitality a sustainable profession rather than an endless performance of generosity. A previous owner once rewarded her storm-season overtime by cutting staff bonuses, and she has not confused praise with support since. During the shutdown, she must keep stranded guests comfortable, protect her staff's rest, and deliver Sunday's established jazz broadcast if conditions permit. She recruits Elena's logistical competence and Marcus's musicianship, but refuses to become their unpaid romantic interpreter.",
+      "role": "supporting",
+      "traits": [],
+      "wound": "An employer exploited her reliability during a crisis, then treated her staff as disposable.",
+      "lie": "If I let anyone see me struggle, they will leave me carrying their work as well as mine.",
+      "want": "Run a safe, adequately staffed storm weekend and preserve the Sunday broadcast without sacrificing her employees.",
+      "need": "Recognize that requesting specific help can reinforce her authority rather than diminish it.",
+      "arc": "positive change"
+    },
+    {
+      "name": "Priya Desai",
+      "biography": "Priya met Elena during their first architecture internship, when they bonded over a supervisor's impossible deadlines and terrible scale models. Now a senior project architect at the same firm, she is coordinating the Chicago end of Elena's partnership presentation. Earlier in her career, she swallowed credit disputes to preserve the appearance of being agreeable; therapy and a happy, occasionally untidy marriage have made her less impressed by that strategy. Over increasingly ill-timed video calls, she helps Elena distinguish an actual professional emergency from the alarming experience of enjoying herself. She also has deadlines of her own and will not quietly complete Elena's work while being called supportive.",
+      "role": "supporting",
+      "traits": [],
+      "wound": "A former mentor repeatedly took advantage of her agreeableness and passed her work off as team effort.",
+      "lie": "Being needed is the surest way to keep my place in someone's life.",
+      "want": "Help deliver a successful partnership presentation while receiving clear credit and keeping her own weekend commitments.",
+      "need": "Remember that mutual affection survives limits, and that friendship does not require rescuing someone from every consequence.",
+      "arc": "flat"
+    }
+  ]
+}

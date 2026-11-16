@@ -11,6 +11,14 @@ from src.m4b_assemble import assemble_m4b
 from src.movie_assemble import DEFAULT_RESOLUTION, SUPPORTED_RESOLUTIONS, assemble_movie
 from src.movie_images import generate_character_refs, generate_scene_images
 from src.movie_storyboard import build_storyboard
+from src.noveliser_import import (
+    NoveliserImportError,
+    import_noveliser,
+    read_manifest,
+    summary,
+    verify_cast_frozen,
+    verify_import,
+)
 from src.script_generate import generate_scripts_sync
 from src.state import mark_step_complete
 from src.text_ingest import extract_any
@@ -31,11 +39,50 @@ def get_book_info(output_dir: Path) -> tuple[str, str]:
 
 
 # ##################################################################
+# noveliser step
+# an imported noveliser project replaces extract/characters/scripts with import and exact
+# verification (never an LLM); every other step first passes the resume gate. Returns an exit
+# code when the step is fully handled here, else None for the shared step implementations.
+def noveliser_step(step: str, source: Path, output_dir: Path) -> int | None:
+    manifest = read_manifest(output_dir)
+    if not source.is_dir():
+        if manifest is not None:
+            raise NoveliserImportError(
+                f"{output_dir.name} is a noveliser import; pass its noveliser project folder, not {source.name}"
+            )
+        return None
+    if step == "extract":
+        print(summary(import_noveliser(source, output_dir)))
+        return 0
+    if manifest is None:
+        raise NoveliserImportError(f"{source} is not imported yet: run ./run noveliser {source} --import-only")
+    verify_import(output_dir)
+    if step == "characters":
+        chars = json.loads((output_dir / "characters.json").read_text(encoding="utf-8"))
+        print(f"Imported cast is frozen: {len(chars)} identities")
+        for char_id, info in chars.items():
+            print(f"  {char_id}: {info['name']}")
+        return 0
+    if step == "scripts":
+        print(f"Imported noveliser scripts verified exact: {manifest['total_lines']} lines (no LLM re-attribution)")
+        mark_step_complete(output_dir, "scripts")
+        return 0
+    return None
+
+
+# ##################################################################
 # run step
 # execute a single pipeline step
 def run_step(step: str, epub_path: Path, max_chapters: int = 0, resolution: int = DEFAULT_RESOLUTION) -> int:
     output_dir = get_output_dir(epub_path)
     output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        imported = noveliser_step(step, epub_path, output_dir)
+    except NoveliserImportError as error:
+        print(f"noveliser import refused: {error}")
+        return 2
+    if imported is not None:
+        return imported
 
     if step == "extract":
         title, author, written = extract_any(epub_path, output_dir)
@@ -58,6 +105,8 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0, resolution: int 
         for char_id, info in voices.items():
             print(f"{Fore.GREEN}{char_id}{Style.RESET_ALL}")
             print(f"  {info['description']}\n")
+        if read_manifest(output_dir) is not None:
+            verify_cast_frozen(output_dir, read_manifest(output_dir))
         mark_step_complete(output_dir, "voices_desc")
 
     elif step == "clone":

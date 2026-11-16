@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11434",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "ollama",
+      "num_ctx": 32768,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": null
+    }
+  },
+  "routes_used": [
+    "qwen3.6:35b-a3b"
+  ],
+  "request": {
+    "prompt": "You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.\n\nAudiobook character voice for TTS cloning.\n\nCAST PLAN CONSTRAINTS (authoritative — the description MUST match all of these;\nuse \"unknown\" fields as freedom, never invent a value for them):\nGender: unknown\nAge: unknown\nAccent: unknown\nVocal size: unknown\nEstablished facts: Character name is Test; Bio describes character as 'Test character'\n\nCharacter id: test\nBio: Test character\n\nCover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.\n\nOutput the voice description text only. No JSON, no preamble.",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "response": "The voice of Test is a neutral, mid-range adult male with a calm and steady delivery. His tone is clear and articulate, lacking any distinct regional accent or strong emotional inflection. The pitch sits comfortably in the middle register, providing an accessible and easy-to-listen-to quality suitable for general narration. There are no distinctive vocal quirks, such as breathiness or rasp, ensuring a clean and professional sound. The pacing is moderate and consistent, allowing listeners to easily follow the narrative without distraction."
+}

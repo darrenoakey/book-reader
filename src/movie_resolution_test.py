@@ -34,10 +34,13 @@ def _make_tone(path: Path) -> None:
 # prepare project
 # constructs a self-contained one-scene project using real audio and image assets
 def _prepare_project(output_dir: Path) -> None:
+    from src.voice_assets_test import prepared_project_at
+
     output_dir.mkdir(parents=True, exist_ok=True)
+    prepared_project_at(output_dir)
     audio_dir = output_dir / "audio"
     scenes_dir = output_dir / "scenes"
-    audio_dir.mkdir()
+    audio_dir.mkdir(exist_ok=True)
     scenes_dir.mkdir()
     _make_tone(audio_dir / "01-chapter.wav")
     (audio_dir / "01-chapter.timeline.json").write_text(json.dumps({"chapter": "01-chapter", "lines": []}))

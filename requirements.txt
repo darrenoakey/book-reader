@@ -6,6 +6,6 @@ ebooklib
 lxml
 Pillow
 pytest
-ruff
+ruff==0.17.5
 setproctitle
 numpy

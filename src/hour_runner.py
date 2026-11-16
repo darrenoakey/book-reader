@@ -15,7 +15,7 @@ import os
 import re
 import shutil
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from src import tts_engine
@@ -200,18 +200,38 @@ async def extend_cast(
 # extend voices
 # create Breeze descriptions only for identities not already established in the shared voice map.
 async def extend_voices(project: Path, cast: dict, active_only: bool = False) -> None:
+    from src.cast_plan import (
+        build_cast_plan,
+        load_plan,
+        plan_is_stale,
+        plan_missing_characters,
+    )
+
     path = project / "voices.json"
     voices = load_json_store(path, "voices", default={})
+    plan = None
     missing = [
-        (char_id, info) for char_id, info in cast.items() if char_id not in voices
+        (char_id, info)
+        for char_id, info in cast.items()
+        if char_id not in voices and not str(char_id).startswith("_")
     ]
     if missing:
+        # New identities are described against the SAME whole-cast plan as the
+        # established voices: a stale or incomplete plan is refreshed first so
+        # cohort accents and profile constraints stay coherent across hours.
+        if plan_is_stale(project, cast) or plan_missing_characters(project, cast):
+            plan = await build_cast_plan(project, cast)
+        else:
+            plan = load_plan(project)
         described = await asyncio.gather(
-            *(_voice_description_for_one(char_id, info) for char_id, info in missing)
+            *(_voice_description_for_one(char_id, info, plan) for char_id, info in missing)
         )
         for char_id, info in described:
             voices[char_id] = info
         atomic_json(path, voices)
+        from src.cast_plan import SIDECAR_VOICES, write_plan_sidecar
+
+        write_plan_sidecar(project, plan["fingerprint"], SIDECAR_VOICES)
     prepare_breeze_voices(project, only=set(cast) if active_only else None)
 
 
@@ -364,7 +384,9 @@ def prepare_hour_directory(
         ):
             source = json.loads((project / name).read_text(encoding="utf-8"))
             kept = {
-                actor_id: source[actor_id] for actor_id in frozen_names if actor_id in source
+                actor_id: source[actor_id]
+                for actor_id in frozen_names
+                if actor_id in source and not str(actor_id).startswith("_")
             }
             existing = hour_dir / name
             if name == "characters.json" and existing.is_file():
@@ -575,7 +597,10 @@ def copy_chapter_context(hour_dir: Path, chapter: Path) -> None:
 def synthesize_window(
     project: Path, script: Path, remaining: float, start_piece: int
 ) -> tuple[list[dict], int]:
+    from src.voice_assets import require_audio_binding
+
     audio_dir = project / "audio_cache"
+    require_audio_binding(project, audio_dir, tts_engine.engine_name())
     audio_dir.mkdir(exist_ok=True)
     _, paths, jobs, metadata = plan_chapter(
         script, audio_dir, project / "voices", tts_engine.speaker_set(project)
@@ -641,7 +666,7 @@ def record_hour_timing(
     project: Path, hour_index: int, outcome: str, seconds: float
 ) -> None:
     entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "hour": hour_index,
         "outcome": outcome,
         "seconds": round(seconds, 3),

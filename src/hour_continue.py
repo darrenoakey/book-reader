@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from PIL import Image, ImageStat
@@ -36,7 +36,7 @@ ACTIVE_POLL_SECONDS = 10
 # append event
 # write a readable, append-only record so an auto-managed resume can be diagnosed without changing ledger state.
 def append_event(project: Path, event: str, **details: object) -> None:
-    entry = {"timestamp": datetime.now(timezone.utc).isoformat(), "event": event, **details}
+    entry = {"timestamp": datetime.now(UTC).isoformat(), "event": event, **details}
     with (project / EVENTS_NAME).open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(entry) + "\n")
 

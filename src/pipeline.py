@@ -15,13 +15,56 @@ from src.m4b_assemble import assemble_m4b
 from src.movie_assemble import DEFAULT_RESOLUTION, assemble_movie, movie_has_resolution
 from src.movie_images import generate_character_refs, generate_scene_images
 from src.movie_storyboard import build_storyboard
-from src.noveliser_import import MANIFEST_NAME, import_noveliser, summary, verify_cast_frozen, verify_import
+from src.noveliser_import import (
+    MANIFEST_NAME,
+    import_noveliser,
+    summary,
+    verify_cast_frozen,
+    verify_import,
+)
 from src.script_generate import generate_scripts_sync
 from src.state import is_step_complete, mark_step_complete
 from src.text_ingest import extract_any
 from src.voice_description import generate_voices_sync
 
 init(autoreset=True)
+
+
+# ##################################################################
+# voices_desc staleness
+# a marked-complete voices_desc step is only authoritative while the cast
+# inputs behind it are unchanged: characters.json digests and importer source
+# context (via the cast-plan fingerprint) plus the persisted voices.json's own
+# recorded fingerprint must all agree, else the step re-runs (no silent stale
+# cache reuse) without destroying already-rendered audio steps.
+def _voices_desc_stale(output_dir: Path) -> bool:
+    characters_path = output_dir / "characters.json"
+    voices_path = output_dir / "voices.json"
+    if not characters_path.is_file() or not voices_path.is_file():
+        return True
+    try:
+        characters = json.loads(characters_path.read_text(encoding="utf-8"))
+        if not isinstance(json.loads(voices_path.read_text(encoding="utf-8")), dict):
+            return True
+    except (json.JSONDecodeError, OSError):
+        return True
+    from src.cast_plan import (
+        SIDECAR_VOICES,
+        artifact_matches_plan,
+        load_plan,
+        plan_is_stale,
+    )
+
+    if plan_is_stale(output_dir, characters):
+        return True
+    plan_fingerprint = None
+    plan_path = output_dir / "cast_plan.json"
+    if plan_path.is_file():
+        try:
+            plan_fingerprint = json.loads(plan_path.read_text(encoding="utf-8")).get("fingerprint")
+        except (json.JSONDecodeError, OSError):
+            plan_fingerprint = None
+    return plan_fingerprint is None or not artifact_matches_plan(output_dir, SIDECAR_VOICES, load_plan(output_dir))
 
 
 @contextmanager
@@ -166,7 +209,7 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int, imp
         print_done("Character analysis complete")
         mark_step_complete(output_dir, "characters")
     print_step(3, "Generate voice descriptions")
-    if is_step_complete(output_dir, "voices_desc"):
+    if is_step_complete(output_dir, "voices_desc") and not _voices_desc_stale(output_dir):
         print_skip("Voice descriptions already generated")
     else:
         with _time_step(output_dir, "voices_desc"):
@@ -177,6 +220,8 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int, imp
         verify_cast_frozen(output_dir, imported)
     print_step(4, f"Prepare character voices ({tts_engine.engine_name()})")
     if is_step_complete(output_dir, "voices_clone"):
+        if not tts_engine.voices_ready(output_dir):
+            raise ValueError(f"completed voice preparation has missing assets in {output_dir}; explicitly recast")
         print_skip("Voices already prepared")
     else:
         with _time_step(output_dir, "voices_clone"):
@@ -197,6 +242,9 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int, imp
         print_done(f"Generated {len(scripts)} script files")
         mark_step_complete(output_dir, "scripts")
     print_step(6, "Synthesize audio with voice cloning")
+    from src.voice_assets import require_audio_binding
+
+    require_audio_binding(output_dir, output_dir / "audio", tts_engine.engine_name())
     if is_step_complete(output_dir, "audio"):
         print_skip("Audio already synthesized")
     else:

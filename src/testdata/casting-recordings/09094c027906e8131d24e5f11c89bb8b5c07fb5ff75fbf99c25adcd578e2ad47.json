@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11436/v1",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "openai",
+      "num_ctx": 262144,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": "Darrens-MacBook-Pro"
+    }
+  },
+  "routes_used": [
+    "qwen3.6:35b-a3b"
+  ],
+  "request": {
+    "prompt": "You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.\n\nAudiobook character voice for TTS cloning.\n\nCAST PLAN CONSTRAINTS (authoritative — the description MUST match all of these;\nuse \"unknown\" fields as freedom, never invent a value for them):\nGender: female\nAge: middle_aged (about 52)\nAccent: American English (Midwestern)\nVocal size: medium\nMust sound clearly distinct from: kaya, rosa\nEstablished facts: Diane, 52, a direct American neighbor with a no-nonsense Midwestern voice.\n\nCharacter id: diane\nBio: A quiet Chicago domestic story: Elena, an Italian-American architect, and her partner Marcus, a Black British jazz pianist who grew up in South London, share an apartment with Elena's teenage nieces Kaya and Rosa, twins raised in the same Chicago household. Gerald is the building's elderly Welsh caretaker. Diane is a middle-aged American neighbor. The Station Man sells train tickets in a booth. Diane, 52, a direct American neighbor with a no-nonsense Midwestern voice.\n\nCover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.\n\nOutput the voice description text only. No JSON, no preamble.",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "response": "Female, middle-aged, approximately fifty-two years old. She speaks with a clear, standard American Midwestern accent, devoid of regional slang or heavy dialect markers. Her vocal size is medium, projecting warmth without being overpowering. The pitch sits comfortably in the mid-range, avoiding the higher frequencies associated with younger voices or the deeper tones of other characters. Her timbre is crisp and articulate, reflecting a no-nonsense, direct personality typical of a practical Chicago neighbor. The pace is steady and measured, conveying reliability and straightforwardness. There is no emotional exaggeration; her delivery is grounded, professional, and distinctly distinct from other female voices, ensuring clear separation in ensemble casts."
+}

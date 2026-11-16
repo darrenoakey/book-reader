@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11436/v1",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "openai",
+      "num_ctx": 262144,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": "Darrens-MacBook-Pro"
+    }
+  },
+  "routes_used": [
+    "qwen3.6:35b-a3b"
+  ],
+  "request": {
+    "prompt": "You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.\n\nAudiobook character voice for TTS cloning.\n\nCAST PLAN CONSTRAINTS (authoritative — the description MUST match all of these;\nuse \"unknown\" fields as freedom, never invent a value for them):\nGender: female\nAge: adult (about 41)\nAccent: American English (Midwestern)\nVocal size: unknown\nMust sound clearly distinct from: mme_berger, theo\nEstablished facts: June, 41, American from Chicago, direct midwestern speech.; She stays American-accented throughout.\n\nCharacter id: june\nBio: An American architect, June, flies from Chicago to Lyon for a restoration project. She stays American-accented throughout. The locals — hotelier Madame Berger and her nephew Théo, both born and raised in Lyon — speak English with French accents. June, 41, American from Chicago, direct midwestern speech.\n\nCover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.\n\nOutput the voice description text only. No JSON, no preamble.\n\nYour previous reply was:\nFemale, approximately 41 years old, speaking with a clear American Midwestern accent, specifically reflecting a Chicago origin. The voice is direct, grounded, and professional, mirroring her role as an architect. Pitch is moderately low to mid-range, conveying authority and practicality without being overly deep. Timbre is warm yet crisp, with a steady, unhurried pace that suggests confidence and no-nonsense efficiency. There is a subtle, natural resonance that distinguishes her from the French-accented characters, maintaining a distinct, authentic American sound throughout. The tone is composed and articulate, avoiding excessive emotionality in favor of clear, precise enunciation suitable for a professional setting.\n\nIt contradicted the casting plan:\n- description specifies a conflicting french accent\n\nRewrite the voice description so it satisfies EVERY constraint exactly (state the correct gender, age band and accent explicitly). Output the voice description text only.",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "response": "Female, approximately 41 years old, speaking with a clear American Midwestern accent, specifically reflecting a Chicago origin. The voice is direct, grounded, and professional, mirroring her role as an architect. Pitch is moderately low to mid-range, conveying authority and practicality without being overly deep. Timbre is warm yet crisp, with a steady, unhurried pace that suggests confidence and no-nonsense efficiency. There is a subtle, natural resonance that distinguishes her from the French-accented characters, maintaining a distinct, authentic American sound throughout. The tone is composed and articulate, avoiding excessive emotionality in favor of clear, precise enunciation suitable for a professional setting."
+}

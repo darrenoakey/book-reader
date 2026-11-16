@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -9,7 +9,7 @@ from pathlib import Path
 def append_state(output_dir: Path, step: str, detail: str) -> None:
     state_path = output_dir / "state.jsonl"
     entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "step": step,
         "detail": detail,
     }

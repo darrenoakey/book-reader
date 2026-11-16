@@ -581,9 +581,23 @@ def test_historical_semantic_migration_keeps_chapter_sixty_new_candidates_eligib
     snapshot = json.loads((project / "qa-new-identity-before-correction.json").read_text(encoding="utf-8"))
     progress = snapshot["progress"]
     assert progress["version"] == 3 and progress["next_chapter"] == 60
-    assert progress["source_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    source_bytes = source.read_bytes()
+    source_hash = hashlib.sha256(source_bytes).hexdigest()
+    if source_hash != progress["source_sha256"]:
+        # The source was legitimately appended after this historical snapshot.
+        # Recover ONLY its byte-identical, provenance-bound original prefix;
+        # never rewrite the snapshot hash or accept a changed historical text.
+        ledger = json.loads((project / "hours.json").read_text(encoding="utf-8"))
+        assert source_hash == ledger["sha256"]
+        extension = next(item for item in ledger["extensions"] if item["previous_sha256"] == progress["source_sha256"])
+        source_bytes = source_bytes[:extension["previous_bytes"]]
+    assert progress["source_sha256"] == hashlib.sha256(source_bytes).hexdigest()
     assert len(snapshot["alias_audit"]) == 25, "historical alias audit snapshot changed"
+    assert (project / "chapters").is_dir(), "mandatory historical chapter fixture is unavailable"
+    assert any((project / "chapters").glob("*.txt")), "never extract into the live fixture from a test"
     _, _, chapters = source_chapters(source, project)
+    assert len(chapters) >= progress["chapter_count"]
+    chapters = chapters[:progress["chapter_count"]]
     batch, _ = context_safe_batch(chapters, 59, progress["registry"], progress["aliases"])
     candidates = candidate_coverage_ledger(immutable_evidence_units(batch), progress["registry"], progress["aliases"])
     labels = {candidate["label"] for candidate in candidates}

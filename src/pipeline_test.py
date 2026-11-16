@@ -83,6 +83,9 @@ def finished_project():
     chapters = output_dir / "chapters"
     chapters.mkdir(parents=True)
     (chapters / "00-intro.txt").write_text("A Tale of Two Tests by Ada Tester, narrated by Darren's Book Reader.")
+    from src.voice_assets_test import prepared_project_at
+
+    prepared_project_at(output_dir)
     for step in ALL_STEPS:
         mark_step_complete(output_dir, step)
     try:

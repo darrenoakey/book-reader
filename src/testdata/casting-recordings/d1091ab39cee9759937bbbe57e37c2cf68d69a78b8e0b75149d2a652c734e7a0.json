@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11436/v1",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "openai",
+      "num_ctx": 262144,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": "Darrens-MacBook-Pro"
+    }
+  },
+  "routes_used": [
+    "qwen3.6:35b-a3b"
+  ],
+  "request": {
+    "prompt": "You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.\n\nAudiobook narrator. Focus on narration qualities: clarity, authority, warmth, pace, range for character voices.\n\nCAST PLAN CONSTRAINTS (authoritative — the description MUST match all of these;\nuse \"unknown\" fields as freedom, never invent a value for them):\nGender: unknown\nAge: unknown\nAccent: unknown\nVocal size: medium\nMust sound clearly distinct from: john\nEstablished facts: An authoritative but warm narrator for a family drama novel.\n\nCharacter id: narrator\nBio: An authoritative but warm narrator for a family drama novel.\n\nCover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.\n\nOutput the voice description text only. No JSON, no preamble.",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "response": "A medium-sized, authoritative yet warm narrator voice, ideal for family drama. The tone is clear and steady, projecting confidence without being cold. Pace is measured and deliberate, allowing emotional weight to settle in each sentence. The voice possesses a rich, resonant timbre that conveys empathy and depth, drawing listeners into the narrative. It maintains distinct clarity, ensuring every word is understood, while offering subtle range for character differentiation. This narration style balances professional authority with genuine warmth, creating an engaging and trustworthy listening experience that feels intimate yet polished, perfectly suited for complex interpersonal stories."
+}

@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11436/v1",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "openai",
+      "num_ctx": 262144,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": "Darrens-MacBook-Pro"
+    }
+  },
+  "routes_used": [
+    "qwen3.6:35b-a3b"
+  ],
+  "request": {
+    "prompt": "You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.\n\nAudiobook character voice for TTS cloning.\n\nCAST PLAN CONSTRAINTS (authoritative — the description MUST match all of these;\nuse \"unknown\" fields as freedom, never invent a value for them):\nGender: female\nAge: teen (about 16)\nAccent: American English\nVocal size: medium\nMust sound clearly distinct from: kaya\nEstablished facts: Rosa, 16, Kaya's twin, raised in the same Chicago household; softer and lower-speaking than her sister.; Twins raised in the same Chicago household.\n\nCharacter id: rosa\nBio: A quiet Chicago domestic story: Elena, an Italian-American architect, and her partner Marcus, a Black British jazz pianist who grew up in South London, share an apartment with Elena's teenage nieces Kaya and Rosa, twins raised in the same Chicago household. Gerald is the building's elderly Welsh caretaker. Diane is a middle-aged American neighbor. The Station Man sells train tickets in a booth. Rosa, 16, Kaya's twin, raised in the same Chicago household; softer and lower-speaking than her sister.\n\nCover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.\n\nOutput the voice description text only. No JSON, no preamble.",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "response": "Female, teen, approximately sixteen years old, speaking American English. The voice possesses a medium vocal size, characterized by a distinctively soft and lower-register tone compared to her twin. The timbre is warm and muted, avoiding sharp or bright qualities. Pace is measured and calm, reflecting a quiet, introspective personality. Emotionally, the delivery remains subdued and gentle, lacking the energetic projection of her sister. Distinctive traits include a slightly breathy quality and a relaxed articulation that conveys shyness. The pitch sits comfortably in the lower-mid range, ensuring clear differentiation from the brighter, higher-pitched voice of Kaya, while maintaining a natural, youthful authenticity appropriate for a Chicago-raised teenager."
+}

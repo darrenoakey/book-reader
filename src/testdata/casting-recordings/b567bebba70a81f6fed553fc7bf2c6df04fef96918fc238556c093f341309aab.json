@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11434",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "ollama",
+      "num_ctx": 32768,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": null
+    }
+  },
+  "routes_used": [
+    "qwen3.6:35b-a3b"
+  ],
+  "request": {
+    "prompt": "You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.\n\nAudiobook narrator. Focus on narration qualities: clarity, authority, warmth, pace, range for character voices.\n\nCAST PLAN CONSTRAINTS (authoritative — the description MUST match all of these;\nuse \"unknown\" fields as freedom, never invent a value for them):\nGender: unknown\nAge: unknown\nAccent: neutral\nVocal size: medium\nEstablished facts: A neutral audiobook narrator.\n\nCharacter id: narrator\nBio: A neutral audiobook narrator.\n\nCover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.\n\nOutput the voice description text only. No JSON, no preamble.",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "response": "A clear, authoritative neutral audiobook narrator with a medium vocal size. The voice exhibits warmth and precision, ensuring high clarity for complex narratives. Pace is steady and measured, allowing listeners to absorb details without feeling rushed. Timbre is rich yet unobtrusive, providing a stable foundation for character differentiation. Range allows for subtle shifts in tone to distinguish dialogue from narration, maintaining an engaging, professional delivery that balances authority with approachable warmth."
+}

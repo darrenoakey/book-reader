@@ -15,12 +15,11 @@ from __future__ import annotations
 import difflib
 import json
 import re
+import tomllib
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-
-import tomllib
 
 from src.llm import Backend, RouterConfig, ask_sync
 

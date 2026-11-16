@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11434",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "ollama",
+      "num_ctx": 32768,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": null
+    }
+  },
+  "routes_used": [
+    "qwen3.6:35b-a3b"
+  ],
+  "request": {
+    "prompt": "You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.\n\nAudiobook character voice for TTS cloning.\n\nCAST PLAN CONSTRAINTS (authoritative — the description MUST match all of these;\nuse \"unknown\" fields as freedom, never invent a value for them):\nGender: male\nAge: adult (about 38)\nAccent: British English (South London)\nVocal size: rich\nMust sound clearly distinct from: gerald\nEstablished facts: Marcus, 38, Black British jazz pianist who grew up in South London.; Rich, unhurried baritone with a South London accent.\n\nCharacter id: marcus\nBio: A quiet Chicago domestic story: Elena, an Italian-American architect, and her partner Marcus, a Black British jazz pianist who grew up in South London, share an apartment with Elena's teenage nieces Kaya and Rosa, twins raised in the same Chicago household. Gerald is the building's elderly Welsh caretaker. Diane is a middle-aged American neighbor. The Station Man sells train tickets in a booth. Marcus, 38, Black British jazz pianist who grew up in South London; rich, unhurried baritone with a South London accent.\n\nCover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.\n\nOutput the voice description text only. No JSON, no preamble.",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "response": "Marcus is a 38-year-old Black British male with a rich, unhurried baritone voice rooted in South London. His tone is warm and resonant, reflecting his identity as a jazz pianist. The accent features distinct South London inflections, avoiding generic British stereotypes to ensure clarity. He speaks with a relaxed, confident pace, embodying the smooth rhythm of jazz. This deep, textured timbre stands clearly apart from Gerald’s Welsh caretaker voice. His delivery is calm and grounded, offering a sophisticated yet accessible auditory presence for the narrative."
+}

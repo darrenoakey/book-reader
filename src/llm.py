@@ -13,6 +13,7 @@ import json
 import re
 import subprocess
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -20,8 +21,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-
-import tomllib
 
 PRIMARY_DEFAULT_URL = "http://10.0.0.42:11434"
 PRIMARY_DEFAULT_MODEL = "qwen3.6:35b-a3b"

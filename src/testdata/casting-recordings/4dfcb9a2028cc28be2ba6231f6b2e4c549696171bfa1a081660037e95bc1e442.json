@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11434",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "ollama",
+      "num_ctx": 32768,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": null
+    }
+  },
+  "routes_used": [
+    "qwen3.6:35b-a3b"
+  ],
+  "request": {
+    "prompt": "You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.\n\nAudiobook character voice for TTS cloning.\n\nCAST PLAN CONSTRAINTS (authoritative — the description MUST match all of these;\nuse \"unknown\" fields as freedom, never invent a value for them):\nGender: male\nAge: unknown\nAccent: American English\nVocal size: medium\nMust sound clearly distinct from: marcus\nEstablished facts: The Station Man sells train tickets in a booth.; Story is set in Chicago, implying American English setting cues.\n\nCharacter id: station_man\nBio: A quiet Chicago domestic story: Elena, an Italian-American architect, and her partner Marcus, a Black British jazz pianist who grew up in South London, share an apartment with Elena's teenage nieces Kaya and Rosa, twins raised in the same Chicago household. Gerald is the building's elderly Welsh caretaker. Diane is a middle-aged American neighbor. The Station Man sells train tickets in a booth. The Station Man sells train tickets in a booth; nothing else is known about him.\n\nCover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.\n\nOutput the voice description text only. No JSON, no preamble.",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "response": "Male, American English. Medium vocal size with a steady, grounded presence. The voice is calm and efficient, reflecting a routine-driven life selling train tickets in a Chicago booth. Pitch is mid-range, avoiding high energy or deep resonance to distinguish clearly from Marcus. Timbre is slightly dry and nasal, mimicking the acoustics of a small ticket booth. Pace is measured and precise, with clear enunciation typical of customer service interactions. Emotion is neutral and professional, conveying quiet reliability without dramatic flair."
+}

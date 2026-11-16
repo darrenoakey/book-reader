@@ -194,3 +194,17 @@ def test_synthesize_breeze_requires_manifest() -> None:
             pytest.raises(ValueError, match="breeze_voices.json not found"),
         ):
             tts_engine.synthesize_jobs(jobs, out)
+
+
+# ##################################################################
+# configured engine
+# Engine selection is machine-local TOML, not an environment fallback.
+def test_engine_configuration_is_toml_and_fail_closed(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    assert tts_engine.configured_engine(config) == "breeze"
+    for engine in ("breeze", "kokoro", "qwen"):
+        config.write_text(f'[tts]\nengine = "{engine}"\n')
+        assert tts_engine.configured_engine(config) == engine
+    config.write_text('[tts]\nengine = "unknown"\n')
+    with pytest.raises(ValueError, match="unsupported TTS engine"):
+        tts_engine.configured_engine(config)

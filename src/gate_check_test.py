@@ -277,3 +277,21 @@ def test_every_data_recovery_reference_is_selected() -> None:
     assert "hourly_spans" not in consumers
     assert "src/hourly_spans_test.py" in select_tests(["src/hourly_spans.py"])
     assert "src/script_generate_test.py" in selected
+
+
+# ##################################################################
+# lint dependency impact remains strict
+# Only a changed Ruff constraint qualifies. Runtime dependency changes and
+# unknown source paths retain the full-repository gate, including defaults.
+def test_exact_ruff_pin_impact_does_not_narrow_runtime_dependencies(tmp_path: Path) -> None:
+    from src.gate_check import only_ruff_changed, ruff_only_requirements_change
+
+    before = "pytest\nruff\nPillow\n"
+    assert only_ruff_changed(before, "pytest\nruff==0.17.5\nPillow\n")
+    assert not only_ruff_changed(before, "pytest\nruff==0.17.5\nPillow==12\n")
+    assert not only_ruff_changed(before, "pytest\nPillow\n")
+    assert not only_ruff_changed(before, before)
+    assert select_tests(["requirements.txt"]) is None
+    assert select_tests(["requirements.txt"], ruff_only=True) == ("src/dep_install_test.py", "src/gate_check_test.py")
+    assert select_tests(["requirements.txt", "src/unknown.py"], ruff_only=True) is None
+    assert not ruff_only_requirements_change(tmp_path)

@@ -56,7 +56,7 @@ different event loop" on the second step.
 
 ## TTS engines (pluggable)
 
-`src/tts_engine.py` dispatches on env `BOOK_TTS_ENGINE` (default `breeze`):
+`src/tts_engine.py` reads `[tts] engine = "breeze"` from gitignored `local/config.toml` (default `breeze`; supported engines `breeze`, `kokoro`, `qwen`):
 
 - **breeze** — Breeze TTS 2 via arbiter `tts-breeze`. Voices: voice-DESIGN one
   short reference clip per character (instruction = voices.json description,

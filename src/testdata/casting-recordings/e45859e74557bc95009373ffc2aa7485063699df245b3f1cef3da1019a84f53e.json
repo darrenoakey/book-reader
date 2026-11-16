@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11436/v1",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "openai",
+      "num_ctx": 262144,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": "Darrens-MacBook-Pro"
+    }
+  },
+  "routes_used": [
+    "qwen3.6:35b-a3b"
+  ],
+  "request": {
+    "prompt": "You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.\n\nAudiobook narrator. Focus on narration qualities: clarity, authority, warmth, pace, range for character voices.\n\nCAST PLAN CONSTRAINTS (authoritative — the description MUST match all of these;\nuse \"unknown\" fields as freedom, never invent a value for them):\nGender: unknown\nAge: unknown\nAccent: American English\nVocal size: medium\nEstablished facts: A neutral audiobook narrator for a quiet domestic Chicago story.\n\nCharacter id: narrator\nBio: A neutral audiobook narrator for a quiet domestic Chicago story.\n\nCover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.\n\nOutput the voice description text only. No JSON, no preamble.",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "response": "A neutral, medium-sized American English voice, ideal for a quiet domestic Chicago narrative. The tone balances clarity with subtle warmth, projecting authority without being overpowering. Pace is steady and measured, ensuring precise articulation while maintaining an engaging rhythm. The timbre is smooth and grounded, avoiding excessive brightness or depth. This narrator offers a versatile range, capable of shifting subtly to distinguish character voices while preserving the story’s intimate atmosphere. The delivery remains consistent, professional, and inviting, perfectly suited for audiobook narration that demands both precision and emotional resonance."
+}

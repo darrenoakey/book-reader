@@ -4,6 +4,8 @@ from pathlib import Path
 
 from src.voice_description import generate_voices_sync
 
+RECORDINGS = Path(__file__).parent / "testdata" / "casting-recordings"
+
 
 # ##################################################################
 # test generate voices real
@@ -22,7 +24,7 @@ def test_generate_voices_real() -> None:
         }
         characters_path = output_dir / "characters.json"
         characters_path.write_text(json.dumps(characters), encoding="utf-8")
-        result_path = generate_voices_sync(output_dir)
+        result_path = generate_voices_sync(output_dir, cache_root=RECORDINGS)
         assert result_path.exists()
         voices = json.loads(result_path.read_text())
         assert "john" in voices
@@ -35,7 +37,7 @@ def test_generate_voices_real() -> None:
 
 # ##################################################################
 # test generate voices idempotent
-# verify existing voices.json is not overwritten
+# verify a genuinely fresh, plan-bound voices.json is not overwritten
 def test_generate_voices_idempotent() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -44,8 +46,10 @@ def test_generate_voices_idempotent() -> None:
         characters = {"test": {"name": "Test", "bio": "Test character"}}
         characters_path = output_dir / "characters.json"
         characters_path.write_text(json.dumps(characters), encoding="utf-8")
-        voices_path = output_dir / "voices.json"
-        voices_path.write_text('{"preserved": true}', encoding="utf-8")
-        generate_voices_sync(output_dir)
-        result = json.loads(voices_path.read_text())
-        assert result == {"preserved": True}
+        voices_path = generate_voices_sync(output_dir, cache_root=RECORDINGS)
+        before = voices_path.read_bytes()
+        modified = voices_path.stat().st_mtime_ns
+        generate_voices_sync(output_dir, cache_root=RECORDINGS)
+        assert voices_path.read_bytes() == before
+        assert voices_path.stat().st_mtime_ns == modified
+        assert set(json.loads(before)) == set(characters)

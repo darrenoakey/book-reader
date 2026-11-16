@@ -36,6 +36,9 @@ def prepare_breeze_voices(output_dir: Path, only: set[str] | None = None) -> Pat
     if not voices_json.exists():
         raise ValueError("voices.json not found — run the voices_desc step first")
     descriptions = json.loads(voices_json.read_text(encoding="utf-8"))
+    from src.voice_assets import require_current_descriptions
+
+    require_current_descriptions(output_dir)
 
     voices_dir = output_dir / "voices"
     voices_dir.mkdir(parents=True, exist_ok=True)
@@ -45,11 +48,26 @@ def prepare_breeze_voices(output_dir: Path, only: set[str] | None = None) -> Pat
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     for index, (char_id, info) in enumerate(sorted(descriptions.items())):
+        if not isinstance(info, dict):
+            continue  # defensive: non-character metadata keys are never designed
         if only is not None and char_id not in only:
             continue
         ref_wav = voices_dir / f"{char_id}.wav"
         description = (info or {}).get("description") or "A clear neutral voice."
         if char_id in manifest and ref_wav.exists() and ref_wav.stat().st_size >= 100:
+            existing = manifest[char_id]
+            if existing.get("description") != description:
+                # A materialized clip whose description changed (new cast plan,
+                # new profile) must never be silently reused for cloning — it
+                # would keep the OLD gender/accent. Fail closed with an explicit
+                # archive/recast instruction instead.
+                raise ValueError(
+                    f"breeze reference clip for {char_id} was designed for a different "
+                    f"description; refusing to reuse a stale clip. Archive the old clip "
+                    f"(voices/{char_id}.wav) and its rendered audio, or delete the "
+                    f"manifest entry to recast: old={existing.get('description')!r} "
+                    f"new={description!r}"
+                )
             continue
         print(f"  breeze voice {index + 1}/{len(descriptions)}: {char_id}")
         tts_breeze_design_to_file(
@@ -77,6 +95,9 @@ def load_breeze_manifest(output_dir: Path) -> dict:
     manifest_path = output_dir / "breeze_voices.json"
     if not manifest_path.exists():
         raise ValueError("breeze_voices.json not found — run the voices step first")
+    from src.voice_assets import require_materialized_voices
+
+    require_materialized_voices(output_dir, "breeze")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     for info in manifest.values():
         info["ref_wav"] = str(output_dir / info["ref_wav"])

@@ -132,7 +132,8 @@ Rules:
 - Established canonical identities (reuse these exact IDs whenever the person is the same): {established_characters or "(none yet)"}
 - voice must focus on VOICE generation; look must focus on what a viewer SEES
 - EXCLUDE from both: plot roles, story function, relationships to other characters, emotional descriptions
-- NO cross-character references (don't mention other characters in the descriptions)
+- EXCEPT: upbringing, origin region, household and shared-place evidence is VOICE evidence — always KEEP explicit statements of where a character grew up, was raised, or lives, and household/family origin (e.g. "grew up in South London", "raised in the same household as siblings", "born in Naples, moved to Chicago"). "Relationships" means story dynamics, never this origin/upbringing evidence.
+- NO cross-character references (don't mention other characters in the descriptions); describe shared upbringing as a property of the character, not of the other character ("raised in a New Orleans household", not "X's brother")
 
 Chapter {chapter_num} text:
 {text}"""

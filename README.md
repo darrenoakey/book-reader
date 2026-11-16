@@ -41,6 +41,8 @@ Give it an EPUB (or a plain `.md` / `.txt` story) and it produces:
 ```bash
 ./run install                     # one-time: create venv + deps
 ./run create book.epub --resolution 480  # full pipeline, 480p default (or 720p/1080p)
+./run noveliser /path/to/finished/project --import-only  # annotated scripts, no model/TTS work
+./run noveliser /path/to/finished/project  # import/resume, then produce narration/movie
 ./run hour full-book.txt --hour 1          # resumable first ≤3600s production hour (Breeze, Qwen-Image-2.1 864×480 sources, 854×480 final)
 ./run step movie book.epub --resolution 1080  # render just the movie at 1080p
 ./run serve                       # inspect UI
@@ -48,6 +50,12 @@ Give it an EPUB (or a plain `.md` / `.txt` story) and it produces:
 ./run test <target>               # run tests
 ./run lint                        # ruff
 ```
+
+## Casting and annotated novels
+
+The whole cast shares an evidence-based `cast_plan.json`: gender, age, vocal character and accent follow each character's profile. People raised together share appropriate accent constraints without becoming the same voice. Visitors keep their original accents; living in the same place or sharing a scene does not erase different backgrounds. Unsupported accents are not silently replaced with a convenient Kokoro voice.
+
+A finished noveliser folder can supply `audio_chapter_N.json` and character metadata directly. Imported lines and speaker identities are verified exactly, with no second LLM attribution pass. `--reimport` archives changed source projects explicitly; incompatible existing voice/audio caches fail closed instead of mixing old and new performances.
 
 ## Long-book hourly production
 
@@ -85,5 +93,5 @@ storyboard filmstrip, and inline playback of the audiobook and movie.
 - **TTS**: Breeze TTS 2 via the arbiter `tts-breeze` adapter on spark
   (10.0.0.254:8400). Lines are batched 40-per-job and sliced back apart.
 - **Images**: arbiter `qwen-image` (Qwen-Image-2.1, owner-sanctioned).
-- **LLM**: arbiter OpenAI-compatible chat (`local-coder`).
-- `BOOK_TTS_ENGINE=breeze|kokoro|qwen` selects the TTS engine (default breeze).
+- **LLM**: `src/llm.py` uses the machine-local configured primary; only failed ICMP reachability permits its verified loopback backup. Model identities and routing are in gitignored `local/config.toml`.
+- `local/config.toml` `[tts] engine = "breeze"` selects `breeze`, `kokoro`, or `qwen` (default Breeze).

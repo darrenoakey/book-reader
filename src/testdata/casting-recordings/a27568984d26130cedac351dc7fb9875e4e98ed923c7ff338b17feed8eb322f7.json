@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11434",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "ollama",
+      "num_ctx": 32768,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": null
+    }
+  },
+  "routes_used": [
+    "qwen3.6:35b-a3b"
+  ],
+  "request": {
+    "prompt": "You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.\n\nAudiobook character voice for TTS cloning.\n\nCAST PLAN CONSTRAINTS (authoritative — the description MUST match all of these;\nuse \"unknown\" fields as freedom, never invent a value for them):\nGender: female\nAge: middle_aged (about early 50s)\nAccent: American English (Midwestern)\nVocal size: medium\nMust sound clearly distinct from: elena\nEstablished facts: Diane, 52, a direct American neighbor.; No-nonsense Midwestern voice.\n\nCharacter id: diane\nBio: A quiet Chicago domestic story: Elena, an Italian-American architect, and her partner Marcus, a Black British jazz pianist who grew up in South London, share an apartment with Elena's teenage nieces Kaya and Rosa, twins raised in the same Chicago household. Gerald is the building's elderly Welsh caretaker. Diane is a middle-aged American neighbor. The Station Man sells train tickets in a booth. Diane, 52, a direct American neighbor with a no-nonsense Midwestern voice.\n\nCover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.\n\nOutput the voice description text only. No JSON, no preamble.",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "response": "Female, middle-aged (early 50s), American English Midwestern accent. Medium vocal size with a grounded, resonant timbre that conveys practical authority. Pitch is steady and mid-range, avoiding high-pitched inflections to maintain her no-nonsense demeanor. Pace is deliberate and clear, reflecting a direct, neighborly communication style typical of Chicago residents. Tone is warm yet firm, projecting reliability and straightforwardness without excessive emotion. Distinct from Elena’s voice through its flatter intonation and robust, unpretentious delivery, embodying the pragmatic spirit of a seasoned local resident."
+}

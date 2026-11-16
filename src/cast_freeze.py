@@ -4222,9 +4222,25 @@ def materialize_profiles(project: Path, registry: dict) -> dict:
     voices = load_object(voices_path, "voice profiles")
     missing = [(actor_id, characters[actor_id]) for actor_id in registry if actor_id not in voices]
     if missing:
+        from src.cast_plan import (
+            build_cast_plan,
+            load_plan,
+            plan_is_stale,
+            plan_missing_characters,
+        )
+
+        # Frozen-cast additions are described against the same whole-cast plan
+        # as the already-frozen voices; a stale plan is refreshed first.
+        if plan_is_stale(project, characters) or plan_missing_characters(project, characters):
+            plan = asyncio.run(build_cast_plan(project, characters))
+        else:
+            plan = load_plan(project)
 
         async def describe_and_checkpoint(batch: list[tuple[str, dict]]) -> None:
-            tasks = [asyncio.create_task(_voice_description_for_one(actor_id, profile)) for actor_id, profile in batch]
+            tasks = [
+                asyncio.create_task(_voice_description_for_one(actor_id, profile, plan))
+                for actor_id, profile in batch
+            ]
             for completed in asyncio.as_completed(tasks):
                 actor_id, description = await completed
                 # Each completed real model response is durable before waiting
@@ -4234,6 +4250,9 @@ def materialize_profiles(project: Path, registry: dict) -> dict:
 
         for start in range(0, len(missing), VOICE_PROFILE_BATCH_SIZE):
             asyncio.run(describe_and_checkpoint(missing[start : start + VOICE_PROFILE_BATCH_SIZE]))
+        from src.cast_plan import SIDECAR_VOICES, write_plan_sidecar
+
+        write_plan_sidecar(project, plan["fingerprint"], SIDECAR_VOICES)
     prepare_breeze_voices(project)
 
     from src.hour_runner import extend_appearances

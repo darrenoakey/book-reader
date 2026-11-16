@@ -17,13 +17,12 @@ import os
 import re
 import sys
 import time
+import tomllib
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
-
-import tomllib
 
 from src.cast_freeze import CastDataIssue
 from src.cast_index import PARAGRAPH, Claim, build_cast_index, reconcile

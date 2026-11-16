@@ -1,6 +1,7 @@
 # Change-impact gate for the movie assembly surface; unrelated changes retain
 # the full repository check, including live model integrations.
 import json
+import re
 import subprocess
 import sys
 import time
@@ -79,6 +80,11 @@ MOVIE_PATHS = {
     "src/demo_outputs.py",
     "src/demo_outputs_test.py",
     "src/kokoro_voices_test.py",
+    "src/kokoro_f0_table.py",
+    "src/kokoro_f0_table_test.py",
+    "src/cast_plan.py",
+    "src/cast_plan_test.py",
+    "src/cast_plan_module_test.py",
     "src/source_extend.py",
     "src/source_extend_test.py",
     "src/pipeline_test.py",
@@ -109,7 +115,7 @@ MOVIE_TESTS = (
     "src/text_ingest_test.py",
     "src/movie_storyboard_test.py",
     "src/movie_images_test.py",
-    "src/llm_test.py::test_load_local_toml_config",
+    "src/llm_test.py::test_load_router_config",
     "src/script_generate_test.py",
     "src/noveliser_import_test.py",
 )
@@ -140,6 +146,7 @@ RECOVERY_TESTS = (
     "src/identity_group_report_test.py",
     "src/source_extend_test.py",
     "src/noveliser_import_test.py",
+    "src/cast_plan_test.py",
 )
 
 
@@ -180,7 +187,24 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "src/conftest_test.py": ("src/conftest_test.py",),
     "jeff_book.py": ("jeff_book_test.py",),
     "jeff_book_test.py": ("jeff_book_test.py",),
+    "src/voice_description_test.py": ("src/voice_description_test.py",),
     "src/kokoro_voices_test.py": ("src/kokoro_voices_test.py",),
+    "src/kokoro_f0_table.py": ("src/kokoro_f0_table_test.py", "src/kokoro_voices_test.py"),
+    "src/kokoro_f0_table_test.py": ("src/kokoro_f0_table_test.py",),
+    "src/cast_plan.py": ("src/cast_plan_test.py", "src/cast_plan_module_test.py"),
+    "src/cast_plan_test.py": ("src/cast_plan_test.py",),
+    "src/cast_plan_module_test.py": ("src/cast_plan_module_test.py",),
+    "src/voice_description.py": (
+        "src/voice_description_test.py",
+        "src/cast_plan_test.py",
+        "src/voice_assets_test.py",
+        "src/hour_runner_test.py",
+        "src/cast_freeze_test.py",
+    ),
+    "src/voice_acoustic.py": (
+        "src/voice_acoustic_test.py",
+        "src/cast_plan_test.py",
+    ),
     "src/source_extend.py": ("src/source_extend_test.py",),
     "src/source_extend_test.py": ("src/source_extend_test.py",),
     "src/tts_engine_test.py": ("src/tts_engine_test.py",),
@@ -192,7 +216,12 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "src/gate_check_test.py": ("src/gate_check_test.py",),
     "src/dep_install.py": ("src/dep_install_test.py",),
     "src/dep_install_test.py": ("src/dep_install_test.py",),
-    "src/hour_runner.py": ("src/hour_runner_test.py", "src/data_recovery_test.py", "src/cast_index_test.py"),
+    "src/hour_runner.py": (
+        "src/hour_runner_test.py",
+        "src/data_recovery_test.py",
+        "src/cast_index_test.py",
+        "src/cast_plan_module_test.py",
+    ),
     "src/hour_runner_test.py": ("src/hour_runner_test.py",),
     "src/cast_freeze.py": (
         "src/cast_freeze_test.py",
@@ -200,6 +229,7 @@ IMPACT: dict[str, tuple[str, ...]] = {
         "src/hour_runner_test.py",
         "src/hour_continue_test.py",
         "src/data_recovery_test.py",
+        "src/cast_plan_module_test.py",
     ),
     "src/cast_freeze_test.py": ("src/cast_freeze_test.py",),
     "src/cast_index.py": ("src/cast_index_test.py",),
@@ -243,6 +273,7 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "src/audio_synth.py": ("src/audio_synth_test.py", "src/data_recovery_test.py"),
     "src/audio_synth_test.py": ("src/audio_synth_test.py",),
     "src/breeze_voices.py": ("src/hour_runner_test.py", "src/breeze_voices_test.py"),
+    "src/kokoro_voices.py": ("src/kokoro_voices_test.py", "src/kokoro_f0_table_test.py", "src/cast_plan_test.py", "src/cast_plan_module_test.py"),
     "src/breeze_voices_test.py": ("src/breeze_voices_test.py",),
     "src/movie_storyboard.py": ("src/movie_storyboard_test.py",),
     "src/movie_storyboard_test.py": ("src/movie_storyboard_test.py",),
@@ -250,9 +281,27 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "src/text_ingest_test.py": ("src/text_ingest_test.py",),
     "src/state_test.py": ("src/state_test.py",),
     "src/character_analysis.py": ("src/character_analysis_test.py", "src/data_recovery_test.py"),
+    "src/casting_llm.py": ("src/casting_llm_test.py", "src/cast_plan_test.py"),
+    "src/casting_llm_test.py": ("src/casting_llm_test.py",),
+    "src/voice_assets.py": ("src/voice_assets_test.py", "src/breeze_voices_test.py", "src/voice_clone_test.py", "src/tts_engine_test.py", "src/audio_synth_test.py", "src/hour_runner_test.py"),
+    "src/voice_assets_test.py": ("src/voice_assets_test.py",),
+    "src/voice_clone.py": ("src/voice_clone_test.py", "src/voice_assets_test.py"),
+    "src/tts_engine.py": ("src/tts_engine_test.py", "src/voice_assets_test.py", "src/audio_synth_test.py", "src/hour_runner_test.py"),
+    "src/state.py": ("src/state_test.py", "src/pipeline_test.py"),
     "src/character_analysis_test.py": ("src/character_analysis_test.py",),
 }
 
+
+MOVIE_PATHS.update({
+    "src/voice_description.py", "src/voice_description_test.py", "src/voice_acoustic.py",
+    "src/casting_llm.py", "src/casting_llm_test.py", "src/kokoro_f0_table.py", "src/kokoro_f0_table_test.py",
+    "src/voice_assets.py", "src/voice_assets_test.py", "src/voice_clone.py", "src/tts_engine.py", "src/state.py", "src/kokoro_voices.py",
+})
+
+# Casting recordings contain only real backend responses; changes re-run their consumers.
+for _recording in (ROOT / "src/testdata/casting-recordings").glob("*.json"):
+    MOVIE_PATHS.add(_recording.relative_to(ROOT).as_posix())
+    IMPACT[_recording.relative_to(ROOT).as_posix()] = ("src/cast_plan_test.py", "src/casting_llm_test.py", "src/voice_description_test.py")
 
 # The captured real production prefix the recovery tests replay; every file of it selects exactly those tests.
 for _fixture in sorted((ROOT / "src/testdata/wide_bio_v8_prefix").rglob("*")):
@@ -273,11 +322,14 @@ for _fixture in sorted((ROOT / "src/testdata/noveliser_arrangement").glob("*.jso
 # Union the tests that execute each changed path. Unknown code fails closed
 # to the full repository check. A movie-surface file without a finer map keeps
 # the full movie set rather than silently shrinking coverage.
-def select_tests(paths: list[str]) -> tuple[str, ...] | None:
-    code = [path for path in paths if not path.endswith(".md")]
-    if not code or any(path not in MOVIE_PATHS for path in code):
+def select_tests(paths: list[str], *, ruff_only: bool = False) -> tuple[str, ...] | None:
+    code = [path for path in paths if not path.endswith(".md") and not (ruff_only and path == "requirements.txt")]
+    tool_tests = ("src/dep_install_test.py", "src/gate_check_test.py") if ruff_only else ()
+    if not code:
+        return tool_tests or None
+    if any(path not in MOVIE_PATHS for path in code):
         return None
-    selected: list[str] = []
+    selected: list[str] = list(tool_tests)
     for path in code:
         tests = IMPACT.get(path)
         if tests is None:
@@ -325,8 +377,31 @@ def _run_tests(tests: tuple[str, ...]) -> int:
     return rc
 
 
+# ##################################################################
+# exact lint-only dependency impact
+# Runtime dependency changes still require the full repository check. Only a
+# changed Ruff constraint with every other requirement identical takes the
+# real full-source lint plus dependency-install/gate contracts.
+def only_ruff_changed(before: str, after: str) -> bool:
+    def rows(text: str) -> list[str]:
+        return [line.partition("#")[0].strip() for line in text.splitlines() if line.partition("#")[0].strip()]
+
+    old, new = rows(before), rows(after)
+    def is_ruff(line: str) -> bool:
+        return bool(re.match(r"^ruff(?:$|[<=>!~;\[])", line, re.IGNORECASE))
+    old_ruff, new_ruff = [line for line in old if is_ruff(line)], [line for line in new if is_ruff(line)]
+    return len(old_ruff) == len(new_ruff) == 1 and old_ruff != new_ruff and [line for line in old if not is_ruff(line)] == [line for line in new if not is_ruff(line)]
+
+
+def ruff_only_requirements_change(root: Path) -> bool:
+    previous = subprocess.run(["git", "show", "refs/greenline/last-green:requirements.txt"], cwd=root, capture_output=True, text=True, check=False)
+    current = root / "requirements.txt"
+    return previous.returncode == 0 and current.is_file() and only_ruff_changed(previous.stdout, current.read_text(encoding="utf-8"))
+
+
 def main() -> int:
-    tests = select_tests(changed_paths(ROOT))
+    paths = changed_paths(ROOT)
+    tests = select_tests(paths, ruff_only="requirements.txt" in paths and ruff_only_requirements_change(ROOT))
     if tests is None:
         return subprocess.call(["dazpycheck"], cwd=ROOT)
     lint = subprocess.Popen([str(ROOT / "run"), "lint"], cwd=ROOT)

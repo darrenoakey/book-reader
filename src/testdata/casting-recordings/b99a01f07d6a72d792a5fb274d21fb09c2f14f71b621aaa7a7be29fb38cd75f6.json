@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11434",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "ollama",
+      "num_ctx": 32768,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": null
+    }
+  },
+  "routes_used": [
+    "qwen3.6:35b-a3b"
+  ],
+  "request": {
+    "prompt": "You are the casting director for an audiobook. Design ONE coherent voice plan for the WHOLE cast below in a single pass.\n\nSTORY CONTEXT (whole-book premise, shared by everyone):\n(none supplied)\n\nCAST (each entry: importer context where supplied, then character bio):\n### john (name: John)\nBIO:\nA tall man in his forties with dark hair. Speaks slowly and thoughtfully.\n\n### narrator (name: Narrator)\nBIO:\nAn authoritative but warm narrator for a family drama novel.\n\nFor EVERY character decide:\n- \"gender\": male | female | nonbinary | unknown — only from pronouns/descriptions/importer context. NEVER from a name.\n- \"age_band\": child | teen | young_adult | adult | middle_aged | older | unknown — from stated age or documented cues (era, occupation, life stage). War/young-sounding settings alone do NOT imply young. If nothing supports an age, use unknown.\n- \"approx_age\": short string (\"mid 30s\") or null.\n- \"accent\": the accent they speak with NOW, e.g. \"American English\", \"British English (South London)\", \"Italian-accented English\". Use importer context first, then bio, then setting cues. \"unknown\" only if no evidence exists.\n- \"vocal_size\": light | medium | rich | unknown — perceived vocal size/depth (a large heavyset man is usually rich; a small frail elder light).\n- \"distinct_from\": list of other character ids whose voices must sound clearly different from this one (same gender/accent peers first).\n- \"evidence\": list {\"fact\": \"...\", \"source\": \"metadata|bio|setting|inferred\"} — every profile fact above must appear here with the best source you have. Race/ethnicity may be recorded as evidence ONLY; it must never determine gender, pitch, accent, or vocal_size.\n\nCOHORTS — accent coherence (formative speech communities, not current residence):\n- Group characters who canonically share a FORMATIVE speech community into cohorts — same upbringing, same childhood place, same origin culture: {\"id\": \"...\", \"kind\": \"upbringing|place|household\", \"members\": [ids], \"accent\": \"...\", \"basis\": \"why\"}.\n- \"place\" means a shared formative place (where accents are acquired), not merely living in the same city now. Adults who moved somewhere together RETAIN the accent of where they grew up — cohort them by upbringing/origin, not current address. \"household\" is for people raised in the same household.\n- Cohort members share the cohort accent UNLESS their own explicit evidence shows a different personal accent (e.g. grew up elsewhere, individual migration) — an individual accent beats the cohort default.\n- People with DIFFERENT backgrounds legitimately have different accents: never equalize accents across separate cohorts or for characters whose evidence differs.\n- Explicit individual migration/accent evidence always wins over cohort default.\n\nRules:\n- Use ONLY the evidence given. Missing evidence = \"unknown\", never a guess. Do NOT infer any demographic from a character's NAME or from race/ethnicity.\n- Keep narrator gender/age/accent only if evidence exists; otherwise unknown (no default narrator voice).\n\nOutput ONLY valid JSON, no markdown:\n{\n  \"characters\": {\n    \"<char_id>\": {\n      \"gender\": \"...\", \"age_band\": \"...\", \"approx_age\": null, \"accent\": \"...\",\n      \"vocal_size\": \"...\", \"distinct_from\": [], \"accent_source\": \"individual|cohort\",\n      \"evidence\": [{\"fact\": \"...\", \"source\": \"metadata\"}]\n    }\n  },\n  \"cohorts\": [\n    {\"id\": \"...\", \"kind\": \"upbringing\", \"members\": [\"a\", \"b\"], \"accent\": \"...\", \"basis\": \"...\"}\n  ]\n}",
+    "temperature": 0.2,
+    "max_tokens": 8192
+  },
+  "response": "{\n  \"characters\": {\n    \"john\": {\n      \"gender\": \"male\",\n      \"age_band\": \"middle_aged\",\n      \"approx_age\": \"forties\",\n      \"accent\": \"unknown\",\n      \"vocal_size\": \"medium\",\n      \"distinct_from\": [\n        \"narrator\"\n      ],\n      \"accent_source\": \"individual\",\n      \"evidence\": [\n        {\n          \"fact\": \"A tall man in his forties with dark hair.\",\n          \"source\": \"bio\"\n        },\n        {\n          \"fact\": \"Speaks slowly and thoughtfully.\",\n          \"source\": \"bio\"\n        }\n      ]\n    },\n    \"narrator\": {\n      \"gender\": \"unknown\",\n      \"age_band\": \"unknown\",\n      \"approx_age\": null,\n      \"accent\": \"unknown\",\n      \"vocal_size\": \"medium\",\n      \"distinct_from\": [\n        \"john\"\n      ],\n      \"accent_source\": \"individual\",\n      \"evidence\": [\n        {\n          \"fact\": \"An authoritative but warm narrator for a family drama novel.\",\n          \"source\": \"bio\"\n        }\n      ]\n    }\n  },\n  \"cohorts\": []\n}"
+}

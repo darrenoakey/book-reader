@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11434",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "ollama",
+      "num_ctx": 32768,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": null
+    }
+  },
+  "routes_used": [
+    "qwen3.6:35b-a3b"
+  ],
+  "request": {
+    "prompt": "You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.\n\nAudiobook character voice for TTS cloning.\n\nCAST PLAN CONSTRAINTS (authoritative — the description MUST match all of these;\nuse \"unknown\" fields as freedom, never invent a value for them):\nGender: female\nAge: adult (about 41)\nAccent: American English (Midwestern)\nVocal size: medium\nMust sound clearly distinct from: mme_berger, theo\nEstablished facts: June, 41, American from Chicago.; She stays American-accented throughout.\n\nCharacter id: june\nBio: An American architect, June, flies from Chicago to Lyon for a restoration project. She stays American-accented throughout. The locals — hotelier Madame Berger and her nephew Théo, both born and raised in Lyon — speak English with French accents. June, 41, American from Chicago, direct midwestern speech.\n\nCover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.\n\nOutput the voice description text only. No JSON, no preamble.\n\nYour previous reply was:\nJune is a 41-year-old American female architect with a distinct Midwestern accent. Her voice is medium-sized, clear, and direct, reflecting her Chicago roots. She speaks with a steady, professional pace, avoiding any French inflections despite being in Lyon. Her timbre is warm yet authoritative, suitable for an architect discussing restoration projects. The pitch is naturally mid-range, neither too high nor low, ensuring clarity against the accented dialogue of local characters. Her delivery is confident and grounded, maintaining her American identity throughout the narrative without deviation or affectation.\n\nIt contradicted the casting plan:\n- description has no 'adult' age cue\n\nRewrite the voice description so it satisfies EVERY constraint exactly (state the correct gender, age band and accent explicitly). Output the voice description text only.",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "response": "June is an adult female architect, approximately 41 years old, with a distinct American English Midwestern accent. Her vocal size is medium, featuring a warm yet authoritative timbre that reflects her Chicago roots. She speaks with a steady, professional pace and clear mid-range pitch, ensuring she sounds distinctly separate from other characters like Mme Berger or Théo. Her delivery is confident, direct, and grounded, maintaining her authentic American identity throughout the narrative without any French inflections or deviations."
+}

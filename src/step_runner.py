@@ -99,6 +99,10 @@ def run_step(step: str, epub_path: Path, max_chapters: int = 0, resolution: int 
         mark_step_complete(output_dir, "characters")
 
     elif step == "voices":
+        from src.pipeline import _voices_desc_stale
+
+        if _voices_desc_stale(output_dir):
+            print("cast inputs changed — regenerating voice descriptions")
         generate_voices_sync(output_dir)
         voices = json.loads((output_dir / "voices.json").read_text())
         print(f"\n{Fore.CYAN}Generated {len(voices)} voice descriptions:{Style.RESET_ALL}\n")

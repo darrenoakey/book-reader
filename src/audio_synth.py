@@ -239,6 +239,9 @@ def plan_chapter(
 # whole time it is processing that speaker's lines, run in those batches,
 # then assemble each chapter wav in original order
 def synthesize_all_chapters(output_dir: Path, max_chapters: int = 0) -> list[Path]:
+    from src.voice_assets import require_audio_binding
+
+    require_audio_binding(output_dir, output_dir / "audio", tts_engine.engine_name())
     script_dir = output_dir / "script"
     audio_dir = output_dir / "audio"
     voices_dir = output_dir / "voices"

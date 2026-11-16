@@ -1,6 +1,6 @@
 """Pluggable TTS engine selection.
 
-Three engines, chosen by env ``BOOK_TTS_ENGINE``:
+Three engines, chosen by ``local/config.toml`` under ``[tts].engine``:
 
   breeze  (default) — Breeze TTS 2 via arbiter ``tts-breeze``. Each character
                       gets a voice-DESIGNED reference clip (voices/<id>.wav)
@@ -19,11 +19,25 @@ prepare per-character voices.
 
 from __future__ import annotations
 
-import os
+import tomllib
 from collections import defaultdict
 from pathlib import Path
 
-ENGINE = os.environ.get("BOOK_TTS_ENGINE", "breeze").lower()
+
+# ##################################################################
+# configured engine
+# Non-secret local selection is explicit; invalid names never fall through
+# to another renderer. Breeze remains the committed default.
+def configured_engine(path: Path | None = None) -> str:
+    path = path or Path(__file__).resolve().parent.parent / "local" / "config.toml"
+    config = tomllib.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    engine = str(config.get("tts", {}).get("engine", "breeze")).lower()
+    if engine not in {"breeze", "kokoro", "qwen"}:
+        raise ValueError(f"unsupported TTS engine {engine!r} in {path}")
+    return engine
+
+
+ENGINE = configured_engine()
 
 
 # ##################################################################
@@ -36,6 +50,9 @@ def engine_name() -> str:
 # voices ready
 # has the per-character voice preparation already been done for this engine?
 def voices_ready(output_dir: Path) -> bool:
+    from src.voice_assets import require_materialized_voices
+
+    require_materialized_voices(output_dir, ENGINE)
     if ENGINE == "breeze":
         return (output_dir / "breeze_voices.json").exists()
     if ENGINE == "kokoro":
@@ -91,6 +108,9 @@ def prepare_voices(output_dir: Path) -> int:
 def synthesize_jobs(jobs: list[dict], output_dir: Path) -> None:
     if not jobs:
         return
+    from src.voice_assets import require_materialized_voices
+
+    require_materialized_voices(output_dir, ENGINE, {job["speaker"] for job in jobs})
     if ENGINE == "breeze":
         from src.arbiter_tts import tts_breeze_many
 

@@ -50,6 +50,7 @@ REQUEST_NAME = "request.json"
 RECEIPT_NAME = "delivery_receipt.json"
 QUIET_HOURS = range(2, 5)
 WAIT_SECONDS = 60
+PARENT_OUTAGE_SECONDS = 30 * 60
 TERMINAL = ("delivered", "published", "failed")
 MILESTONES = ("extract", "characters", "voices_desc", "voices_clone", "scripts", "audio", "m4b")
 
@@ -576,8 +577,20 @@ def pipeline_pid(project: Path) -> int | None:
 
 
 def _await_series_parent(config: dict[str, Path], job: dict) -> Path:
+    # this wait spans the parent's whole render (many hours), so a share outage
+    # longer than load_job's short retry must not kill it; the record is polled
+    # until a continuous absence outlasts PARENT_OUTAGE_SECONDS, then fails closed
+    missing_since: float | None = None
     while True:
-        parent = load_job(config, job["series_parent_job"])
+        try:
+            parent = load_job(config, job["series_parent_job"], attempts=1)
+        except FileNotFoundError:
+            missing_since = missing_since if missing_since is not None else time.monotonic()
+            if time.monotonic() - missing_since >= PARENT_OUTAGE_SECONDS:
+                raise
+            time.sleep(WAIT_SECONDS)
+            continue
+        missing_since = None
         if parent.get("published") and parent.get("probe", {}).get("ok"):
             return Path(parent["project"]).resolve()
         if parent["state"] == "failed" and not worker_alive(parent):

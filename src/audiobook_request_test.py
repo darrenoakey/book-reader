@@ -269,6 +269,48 @@ def test_load_job_retries_a_transient_lookup_then_fails_closed() -> None:
 
 
 # ##################################################################
+# test a series child outlives a share outage while awaiting its parent
+# The child waits for the parent's entire render. A share outage longer than
+# load_job's short retry once killed that wait; it must keep waiting through a
+# bounded outage and still fail closed when the parent record stays absent.
+def test_series_wait_survives_a_share_outage_then_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        config = make_config(root)
+        make_epub(root / "library" / "Anne McCaffrey - Dragonsong.epub", "Dragonsong", "McCaffrey Anne")
+        settings = req.settings(config)
+        parent = req.request("Dragonsong", "Anne McCaffrey", start=False, config_path=config)["job"]
+        project = root / "parent-project"
+        project.mkdir()
+        req.save_job(settings, parent, published=str(project), probe={"ok": True}, project=str(project))
+        child = {"series_parent_job": parent["job_id"], "state": "waiting_for_series_parent"}
+        parent_path = req.job_path(settings, parent["job_id"])
+
+        real_read, wait, outage = req.read_json, req.WAIT_SECONDS, req.PARENT_OUTAGE_SECONDS
+        calls = {"n": 0}
+
+        def outage_then_back(target: Path) -> dict:
+            if target == parent_path:
+                calls["n"] += 1
+                if calls["n"] <= 6:
+                    raise FileNotFoundError(str(target))
+            return real_read(target)
+
+        req.read_json, req.WAIT_SECONDS = outage_then_back, 0
+        try:
+            # six consecutive misses (beyond load_job's own retry) are ridden out
+            assert req._await_series_parent(settings, child) == project.resolve()
+            assert calls["n"] == 7
+            # a parent record that stays absent past the outage bound fails closed
+            req.PARENT_OUTAGE_SECONDS = 0
+            gone = {**child, "series_parent_job": "work-" + "2" * 16}
+            with pytest.raises(FileNotFoundError, match="no audiobook job"):
+                req._await_series_parent(settings, gone)
+        finally:
+            req.read_json, req.WAIT_SECONDS, req.PARENT_OUTAGE_SECONDS = real_read, wait, outage
+
+
+# ##################################################################
 # test a contract recorded mid-render is honoured at publish time
 # A render runs for hours. The series contract can be recorded on the job while
 # it is producing, so publishing must re-read the job instead of trusting the

@@ -388,3 +388,65 @@ def test_job_locks_are_local_and_job_writes_ride_out_a_share_outage() -> None:
                 req.save_job(settings, job, state="failed", attempts=3)
         finally:
             req.write_json, req.SHARE_RETRY_SECONDS = real_write, pause
+
+
+# ##################################################################
+# test the delivery step verifies what the pipeline actually assembled
+# The producer's M4B is verified through the same call the worker makes, against
+# the assembly manifest m4b_assemble writes itself. This runs after a multi-hour
+# render, so it must accept a good book and refuse one whose recorded identity is
+# not the requested work instead of trusting the manifest.
+def test_verify_assembled_accepts_the_producers_own_m4b() -> None:
+    import hashlib
+
+    from src.audiobook_cover import COVER_NAME, cover_is_current, fingerprint
+    from src.m4b_assemble import assemble_m4b
+
+    with tempfile.TemporaryDirectory() as tmp:
+        project = Path(tmp) / "Dragonsong"
+        audio = project / "audio"
+        audio.mkdir(parents=True)
+        for name, seconds in (("00-intro.wav", 1.5), ("01-chapter_one.wav", 2.0)):
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                    "-i", f"sine=frequency=440:duration={seconds}",
+                    "-ar", "24000", "-ac", "1", str(audio / name),
+                ],
+                check=True,
+                timeout=120,
+            )
+        cover = project / COVER_NAME
+        Image.new("RGB", (1400, 1400), (30, 70, 120)).save(cover, format="JPEG", quality=92)
+        binding = {"title": "Dragonsong", "author": "Anne McCaffrey", "seed": 7, "prompt": "p", "cover": COVER_NAME}
+        for member, model, suffix in (
+            ("source", "cover.jpeg", "JPEG"),
+            ("source_square", "cover_source_square.png", "PNG"),
+            ("art", "cover_art.png", "PNG"),
+        ):
+            Image.new("RGB", (512, 512), (30, 70, 120)).save(project / model, format=suffix)
+            binding[member] = model
+            binding[f"{member}_sha256"] = hashlib.sha256((project / model).read_bytes()).hexdigest()
+        binding["fingerprint"] = fingerprint(
+            title="Dragonsong",
+            author="Anne McCaffrey",
+            source_sha256=binding["source_sha256"],
+            art_sha256=binding["art_sha256"],
+            cover_sha256=hashlib.sha256(cover.read_bytes()).hexdigest(),
+            seed=7,
+            prompt="p",
+        )
+        (project / "audiobook_cover.json").write_text(json.dumps(binding), encoding="utf-8")
+        assert cover_is_current(project, "Dragonsong", "Anne McCaffrey")
+
+        # the production call: the assembly step writes its own manifest
+        assemble_m4b(project, "Dragonsong", "Anne McCaffrey", require_generated_cover=True)
+
+        probe = req.verify_assembled(project, "Dragonsong", "Anne McCaffrey")
+        assert probe["ok"] is True
+        assert probe["checks"]["cover_source_parity"]["detail"].startswith("embedded cover is byte-identical")
+        assert probe["checks"]["artist_tag"]["ok"] is True
+
+        # the manifest's own identity must never override the requested work
+        with pytest.raises(ValueError, match="differs from the requested work"):
+            req.verify_assembled(project, "Dragonsinger", "Anne McCaffrey")

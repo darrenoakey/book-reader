@@ -407,6 +407,35 @@ def probe_m4b(m4b: Path) -> dict:
 # ##################################################################
 # publish
 # copy the verified M4B and its cover into the delivery folder, sha-checked
+def verify_assembled(project: Path, title: str, author: str) -> dict:
+    """Verify one produced M4B against the assembly the pipeline itself recorded.
+
+    ``m4b_assemble`` writes the assembly manifest, so this reads that record and
+    hands the verifier the JOB's title and author: the manifest is a mutable file
+    and is never trusted to name the book. The generated cover is passed
+    explicitly so byte-identical cover parity is owed on the exact art the
+    assembly embedded.
+    """
+    from src.audiobook_cover import COVER_NAME
+    from src.audiobook_verify import load_manifest, verify_audiobook
+    from src.m4b_assemble import AUDIOBOOK_ASSEMBLY_NAME
+
+    project = Path(project)
+    manifest = project / AUDIOBOOK_ASSEMBLY_NAME
+    _, recorded = load_manifest(manifest)
+    if (recorded.get("title"), recorded.get("author")) != (title, author):
+        raise ValueError("assembly title or author differs from the requested work")
+    report = verify_audiobook(
+        project / f"{project.name}.m4b",
+        manifest,
+        title=title,
+        author=author,
+        cover=project / COVER_NAME,
+    )
+    report.raise_for_status()
+    return report.as_dict()
+
+
 def publish(m4b: Path, cover: Path, folder: Path) -> dict:
     folder.mkdir(parents=True, exist_ok=True)
     published = {}
@@ -514,16 +543,8 @@ def _work(config: dict[str, Path], job: dict) -> dict:
 
     m4b = run_audiobook_pipeline(source, project, display_author=job["author"])
     from src.audiobook_cover import COVER_NAME
-    from src.audiobook_verify import load_manifest, verify_audiobook
-    from src.m4b_assemble import AUDIOBOOK_ASSEMBLY_NAME
 
-    manifest = project / AUDIOBOOK_ASSEMBLY_NAME
-    expected = load_manifest(manifest)
-    if (expected.title, expected.author) != (job["title"], job["author"]):
-        raise ValueError("assembly title or author differs from the requested work")
-    report = verify_audiobook(m4b, manifest, require_byte_identical_cover=True)
-    report.raise_for_status()
-    probe = report.as_dict()
+    probe = verify_assembled(project, job["title"], job["author"])
     write_json(project / "audiobook_verification.json", probe)
     published = publish(m4b, project / COVER_NAME, publication)
     # A render can run for many hours, so a contract recorded on the job while it

@@ -174,3 +174,49 @@ def test_validation_rejects_bad_speakers_and_short_coverage() -> None:
     with pytest.raises(ScriptGenerationError):
         validate_script_lines([{"narrator": "Title"}], chunk, ["narrator"])
     validate_script_lines([{"narrator": "Title"}, {"narrator": chunk}], chunk, ["narrator"])
+
+
+# ##################################################################
+# test the spoken chapter heading is not duplicated
+# A chapter's own text normally opens with its title, so prepending the title
+# unconditionally made the narrator read the heading twice (and the assembled
+# audiobook then announced it a third time). The heading is only added when the
+# source does not already start with it, and coverage validation must still pass
+# in both shapes.
+def test_source_opens_with_title_detects_the_real_heading() -> None:
+    from src.script_generate import source_opens_with_title
+
+    assert source_opens_with_title("Chapter 1\n\nDrummer, beat, and piper, blow", "Chapter 1")
+    assert source_opens_with_title("  chapter 1: the ledger\n\nBody text.", "Chapter 1")
+    assert not source_opens_with_title("Drummer, beat, and piper, blow", "Chapter 1")
+    # a title that merely shares a prefix with the prose is not the heading
+    assert not source_opens_with_title("Chapterhouse rules applied.", "Chapter 1")
+
+
+def test_heading_is_prepended_only_when_the_source_lacks_it() -> None:
+    import asyncio
+
+    import src.script_generate as sg
+
+    original = sg.classify_spans
+    try:
+        # classify_spans covers the WHOLE chapter text, heading included, which is
+        # exactly why prepending the title produced a second "Chapter 1".
+        async def covers_heading(text, speaker_ids, *args, **kwargs):
+            return [{"narrator": "Chapter 1"}, {"narrator": "Drummer, beat, and piper, blow."}]
+
+        sg.classify_spans = covers_heading
+        lines = asyncio.run(
+            sg.generate_chapter_script("Chapter 1\n\nDrummer, beat, and piper, blow.", "Chapter 1", ["narrator"])
+        )
+        assert [next(iter(line.values())) for line in lines] == ["Chapter 1", "Drummer, beat, and piper, blow."]
+
+        # a source that does not open with the heading still gets one spoken title
+        async def no_heading(text, speaker_ids, *args, **kwargs):
+            return [{"narrator": "Drummer, beat, and piper, blow."}]
+
+        sg.classify_spans = no_heading
+        lines = asyncio.run(sg.generate_chapter_script("Drummer, beat, and piper, blow.", "Chapter 1", ["narrator"]))
+        assert [next(iter(line.values())) for line in lines] == ["Chapter 1", "Drummer, beat, and piper, blow."]
+    finally:
+        sg.classify_spans = original

@@ -74,7 +74,7 @@ def chunk_text(text: str, chunk_size: int = 4000, overlap: int = 0) -> list[str]
 CHUNK_SIZE = 4000
 MAX_ATTEMPTS = 6
 RETRY_DELAY_SECONDS = 5
-SCRIPT_VERSION = 4
+SCRIPT_VERSION = 4  # not bumped: a new fingerprint would regenerate cached scripts and shift line indexes under already-rendered audio
 MIN_COVERAGE = 0.7
 MAX_COVERAGE = 1.4
 META_SUFFIX = ".meta.json"
@@ -320,12 +320,29 @@ async def _process_chunk(chunk: str, speaker_ids: list[str], label: str) -> list
     raise ScriptGenerationError(f"{label}: no valid script after {MAX_ATTEMPTS} attempts ({last_error})")
 
 
+# ##################################################################
+# source heading
+# a chapter's own text usually repeats its title as the first line, so prepending
+# the title unconditionally made the narrator read the heading twice.
+def source_opens_with_title(chapter_text: str, chapter_title: str) -> bool:
+    """True when the chapter's own prose already begins with its title."""
+    leading = chapter_text.lstrip()[: max(len(chapter_title) * 4, 80)]
+    return normalized_words(leading)[: len(normalized_words(chapter_title))] == normalized_words(chapter_title)
+
+
 async def generate_chapter_script(chapter_text: str, chapter_title: str, speaker_ids: list[str]) -> list[dict]:
     # The model chooses only a speaker ID. immutable_spans retains each source
     # sentence byte-for-byte, so a smaller backup model cannot omit or rewrite
     # narration while the existing canonical JSONL/cache contract is unchanged.
-    lines = [{"narrator": chapter_title}, *await classify_spans(chapter_text, speaker_ids)]
-    validate_script_lines(lines, chapter_text, speaker_ids)
+    # The spoken heading is prepended only when the source does not already open
+    # with it; otherwise the narrator said the chapter title twice.
+    opens_with_title = source_opens_with_title(chapter_text, chapter_title)
+    body = await classify_spans(chapter_text, speaker_ids)
+    lines = body if opens_with_title else [{"narrator": chapter_title}, *body]
+    # include_title=True tells the coverage check to compare line 0 as source
+    # prose. That is true exactly when the source itself opens with the heading;
+    # a synthetic heading absent from the source must not be counted.
+    validate_script_lines(lines, chapter_text, speaker_ids, include_title=opens_with_title)
     return lines
 
 
@@ -352,7 +369,13 @@ async def generate_script_for_file(chapter_path: Path, script_dir: Path, speaker
         lines = [{"narrator": chapter_text}]
     else:
         lines = await generate_chapter_script(chapter_text, chapter_title, speaker_ids)
-        validate_script_lines(lines, chapter_text, speaker_ids)
+        # the prepended heading is only extra when the source does not open with it
+        validate_script_lines(
+            lines,
+            chapter_text,
+            speaker_ids,
+            include_title=source_opens_with_title(chapter_text, chapter_title),
+        )
     await asyncio.to_thread(write_canonical_script, script_path, lines, fingerprint)
     return script_path
 

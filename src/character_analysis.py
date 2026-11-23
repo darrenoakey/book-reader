@@ -449,11 +449,14 @@ async def analyze_characters(output_dir: Path, title: str, author: str) -> Path:
         targets.append((i, chapter_path))
     print(f"Analyzing {len(targets)} chapters in parallel...")
     ledger = RecoveryLedger(output_dir)
+    from src.series_voices import established_identities
+
+    established = established_identities(output_dir)
 
     async def one(index: int, path: Path) -> dict | None:
         # Only data problems quarantine the chapter; infrastructure errors propagate fail-closed.
         try:
-            return await analyze_chapter(path, index)
+            return await analyze_chapter(path, index, established)
         except Exception as error:
             if not is_data_error(error):
                 raise

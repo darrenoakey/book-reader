@@ -293,6 +293,41 @@ def _norm_evidence(value) -> list[dict]:
     return out
 
 
+# ##################################################################
+# numeric age
+# a concrete age in the plan's approx_age ("mid 30s", "early 20s", "fifties"),
+# or None when no age can be read from it
+_AGE_BAND_RANGES = {"child": (0, 12), "teen": (13, 19), "young_adult": (20, 34), "adult": (25, 49), "middle_aged": (40, 64), "older": (60, 120)}
+
+
+def numeric_age(approx_age: str | None) -> int | None:
+    if not approx_age:
+        return None
+    text = approx_age.lower()
+    numbers = [int(n) for n in re.findall(r"\d{1,3}", text) if 0 < int(n) <= 110]
+    if numbers:
+        return max(numbers)
+    for word, decade in (("twenties", 25), ("thirties", 35), ("forties", 45), ("fifties", 55), ("sixties", 65), ("seventies", 75), ("eighties", 85), ("nineties", 95)):
+        if word in text:
+            return decade
+    return None
+
+
+def age_band_for_age(age: int) -> str:
+    for band, (low, high) in _AGE_BAND_RANGES.items():
+        if low <= age <= high:
+            return band
+    return "unknown"
+
+
+def band_conflict(age_band: str, approx_age: str | None) -> int | None:
+    age = numeric_age(approx_age)
+    if age is None or age_band not in _AGE_BAND_RANGES:
+        return None
+    low, high = _AGE_BAND_RANGES[age_band]
+    return None if low <= age <= high else age
+
+
 def normalize_plan(raw: dict, known: set[str], rows: list[dict]) -> dict:
     """Typed, bounded plan from the model response; identity set must match.
 
@@ -313,13 +348,19 @@ def normalize_plan(raw: dict, known: set[str], rows: list[dict]) -> dict:
     for row in rows:
         char_id = row["id"]
         entry = characters_in.get(char_id, {}) if isinstance(characters_in.get(char_id), dict) else {}
+        age_band = _norm_choice(entry.get("age_band"), AGE_BANDS, "unknown")
+        approx_age = (str(entry["approx_age"]).strip()[:40] or None) if entry.get("approx_age") else None
+        if band_conflict(age_band, approx_age):
+            # "teen / early 20s" (Dragonsong Brekke) contradicts itself; the numeric age
+            # is the concrete part and the band follows it rather than poisoning every
+            # voice description with an impossible constraint.
+            print(f"  cast plan {char_id}: age_band {age_band!r} contradicts approx_age {approx_age!r}; following the numeric age")
+            age_band = age_band_for_age(band_conflict(age_band, approx_age))
         characters[char_id] = {
             "name": row["name"],
             "gender": _norm_choice(entry.get("gender"), GENDERS, "unknown"),
-            "age_band": _norm_choice(entry.get("age_band"), AGE_BANDS, "unknown"),
-            "approx_age": (str(entry["approx_age"]).strip()[:40] or None)
-            if entry.get("approx_age")
-            else None,
+            "age_band": age_band,
+            "approx_age": approx_age,
             "accent": str(entry.get("accent") or "").strip()[:120] or "unknown",
             "vocal_size": _norm_choice(entry.get("vocal_size"), VOCAL_SIZES, "unknown"),
             "distinct_from": _as_id_list(entry.get("distinct_from"), known),
@@ -343,6 +384,16 @@ def normalize_plan(raw: dict, known: set[str], rows: list[dict]) -> dict:
             }
         )
     return {"characters": characters, "cohorts": cohorts}
+
+
+# ##################################################################
+# plan max tokens
+# output budget for one cast plan. A fixed 8192 truncated a 46-character novel
+# cast mid-JSON (Dragonsong); measured real plans run ~27 pretty-printed lines
+# (~400 tokens) per character, so the budget grows with the cast at 2.5x that.
+# Casts that fit in 8192 keep exactly that request (and their recordings).
+def plan_max_tokens(cast_size: int) -> int:
+    return max(8192, 1000 * cast_size)
 
 
 def parse_plan(text: str) -> dict:
@@ -481,13 +532,17 @@ async def build_cast_plan(
         previous = project / PLAN_NAME
         if not story_context and previous.is_file():
             story_context = str(load_plan(project).get("story_context") or "")
+    # one-shot plan output truncation is not an identity mismatch: a malformed
+    # JSON answer is asked for again at the next budget tier rather than only
+    # reporting an error. The tiers are real requests; an identical prompt at
+    # a given tier replays its recorded response.
     prompt = build_prompt(cast_input(characters, contexts), story_context)
     if len(prompt) > MAX_PROMPT_CHARS:
         raise ValueError(
             f"cast plan prompt {len(prompt)} chars exceeds bound {MAX_PROMPT_CHARS}; "
             "reduce source context"
         )
-    raw_text = (await ask(prompt, temperature=0.2, max_tokens=8192, root=cache_root)).strip()
+    raw_text = (await ask(prompt, temperature=0.2, max_tokens=plan_max_tokens(len(characters)), root=cache_root)).strip()
     raw = parse_plan(raw_text)
     known = set(characters)
     plan = normalize_plan(raw, known, cast_input(characters, contexts))

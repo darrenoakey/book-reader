@@ -52,3 +52,21 @@ Scripts written before 2026-10-11 have no `attribution` key. Hour logs (`local/a
 
 The audio-hours supervisor (`sh local/audio-hours-supervisor.sh N`) runs for hours (one hour of audio takes about
 four hours). Always start it detached (`nohup ... &`) and check on it later. Never hold an agent turn waiting on it.
+
+## Long audiobook renders must be detached
+
+A full audiobook render (extract -> scripts -> audio -> cover -> M4B) runs for hours and
+MUST be started detached (`/tmp/abd/render.sh PROJECT EPUB LOG`, or
+`./run audiobook "Title" --author A` which spawns a detached worker). Never hold an agent
+turn watching it: start it, then `sleep` and re-inspect the project log on waking.
+The scriptor host must have `scriptor:v5` published before step 5 or the run dies with
+`permanent HTTP 404`; restore it by rsyncing the manifest plus its blobs from
+`~/.ollama/models` (local offload store) to Boringstack's `~/.ollama/models`, then verify
+`curl :11434/api/generate -d '{"model":"scriptor:v5",...}'`.
+
+Measured breeze throughput (2026-11-24): Arbiter's `tts-breeze` model runs on ONE
+`max_concurrent=1` slot and averages ~400s execution plus ~305s queue wait per
+40-line job, i.e. ~10s per line, so a 3000-line book needs ~9h of GPU time plus
+queueing. This is a server-side model limit: client batch size and window
+changes buy nothing, and submitting extra concurrent jobs only lengthens the
+queue. Budget renders in hours and sleep on them; never wait inside a turn.

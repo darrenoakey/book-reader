@@ -307,3 +307,43 @@ def test_acoustic_violations_missing_accent() -> None:
     profile = {"gender": "male", "age_band": "older", "accent": "British English"}
     problems = description_violations("An elderly man, deep and gravelly.", profile)
     assert any("accent" in p for p in problems)
+
+
+def test_decade_words_are_checked_as_ages_not_as_hard_elderly_cues() -> None:
+    from src.voice_acoustic import description_violations
+
+    # Dragonsong's "Auntie": plan middle_aged / approx 50s-60s; the model's repair said "fifties or sixties"
+    profile = {"gender": "female", "age_band": "middle_aged", "accent": "unknown"}
+    assert description_violations("A middle-aged woman in her fifties or sixties, formal and concerned.", profile) == []
+    assert description_violations("A middle-aged woman in her seventies, frail.", profile) != []
+    assert description_violations("An elderly middle-aged woman.", profile) != []
+    adult = {"gender": "male", "age_band": "adult", "accent": "unknown"}
+    assert any("numeric age" in p for p in description_violations("An adult man in his sixties.", adult))
+    older = {"gender": "male", "age_band": "older", "accent": "unknown"}
+    assert description_violations("An elderly man in his seventies.", older) == []
+
+
+def test_cast_plan_output_budget_grows_with_the_cast() -> None:
+    from src.cast_plan import plan_max_tokens
+
+    assert plan_max_tokens(5) == 8192  # small casts keep the exact recorded request
+    assert plan_max_tokens(46) >= 46 * 400 * 2  # Dragonsong's 46 voices truncated at 8192
+
+
+def test_contradictory_age_band_follows_the_numeric_age() -> None:
+    from src.cast_plan import (
+        age_band_for_age,
+        band_conflict,
+        normalize_plan,
+        numeric_age,
+    )
+
+    assert band_conflict("teen", "early 20s") == 20
+    assert band_conflict("adult", "mid 30s") is None
+    assert numeric_age("fifties") == 55 and numeric_age("unknown") is None
+    assert age_band_for_age(20) == "young_adult"
+    rows = [{"id": "brekke", "name": "Brekke", "bio": "young adult", "context": ""}]
+    raw = {"characters": {"brekke": {"gender": "female", "age_band": "teen", "approx_age": "early 20s", "accent": "unknown", "vocal_size": "light"}}, "cohorts": []}
+    plan = normalize_plan(raw, {"brekke"}, rows)
+    assert plan["characters"]["brekke"]["age_band"] == "young_adult"
+    assert plan["characters"]["brekke"]["approx_age"] == "early 20s"

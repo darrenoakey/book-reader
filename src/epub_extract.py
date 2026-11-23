@@ -174,6 +174,13 @@ def extract_chapters(epub_path: Path, book: epub.EpubBook | None = None) -> tupl
 
 
 # ##################################################################
+# intro text
+# the spoken opening line; title and author are also read back from it on resume
+def intro_text(title: str, author: str) -> str:
+    return f"{title} by {author}, narrated by Darren's Book Reader."
+
+
+# ##################################################################
 # write chapters
 # write extracted chapters to output directory
 def write_chapters(output_dir: Path, title: str, author: str, chapters: list[ChapterInfo]) -> list[Path]:
@@ -182,8 +189,7 @@ def write_chapters(output_dir: Path, title: str, author: str, chapters: list[Cha
     written = []
     intro_path = chapters_dir / "00-intro.txt"
     if not intro_path.exists():
-        intro_text = f"{title} by {author}, narrated by Darren's Book Reader."
-        intro_path.write_text(intro_text, encoding="utf-8")
+        intro_path.write_text(intro_text(title, author), encoding="utf-8")
     written.append(intro_path)
     for chapter in chapters:
         filename = f"{chapter.number:02d}-{normalize_name(chapter.title)[:40]}.txt"

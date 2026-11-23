@@ -71,6 +71,7 @@ MOVIE_PATHS = {
     "src/text_ingest.py",
     "src/text_ingest_test.py",
     "greenline.toml",
+    ".gitignore",
     "jeff_book.py",
     "jeff_book_test.py",
     "src/breeze_voices_test.py",
@@ -147,6 +148,12 @@ RECOVERY_TESTS = (
     "src/source_extend_test.py",
     "src/noveliser_import_test.py",
     "src/cast_plan_test.py",
+    # audiobook production consumes data_recovery through the pipeline, cover,
+    # verification and publish steps, so a recovery change must re-run them.
+    "src/audiobook_cover_test.py",
+    "src/audiobook_request_test.py",
+    "src/audiobook_verify_test.py",
+    "src/m4b_assemble_test.py",
 )
 
 
@@ -163,6 +170,9 @@ IMPACT: dict[str, tuple[str, ...]] = {
         "src/noveliser_import_test.py::test_cli_import_only",
     ),
     "greenline.toml": ("src/gate_check_test.py",),
+    # repository hygiene: no runtime surface, but explicitly known so it does not
+    # trigger the whole-repository check that an unknown path forces.
+    ".gitignore": ("src/gate_check_test.py",),
     "src/movie_assemble.py": (
         "src/movie_assemble_test.py",
         "src/movie_resolution_test.py",
@@ -271,6 +281,14 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "src/arbiter_tts.py": ("src/arbiter_tts_test.py", "src/movie_images_test.py"),
     "src/arbiter_tts_test.py": ("src/arbiter_tts_test.py",),
     "src/audio_synth.py": ("src/audio_synth_test.py", "src/data_recovery_test.py"),
+    "src/audiobook_cover.py": ("src/audiobook_cover_test.py",),
+    "src/audiobook_cover_test.py": ("src/audiobook_cover_test.py",),
+    "src/audiobook_library.py": ("src/audiobook_library_test.py", "src/audiobook_request_test.py"),
+    "src/audiobook_library_test.py": ("src/audiobook_library_test.py", "src/audiobook_request_test.py"),
+    "src/audiobook_request.py": ("src/audiobook_request_test.py",),
+    "src/audiobook_request_test.py": ("src/audiobook_request_test.py",),
+    "src/books_delivery.py": ("src/books_delivery_test.py", "src/audiobook_request_test.py"),
+    "src/books_delivery_test.py": ("src/books_delivery_test.py",),
     "src/audio_synth_test.py": ("src/audio_synth_test.py",),
     "src/breeze_voices.py": ("src/hour_runner_test.py", "src/breeze_voices_test.py"),
     "src/kokoro_voices.py": ("src/kokoro_voices_test.py", "src/kokoro_f0_table_test.py", "src/cast_plan_test.py", "src/cast_plan_module_test.py"),
@@ -289,10 +307,26 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "src/tts_engine.py": ("src/tts_engine_test.py", "src/voice_assets_test.py", "src/audio_synth_test.py", "src/hour_runner_test.py"),
     "src/state.py": ("src/state_test.py", "src/pipeline_test.py"),
     "src/character_analysis_test.py": ("src/character_analysis_test.py",),
+    # audiobook surface: verification, series continuity, and the two pipeline
+    # steps they consume. Registered so a change here selects real suites
+    # instead of falling back to the whole-repository check.
+    "src/audiobook_verify.py": ("src/audiobook_verify_test.py", "src/audiobook_request_test.py"),
+    "src/audiobook_verify_test.py": ("src/audiobook_verify_test.py",),
+    "src/series_voices.py": ("src/series_voices_test.py", "src/audiobook_request_test.py"),
+    "src/series_voices_test.py": ("src/series_voices_test.py",),
+    "src/epub_extract.py": ("src/epub_extract_test.py", "src/audiobook_cover_test.py", "src/movie_resolution_test.py"),
+    "src/epub_extract_test.py": ("src/epub_extract_test.py",),
+    "src/m4b_assemble.py": ("src/m4b_assemble_test.py", "src/audiobook_verify_test.py"),
 }
 
 
 MOVIE_PATHS.update({
+    "src/audiobook_cover.py", "src/audiobook_cover_test.py",
+    "src/audiobook_library.py", "src/audiobook_library_test.py",
+    "src/audiobook_request.py", "src/audiobook_request_test.py",
+    "src/audiobook_verify.py", "src/audiobook_verify_test.py",
+    "src/series_voices.py", "src/series_voices_test.py", "src/books_delivery.py", "src/books_delivery_test.py",
+    "src/epub_extract.py", "src/epub_extract_test.py", "src/m4b_assemble.py",
     "src/voice_description.py", "src/voice_description_test.py", "src/voice_acoustic.py",
     "src/casting_llm.py", "src/casting_llm_test.py", "src/kokoro_f0_table.py", "src/kokoro_f0_table_test.py",
     "src/voice_assets.py", "src/voice_assets_test.py", "src/voice_clone.py", "src/tts_engine.py", "src/state.py", "src/kokoro_voices.py",

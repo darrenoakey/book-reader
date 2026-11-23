@@ -1,3 +1,4 @@
+import json
 import subprocess
 import tempfile
 from pathlib import Path
@@ -8,6 +9,7 @@ PAUSE_BETWEEN_CHAPTERS_SEC = 3.0
 PAUSE_AFTER_CHIME_SEC = 0.5
 PAUSE_AFTER_ANNOUNCEMENT_SEC = 1.0
 SAMPLE_RATE = 24000
+AUDIOBOOK_ASSEMBLY_NAME = "audiobook_assembly.json"
 
 
 # ##################################################################
@@ -28,9 +30,10 @@ def number_duplicate_titles(chapters: list[dict]) -> None:
 
 # ##################################################################
 # find cover image
-# look for cover image in output directory
+# look for cover image in output directory; a generated audiobook cover
+# (audiobook_cover.jpg) always wins over the source EPUB's own cover file
 def find_cover_image(output_dir: Path) -> Path | None:
-    for name in ("cover.jpeg", "cover.jpg", "cover.png"):
+    for name in ("audiobook_cover.jpg", "cover.jpeg", "cover.jpg", "cover.png"):
         path = output_dir / name
         if path.exists():
             return path
@@ -195,13 +198,35 @@ def write_chapter_metadata(chapters: list[dict], output_path: Path) -> None:
 # ##################################################################
 # assemble m4b
 # create final m4b audiobook with chapter markers
-def assemble_m4b(output_dir: Path, title: str, author: str, max_chapters: int = 0) -> Path:
+def assemble_m4b(
+    output_dir: Path, title: str, author: str, max_chapters: int = 0, *, require_generated_cover: bool = False
+) -> Path:
     audio_dir = output_dir / "audio"
     if not audio_dir.exists():
         raise ValueError("audio directory not found")
     book_name = output_dir.name
     m4b_path = output_dir / f"{book_name}.m4b"
-    if m4b_path.exists():
+    manifest = output_dir / AUDIOBOOK_ASSEMBLY_NAME
+    cover_path = find_cover_image(output_dir)
+    if require_generated_cover:
+        from src.audiobook_cover import COVER_NAME, cover_is_current
+        from src.audiobook_request import write_json
+        from src.audiobook_verify import canonical_digest, manifest_is_intact
+        from src.books_delivery import sha256_file
+
+        cover_path = output_dir / COVER_NAME
+        if not cover_is_current(output_dir, title, author):
+            raise ValueError(f"{title} has no verified generated audiobook cover")
+        cover_sha256 = sha256_file(cover_path)
+        if m4b_path.is_file() and manifest.is_file():
+            prior = json.loads(manifest.read_text())
+            if (
+                manifest_is_intact(prior)
+                and (prior.get("title"), prior.get("author"), prior.get("cover_sha256")) == (title, author, cover_sha256)
+                and prior.get("m4b_sha256") == sha256_file(m4b_path)
+            ):
+                return m4b_path
+    elif m4b_path.exists():
         return m4b_path
     chapter_files = sorted(f for f in audio_dir.glob("*.wav") if not f.stem.endswith(".announce") and f.stem != "chime")
     if max_chapters > 0:
@@ -240,6 +265,7 @@ def assemble_m4b(output_dir: Path, title: str, author: str, max_chapters: int = 
                     "title": chapter_name,
                     "start": chapter_start,
                     "end": current_time + duration,
+                    "source": chapter_file.name,
                 }
             )
             interleaved.append(chapter_file)
@@ -251,7 +277,6 @@ def assemble_m4b(output_dir: Path, title: str, author: str, max_chapters: int = 
         concatenate_audio_files(interleaved, full_audio_path)
         metadata_path = work_dir / "metadata.txt"
         write_chapter_metadata(chapter_info, metadata_path)
-        cover_path = find_cover_image(output_dir)
         cmd = [
             "ffmpeg",
             "-y",
@@ -286,12 +311,30 @@ def assemble_m4b(output_dir: Path, title: str, author: str, max_chapters: int = 
                 "-map",
                 "1:v",
                 "-c:v",
-                "mjpeg",
+                "copy" if require_generated_cover else "mjpeg",
                 "-disposition:v:0",
                 "attached_pic",
             ]
-        cmd.append(str(m4b_path))
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg m4b creation failed: {result.stderr}")
+        partial = m4b_path.with_name(f".{m4b_path.stem}.partial.m4b")
+        cmd.append(str(partial))
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg m4b creation failed: {result.stderr}")
+            partial.replace(m4b_path)
+        finally:
+            partial.unlink(missing_ok=True)
+        if require_generated_cover:
+            assembly = {
+                "version": 1,
+                "title": title,
+                "author": author,
+                "album": title,
+                "chapters": chapter_info,
+                "duration_seconds": current_time,
+                "cover_name": cover_path.name,
+                "cover_sha256": cover_sha256,
+                "m4b_sha256": sha256_file(m4b_path),
+            }
+            write_json(manifest, {**assembly, "fingerprint": canonical_digest(assembly)})
     return m4b_path

@@ -69,6 +69,14 @@ def prepare_breeze_voices(output_dir: Path, only: set[str] | None = None) -> Pat
                     f"new={description!r}"
                 )
             continue
+        from src.series_voices import copy_parent_reference
+
+        inherited = copy_parent_reference(output_dir, char_id, description)
+        if inherited is not None:
+            print(f"  breeze voice {index + 1}/{len(descriptions)}: {char_id} (series voice reused)")
+            manifest[char_id] = inherited
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            continue
         print(f"  breeze voice {index + 1}/{len(descriptions)}: {char_id}")
         tts_breeze_design_to_file(
             description=description,

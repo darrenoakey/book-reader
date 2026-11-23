@@ -131,6 +131,17 @@ def test_lock_refuses_live_owner(tmp_path: Path) -> None:
 
 
 # ##################################################################
+# test lock leaves no foreign artifact beside the lock
+# acquiring must publish only ".pipeline.lock": a guard/partial file left behind
+# makes noveliser_import reject the project as a non-noveliser directory.
+def test_lock_publishes_only_the_lock_file(tmp_path: Path) -> None:
+    lock = acquire_lock(tmp_path)
+    assert sorted(path.name for path in tmp_path.iterdir()) == [".pipeline.lock"]
+    release_lock(lock)
+    assert sorted(path.name for path in tmp_path.iterdir()) == []
+
+
+# ##################################################################
 # test lock takes over stale
 # a lock left by a dead process or holding garbage is replaced by ours
 def test_lock_replaces_stale_and_garbage(tmp_path: Path) -> None:

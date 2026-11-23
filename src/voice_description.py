@@ -199,7 +199,12 @@ async def generate_voices(output_dir: Path, cache_root: Path | str | None = None
         if any((output_dir / "voices").glob("*.wav")) or any((output_dir / "audio").glob("*.wav")):
             raise ValueError(f"casting changed in {output_dir} with materialized voices/audio; archive or reimport the project to explicitly recast without mixing old and new voices")
         print("  cast plan changed — regenerating voice descriptions (was stale)")
-    voices = await generate_all_voice_descriptions(characters, plan, cache_root)
+    from src.series_voices import inherited_descriptions
+
+    inherited = inherited_descriptions(output_dir, characters, plan)
+    fresh = {cid: info for cid, info in characters.items() if cid not in inherited}
+    voices = {**await generate_all_voice_descriptions(fresh, plan, cache_root), **inherited}
+    voices = {cid: voices[cid] for cid in sorted(voices)}
     voices_path.write_text(json.dumps(voices, indent=2), encoding="utf-8")
     write_plan_sidecar(output_dir, plan["fingerprint"], SIDECAR_VOICES)
     return voices_path

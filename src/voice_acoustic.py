@@ -89,6 +89,9 @@ def self_description(description: str) -> str:
     return " ".join(parts)
 
 
+_DECADES = {"twenties": 20, "thirties": 30, "forties": 40, "fifties": 50, "sixties": 60, "seventies": 70, "eighties": 80, "nineties": 90}
+
+
 def description_violations(description: str, profile: dict) -> list[str]:
     problems: list[str] = []
     text = self_description(description).lower()
@@ -103,6 +106,11 @@ def description_violations(description: str, profile: dict) -> list[str]:
     if age_band and age_band != "unknown":
         cues = _AGE_CUES.get(age_band, ())
         numeric_ages = [int(value) for value in re.findall(r"\b(\d{1,3})[- ]years?[- ]old\b", text)]
+        # decade words are ages too: "in her fifties or sixties" is checked against the band
+        # (a middle-aged 50s-60s woman is not "elderly"; a middle-aged "seventies" still fails)
+        numeric_ages += [_DECADES[word] for word in re.findall(r"\b(" + "|".join(_DECADES) + r")\b", text)]
+        # "in her early 20s" is an age too, not just "22 years old" or "twenties"
+        numeric_ages += [int(value) for value in re.findall(r"\b(?:age[d]?|about|around|early|mid|late)\s+(\d{1,3})s?\b", text)]
         ranges = {"child": (0, 12), "teen": (13, 19), "young_adult": (20, 34), "adult": (25, 49), "middle_aged": (40, 64), "older": (60, 120)}
         numeric_match = any(ranges[age_band][0] <= age <= ranges[age_band][1] for age in numeric_ages) if age_band in ranges else False
         if cues and not any(_mentions(text, cue) for cue in cues) and not numeric_match:
@@ -111,7 +119,7 @@ def description_violations(description: str, profile: dict) -> list[str]:
             problems.append(f"description states an incompatible numeric age for '{age_band}'")
         hard_age_cues = {
             "child": ("young child", "child voice", "child's voice", "little boy", "little girl"),
-            "older": ("elderly", "sixties", "seventies", "old man", "old woman", "older adult", "older male", "older female", "older man", "older woman", "older voice"),
+            "older": ("elderly", "old man", "old woman", "older adult", "older male", "older female", "older man", "older woman", "older voice"),
         }
         for other, cues_other in hard_age_cues.items():
             # Job seniority and relative age ('older sister') do not mean elderly.

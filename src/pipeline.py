@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 import time
@@ -109,16 +110,26 @@ def print_skip(message: str) -> None:
 # queue (this actually happened — degraded scripts, cancelled TTS batches).
 def acquire_lock(output_dir: Path) -> Path:
     lock = output_dir / ".pipeline.lock"
-    if lock.exists():
+    # The exclusive advisory lock is taken on the lock file itself, so acquiring
+    # leaves exactly the one artifact this project already published. A separate
+    # guard file would be a new foreign entry in every project directory.
+    with lock.open("a+b") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        # an append-mode descriptor is positioned at EOF, so seek before reading:
+        # otherwise the holder is read as empty and a live lock is stolen.
+        guard.seek(0)
+        holder = guard.read().decode("utf-8", "replace").strip()
         try:
-            pid = int(lock.read_text().strip())
+            pid = int(holder)
             os.kill(pid, 0)  # alive?
+        except (ProcessLookupError, ValueError):
+            pass  # stale lock from a dead run, or no usable pid
+        else:
             raise SystemExit(f"pipeline already running for {output_dir.name} (pid {pid}) — refusing to start a second")
-        except ProcessLookupError:
-            pass  # stale lock from a dead run
-        except ValueError:
-            pass
-    lock.write_text(str(os.getpid()), encoding="utf-8")
+        guard.seek(0)
+        guard.truncate()
+        guard.write(str(os.getpid()).encode("utf-8"))
+        guard.flush()
     return lock
 
 
@@ -177,7 +188,29 @@ def run_noveliser_pipeline(
         release_lock(lock)
 
 
-def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int, imported: dict | None = None) -> Path:
+# ##################################################################
+# run audiobook pipeline
+# audiobook-only production into an explicit project directory: the same
+# extract..m4b steps, an original generated cover, and no storyboard/images/movie.
+def run_audiobook_pipeline(source: Path, output_dir: Path, display_author: str | None = None) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock = acquire_lock(output_dir)
+    try:
+        return _run_pipeline_locked(
+            source, output_dir, DEFAULT_RESOLUTION, audiobook_only=True, display_author=display_author
+        )
+    finally:
+        release_lock(lock)
+
+
+def _run_pipeline_locked(
+    epub_path: Path,
+    output_dir: Path,
+    resolution: int,
+    imported: dict | None = None,
+    audiobook_only: bool = False,
+    display_author: str | None = None,
+) -> Path:
     print(f"{Fore.CYAN}Book Reader Pipeline{Style.RESET_ALL}")
     print(f"  Input: {epub_path}")
     print(f"  Output: {output_dir}")
@@ -198,6 +231,12 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int, imp
             title, author, written = extract_any(epub_path, output_dir)
         print_done(f"Extracted {len(written)} chapter files")
         mark_step_complete(output_dir, "extract")
+    if display_author and display_author != author:
+        # EPUB metadata like "McCaffrey Anne": the request's spelling is what is spoken, tagged and printed
+        from src.epub_extract import intro_text
+
+        (output_dir / "chapters" / "00-intro.txt").write_text(intro_text(title, display_author), encoding="utf-8")
+        author = display_author
     print_step(2, "Analyze characters with Claude Haiku")
     if imported is not None:
         print_skip(f"Cast imported from noveliser and frozen ({len(imported['identities'])} identities)")
@@ -252,8 +291,19 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int, imp
             audio_files = synthesize_all_chapters(output_dir)
         print_done(f"Synthesized {len(audio_files)} audio segments")
         mark_step_complete(output_dir, "audio")
+    if audiobook_only:
+        from src.audiobook_cover import generate_audiobook_cover
+
+        # the generated cover (an edit of the EPUB's own cover) is what assemble_m4b embeds
+        print_step(7, "Generate audiobook cover")
+        print_done(f"Cover {generate_audiobook_cover(output_dir, title, author).name}")
     print_step(7, "Assemble M4B audiobook")
-    if is_step_complete(output_dir, "m4b"):
+    if audiobook_only:
+        with _time_step(output_dir, "m4b"):
+            m4b_path = assemble_m4b(output_dir, title, author, require_generated_cover=True)
+        print_done(f"Audiobook {m4b_path.name}")
+        mark_step_complete(output_dir, "m4b")
+    elif is_step_complete(output_dir, "m4b"):
         print_skip("M4B already assembled")
         m4b_path = output_dir / f"{output_dir.name}.m4b"
     else:
@@ -261,6 +311,9 @@ def _run_pipeline_locked(epub_path: Path, output_dir: Path, resolution: int, imp
             m4b_path = assemble_m4b(output_dir, title, author)
         print_done(f"Created {m4b_path.name}")
         mark_step_complete(output_dir, "m4b")
+    if audiobook_only:
+        print(f"\n{Fore.GREEN}Complete!{Style.RESET_ALL} Audiobook: {m4b_path}")
+        return m4b_path
     print_step(8, "Build movie storyboard (~30s scenes)")
     if is_step_complete(output_dir, "storyboard"):
         print_skip("Storyboard already built")

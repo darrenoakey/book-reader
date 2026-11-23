@@ -51,6 +51,7 @@ RECEIPT_NAME = "delivery_receipt.json"
 QUIET_HOURS = range(2, 5)
 WAIT_SECONDS = 60
 PARENT_OUTAGE_SECONDS = 30 * 60
+SHARE_RETRY_SECONDS = 1.0
 TERMINAL = ("delivered", "published", "failed")
 MILESTONES = ("extract", "characters", "voices_desc", "voices_clone", "scripts", "audio", "m4b")
 
@@ -127,6 +128,12 @@ def jobs_dir(config: dict[str, Path]) -> Path:
     return config["delivery_root"] / "jobs"
 
 
+def locks_dir(config: dict[str, Path]) -> Path:
+    # locks only coordinate processes on this Mac, so they live on local disk:
+    # an SMB share can keep a dead session's lock and refuse every later worker
+    return config["productions_root"] / ".audiobook-locks"
+
+
 def job_path(config: dict[str, Path], job_id: str) -> Path:
     if not re.fullmatch(r"work-[0-9a-f]{16}", job_id):
         raise ValueError(f"not a job id: {job_id!r}")
@@ -135,7 +142,7 @@ def job_path(config: dict[str, Path], job_id: str) -> Path:
 
 @contextmanager
 def job_lock(config: dict[str, Path], job_id: str, *, worker: bool = False):
-    path = job_path(config, job_id).with_suffix(".worker.lock" if worker else ".request.lock")
+    path = locks_dir(config) / job_path(config, job_id).with_suffix(".worker.lock" if worker else ".request.lock").name
     path.parent.mkdir(parents=True, exist_ok=True)
     # Lock files are never unlinked: contenders must acquire the same inode.
     with path.open("ab") as handle:
@@ -171,9 +178,18 @@ def load_job(config: dict[str, Path], job_id: str, *, attempts: int = 4) -> dict
     raise FileNotFoundError(f"no audiobook job {job_id}") from last
 
 
-def save_job(config: dict[str, Path], job: dict, **changes) -> dict:
+def save_job(config: dict[str, Path], job: dict, *, attempts: int = 6, **changes) -> dict:
     job = {**job, **changes, "updated": now()}
-    write_json(job_path(config, job["job_id"]), job)
+    # the record lives on the delivery share; ride out a short outage (about a
+    # minute in total) rather than kill an hours-long worker, then fail loudly
+    for attempt in range(1, attempts + 1):
+        try:
+            write_json(job_path(config, job["job_id"]), job)
+            return job
+        except OSError:
+            if attempt == attempts:
+                raise
+            time.sleep(min(2 ** (attempt - 1), 30) * SHARE_RETRY_SECONDS)
     return job
 
 
@@ -540,7 +556,8 @@ def _work(config: dict[str, Path], job: dict) -> dict:
     asset = find_delivered_asset(published_m4b)
     if asset is None:
         job = save_job(config, job, state="waiting_for_books_window")
-        lock = jobs_dir(config) / ".mac-books-import.lock"
+        lock = locks_dir(config) / ".mac-books-import.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
         while asset is None:
             if books_window_open():
                 with lock.open("ab") as guard:

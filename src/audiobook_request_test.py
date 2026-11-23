@@ -344,3 +344,47 @@ def test_publish_reads_the_contract_recorded_during_the_render() -> None:
     reload_at = source.index("load_job(config, job[\"job_id\"])")
     assert reload_at > publish_at, "the job must be re-read after publishing, before the series step"
     assert source.index('if job.get("series"):') > reload_at, "the series step must read the reloaded job"
+
+
+# ##################################################################
+# test job locks are local and a share write outage is ridden out
+# The share kept a dead SMB session's flock and refused every later worker with
+# EACCES, so locks must live on local disk where contention is a clean
+# BlockingIOError. A job write must survive a short share outage but still fail
+# loudly when the share stays down.
+def test_job_locks_are_local_and_job_writes_ride_out_a_share_outage() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        config = make_config(root)
+        make_epub(root / "library" / "Anne McCaffrey - Dragonsong.epub", "Dragonsong", "McCaffrey Anne")
+        settings = req.settings(config)
+        job = req.request("Dragonsong", "Anne McCaffrey", start=False, config_path=config)["job"]
+
+        with req.job_lock(settings, job["job_id"], worker=True):
+            assert (root / "productions" / ".audiobook-locks" / f"{job['job_id']}.worker.lock").is_file()
+            assert not list((root / "delivery").rglob("*.worker.lock"))
+            with pytest.raises(BlockingIOError), req.job_lock(settings, job["job_id"], worker=True):
+                pass
+
+        real_write, pause = req.write_json, req.SHARE_RETRY_SECONDS
+        calls = {"n": 0}
+
+        def outage(path: Path, data: dict) -> None:
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise TimeoutError(60, "Operation timed out", str(path))
+            real_write(path, data)
+
+        req.write_json, req.SHARE_RETRY_SECONDS = outage, 0
+        try:
+            saved = req.save_job(settings, job, state="producing")
+            assert calls["n"] == 3 and req.load_job(settings, job["job_id"])["state"] == saved["state"] == "producing"
+
+            def down(path: Path, data: dict) -> None:
+                raise OSError(64, "Host is down", str(path))
+
+            req.write_json = down
+            with pytest.raises(OSError, match="Host is down"):
+                req.save_job(settings, job, state="failed", attempts=3)
+        finally:
+            req.write_json, req.SHARE_RETRY_SECONDS = real_write, pause

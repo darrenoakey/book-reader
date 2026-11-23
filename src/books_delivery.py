@@ -101,8 +101,17 @@ def find_delivered_asset(m4b: Path, database: Path | None = None) -> dict | None
         stored = Path(asset["path"])
         candidates = sorted(stored.glob("*.m4b")) if stored.is_dir() else [stored]
         for candidate in candidates:
-            if candidate.is_file() and candidate.stat().st_size == size and sha256_file(candidate) == digest:
-                return {**asset, "stored_file": str(candidate), "sha256": digest, "bytes": size}
+            if not candidate.is_file() or candidate.stat().st_size != size:
+                continue
+            # An iCloud-evicted candidate raises EDEADLK/ENOENT instead of reading.
+            # It cannot be proven identical, so it is not this asset, and scanning
+            # on must never abort a delivery on an unreadable older copy.
+            try:
+                if sha256_file(candidate) != digest:
+                    continue
+            except OSError:
+                continue
+            return {**asset, "stored_file": str(candidate), "sha256": digest, "bytes": size}
     return None
 
 

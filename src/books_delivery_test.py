@@ -26,6 +26,7 @@ import pytest
 from src.books_delivery import (
     audiobook_assets,
     copy_to_icloud_files,
+    find_delivered_asset,
     icloud_container,
     icloud_delivery_evidence,
     library_database,
@@ -370,3 +371,34 @@ def test_private_copy_never_launches_books(studio: Path, m4b: Path, monkeypatch:
     for call in calls:
         assert call[0] not in {"open", "open -a"}
         assert "Books" not in call
+
+
+# ##################################################################
+# test unreadable registered copies are skipped, never fatal
+# An iCloud-evicted stored file raises EDEADLK/ENOENT instead of reading. Such a
+# copy cannot be proven byte-identical, so the scan must move on to the next
+# asset instead of aborting the delivery that is looking for its own import.
+def test_find_delivered_asset_skips_unreadable_copies(studio: Path, m4b: Path) -> None:
+    import sqlite3
+
+    database = studio / "BKLibrary-1-test.sqlite"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE ZBKLIBRARYASSET (ZASSETID TEXT, ZTITLE TEXT, ZPATH TEXT, ZCONTENTTYPE INTEGER, ZISHIDDEN INTEGER)")
+    evicted = studio / "library" / "evicted"
+    evicted.mkdir(parents=True)
+    (evicted / "gone.m4b").symlink_to(studio / "does-not-exist.m4b")
+    identical = studio / "library" / "identical"
+    identical.mkdir(parents=True)
+    (identical / "copy.m4b").write_bytes(PAYLOAD)
+    connection.execute("INSERT INTO ZBKLIBRARYASSET VALUES (?,?,?,?,?)", ("evicted-id", "Evicted", str(evicted), 6, 0))
+    connection.execute(
+        "INSERT INTO ZBKLIBRARYASSET VALUES (?,?,?,?,?)", ("real-id", "Test Book", str(identical), 6, 0)
+    )
+    connection.commit()
+    connection.close()
+
+    found = find_delivered_asset(m4b, database)
+
+    assert found is not None, "an unreadable registered copy must not hide the real one"
+    assert found["asset_id"] == "real-id"
+    assert found["sha256"] == sha256_file(m4b)

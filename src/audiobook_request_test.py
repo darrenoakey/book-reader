@@ -267,6 +267,22 @@ def test_load_job_retries_a_transient_lookup_then_fails_closed() -> None:
         assert recovered["job_id"] == path.stem
         assert calls["n"] == 2
 
+        # a share timeout is retried, and if it persists it surfaces as itself,
+        # never disguised as a missing job
+        timeouts = {"n": 0}
+
+        def timing_out(target: Path) -> dict:
+            timeouts["n"] += 1
+            raise TimeoutError(60, "Operation timed out", str(target))
+
+        req.read_json = timing_out
+        try:
+            with pytest.raises(TimeoutError):
+                req.load_job(settings, job["job_id"], attempts=2)
+        finally:
+            req.read_json = real_read
+        assert timeouts["n"] == 2
+
 
 # ##################################################################
 # test a series child outlives a share outage while awaiting its parent
@@ -292,8 +308,13 @@ def test_series_wait_survives_a_share_outage_then_fails_closed() -> None:
         def outage_then_back(target: Path) -> dict:
             if target == parent_path:
                 calls["n"] += 1
-                if calls["n"] <= 6:
+                # the real outage mixes a missing record, an SMB timeout and a dropped host
+                if calls["n"] <= 2:
                     raise FileNotFoundError(str(target))
+                if calls["n"] <= 4:
+                    raise TimeoutError(60, "Operation timed out", str(target))
+                if calls["n"] <= 6:
+                    raise OSError(64, "Host is down", str(target))
             return real_read(target)
 
         req.read_json, req.WAIT_SECONDS = outage_then_back, 0

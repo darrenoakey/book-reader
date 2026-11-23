@@ -154,12 +154,17 @@ def load_job(config: dict[str, Path], job_id: str, *, attempts: int = 4) -> dict
     for attempt in range(1, attempts + 1):
         try:
             job = read_json(path)
-        except FileNotFoundError as error:
+        except OSError as error:
+            # a timed-out or dropped SMB session surfaces as other OSErrors
+            # (ETIMEDOUT, EHOSTDOWN); retry those too, but re-raise them as-is
+            # so only a genuinely missing record reads as "no audiobook job"
             last = error
             if attempt < attempts:
                 time.sleep(0.5 * attempt)
                 continue
-            raise FileNotFoundError(f"no audiobook job {job_id}") from error
+            if isinstance(error, FileNotFoundError):
+                raise FileNotFoundError(f"no audiobook job {job_id}") from error
+            raise
         if job.get("job_id") != job_id:
             raise ValueError(f"job record {path.name} has a different identity")
         return job
@@ -450,7 +455,12 @@ def work(job_id: str, config_path: Path = CONFIG_PATH) -> dict:
             try:
                 return _work(config, job)
             except BaseException as error:
-                save_job(config, load_job(config, job_id), state="failed", error=f"{type(error).__name__}: {error}")
+                # recording the failure needs the same share that may have just
+                # failed; never let that mask the original error, which still raises
+                try:
+                    save_job(config, load_job(config, job_id), state="failed", error=f"{type(error).__name__}: {error}")
+                except OSError:
+                    pass
                 raise
     except BlockingIOError:
         if worker_alive(load_job(config, job_id)):
@@ -578,13 +588,14 @@ def pipeline_pid(project: Path) -> int | None:
 
 def _await_series_parent(config: dict[str, Path], job: dict) -> Path:
     # this wait spans the parent's whole render (many hours), so a share outage
-    # longer than load_job's short retry must not kill it; the record is polled
-    # until a continuous absence outlasts PARENT_OUTAGE_SECONDS, then fails closed
+    # (missing record, timeout, host down) longer than load_job's short retry
+    # must not kill it; the record is polled until a continuous outage outlasts
+    # PARENT_OUTAGE_SECONDS, then fails closed
     missing_since: float | None = None
     while True:
         try:
             parent = load_job(config, job["series_parent_job"], attempts=1)
-        except FileNotFoundError:
+        except OSError:
             missing_since = missing_since if missing_since is not None else time.monotonic()
             if time.monotonic() - missing_since >= PARENT_OUTAGE_SECONDS:
                 raise
@@ -596,7 +607,10 @@ def _await_series_parent(config: dict[str, Path], job: dict) -> Path:
         if parent["state"] == "failed" and not worker_alive(parent):
             raise ValueError(f"series parent {parent['title']} did not publish: {parent.get('error')}")
         if job["state"] != "waiting_for_series_parent":
-            job = save_job(config, job, state="waiting_for_series_parent")
+            try:
+                job = save_job(config, job, state="waiting_for_series_parent")
+            except OSError:
+                pass  # a status write can wait for the share; the next poll retries it
         time.sleep(WAIT_SECONDS)
 
 

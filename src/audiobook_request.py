@@ -142,14 +142,27 @@ def job_lock(config: dict[str, Path], job_id: str, *, worker: bool = False):
         yield
 
 
-def load_job(config: dict[str, Path], job_id: str) -> dict:
+def load_job(config: dict[str, Path], job_id: str, *, attempts: int = 4) -> dict:
     path = job_path(config, job_id)
-    if not path.is_file():
-        raise FileNotFoundError(f"no audiobook job {job_id}")
-    job = read_json(path)
-    if job.get("job_id") != job_id:
-        raise ValueError(f"job record {path.name} has a different identity")
-    return job
+    # The jobs directory lives on the delivery share, where a read can fail
+    # transiently (a stale negative lookup or a re-exported mount) while the
+    # record is present. Retry a bounded number of times so one flaky lookup
+    # cannot kill a worker that waits hours for its series parent; a genuinely
+    # absent job still fails closed on the last attempt.
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            job = read_json(path)
+        except FileNotFoundError as error:
+            last = error
+            if attempt < attempts:
+                time.sleep(0.5 * attempt)
+                continue
+            raise FileNotFoundError(f"no audiobook job {job_id}") from error
+        if job.get("job_id") != job_id:
+            raise ValueError(f"job record {path.name} has a different identity")
+        return job
+    raise FileNotFoundError(f"no audiobook job {job_id}") from last
 
 
 def save_job(config: dict[str, Path], job: dict, **changes) -> dict:

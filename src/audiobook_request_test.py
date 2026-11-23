@@ -224,3 +224,45 @@ def test_request_records_series_contract_and_publishes_registry() -> None:
         version, latest = latest_series_version(Path(req.settings(config)["delivery_root"]), "Harper Hall of Pern")
         assert version == 1 and latest["production"] == str(project.resolve())
         assert load_series_registry(Path(req.settings(config)["delivery_root"]))["format"] == "series-registry-v1"
+
+
+# ##################################################################
+# test a transient read failure does not kill the worker
+# The jobs directory lives on the delivery share, where a lookup can fail
+# transiently while the record is present. An absent job must still fail closed,
+# so the retry is bounded and the error type is preserved.
+def test_load_job_retries_a_transient_lookup_then_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        config = make_config(root)
+        make_epub(root / "library" / "Anne McCaffrey - Dragonsong.epub", "Dragonsong", "McCaffrey Anne")
+        job = req.request("Dragonsong", "Anne McCaffrey", start=False, config_path=config)["job"]
+        settings = req.settings(config)
+        path = req.job_path(settings, job["job_id"])
+
+        # a present record is returned normally
+        assert req.load_job(settings, job["job_id"])["job_id"] == job["job_id"]
+
+        # a genuinely absent job still fails closed with the documented error
+        with pytest.raises(FileNotFoundError, match="no audiobook job"):
+            req.load_job(settings, "work-" + "0" * 16)
+        with pytest.raises(FileNotFoundError, match="no audiobook job"):
+            req.load_job(settings, "work-" + "1" * 16, attempts=1)
+
+        # one transient miss is absorbed, and the real record is returned
+        real_read = req.read_json
+        calls = {"n": 0}
+
+        def flaky(target: Path) -> dict:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise FileNotFoundError(str(target))
+            return real_read(target)
+
+        req.read_json = flaky
+        try:
+            recovered = req.load_job(settings, job["job_id"])
+        finally:
+            req.read_json = real_read
+        assert recovered["job_id"] == path.stem
+        assert calls["n"] == 2

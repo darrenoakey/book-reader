@@ -206,6 +206,8 @@ def request(
     deliver: bool = True,
     start: bool = True,
     config_path: Path = CONFIG_PATH,
+    series: str | None = None,
+    series_required_characters: list[str] | None = None,
 ) -> dict:
     config = settings(config_path)
     existing = exact_job(config, title, author)
@@ -241,6 +243,16 @@ def request(
                     job = save_job(config, job, source_stat=identity)
             if parent_id is not None and job.get("series_parent_job") != parent_id:
                 raise ValueError(f"job {work_id} already has series parent {job.get('series_parent_job')}")
+            if series is not None:
+                if job.get("series") not in (None, series):
+                    raise ValueError(f"job {work_id} already belongs to series {job.get('series')!r}")
+                changes = {}
+                if job.get("series") is None:
+                    changes["series"] = series
+                if series_required_characters and not job.get("series_required_characters"):
+                    changes["series_required_characters"] = list(series_required_characters)
+                if changes:
+                    job = save_job(config, job, **changes)
         else:
             source = Path(found["source"])
             book_author = display_author(author, found["authors"])
@@ -254,6 +266,8 @@ def request(
                     "source_sha256": found["source_sha256"],
                     "source_stat": source_identity(source),
                     "series_parent_job": parent_id,
+                    "series": series,
+                    "series_required_characters": list(series_required_characters or []),
                     "deliver": deliver,
                     "project": str(config["productions_root"] / project_slug(source)),
                     "publication": str(config["delivery_root"] / publication_name(found["title"], book_author)),
@@ -585,6 +599,13 @@ def main(argv: list[str]) -> int:
     p_request.add_argument("--after", help="earlier book in the same series whose voices this one reuses")
     p_request.add_argument("--no-deliver", action="store_true", help="produce and publish only; no iCloud or Apple Books delivery")
     p_request.add_argument("--no-start", action="store_true", help="record the job without starting the worker")
+    p_request.add_argument("--series", help="series this book belongs to; a published parent becomes its voice contract")
+    p_request.add_argument(
+        "--series-required",
+        action="append",
+        default=None,
+        help="character display name the series contract requires in every volume (repeatable)",
+    )
     p_status = sub.add_parser("status", help="show one job or all jobs")
     p_status.add_argument("job_id", nargs="?")
     p_work = sub.add_parser("work", help="(internal) run one job's detached worker")
@@ -592,7 +613,15 @@ def main(argv: list[str]) -> int:
     p_work.add_argument("--config", type=Path, default=CONFIG_PATH)
     args = parser.parse_args(argv)
     if args.command == "request":
-        result = request(args.title, args.author, args.after, deliver=not args.no_deliver, start=not args.no_start)
+        result = request(
+            args.title,
+            args.author,
+            args.after,
+            deliver=not args.no_deliver,
+            start=not args.no_start,
+            series=args.series,
+            series_required_characters=args.series_required,
+        )
         print(json.dumps(result, indent=2))
         return 0 if result["status"] == "accepted" else 2
     if args.command == "status":

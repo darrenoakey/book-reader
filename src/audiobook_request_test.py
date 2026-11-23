@@ -159,3 +159,68 @@ def test_existing_receipt_requires_matching_bytes() -> None:
         assert req.existing_receipt(folder, m4b) is None
         (folder / req.RECEIPT_NAME).write_text(json.dumps({"m4b_sha256": "0" * 64}), encoding="utf-8")
         assert req.existing_receipt(folder, m4b) is None
+
+
+# ##################################################################
+# test the series contract is recorded and published
+# The registry is the durable series/character record Darren asked for. It is
+# only written when a job names its series, so the request must carry that
+# contract through to the worker instead of leaving it unreachable.
+def test_request_records_series_contract_and_publishes_registry() -> None:
+    from src.series_voices import (
+        latest_series_version,
+        load_series_registry,
+        registry_root,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        config = make_config(root)
+        make_epub(root / "library" / "Anne McCaffrey - Dragonsong.epub", "Dragonsong", "McCaffrey Anne")
+        result = req.request(
+            "Dragonsong",
+            "Anne McCaffrey",
+            start=False,
+            config_path=config,
+            series="Harper Hall of Pern",
+            series_required_characters=["Menolly"],
+        )
+        job = result["job"]
+        assert job["series"] == "Harper Hall of Pern"
+        assert job["series_required_characters"] == ["Menolly"]
+
+        # idempotent re-request keeps the recorded contract and never re-points it
+        again = req.request("Dragonsong", "Anne McCaffrey", start=False, config_path=config)
+        assert again["job"]["series"] == "Harper Hall of Pern"
+        with pytest.raises(ValueError, match="already belongs to series"):
+            req.request("Dragonsong", "Anne McCaffrey", start=False, config_path=config, series="Other Series")
+
+        # a production with a narrator and Menolly publishes as series version 1
+        project = Path(job["project"])
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "characters.json").write_text(json.dumps({"narrator": {"name": "Narrator"}, "menolly": {"name": "Menolly"}}), encoding="utf-8")
+        (project / "voices.json").write_text(
+            json.dumps(
+                {
+                    "narrator": {"description": "A warm British narrator."},
+                    "menolly": {"description": "A bright teenage girl from the sea holds."},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (project / "breeze_voices.json").write_text("{}", encoding="utf-8")
+        from src.series_voices import publish_series
+
+        entry = publish_series(
+            Path(req.settings(config)["delivery_root"]),
+            job["series"],
+            project,
+            character_names={"narrator": "Narrator", "menolly": "Menolly"},
+            required_characters=job["series_required_characters"],
+        )
+        assert entry["version"] == 1
+        assert "menolly" in entry["required_characters"]
+        assert (registry_root(Path(req.settings(config)["delivery_root"])) / "series_registry.json").is_file()
+        version, latest = latest_series_version(Path(req.settings(config)["delivery_root"]), "Harper Hall of Pern")
+        assert version == 1 and latest["production"] == str(project.resolve())
+        assert load_series_registry(Path(req.settings(config)["delivery_root"]))["format"] == "series-registry-v1"

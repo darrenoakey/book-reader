@@ -61,7 +61,7 @@ def command_audiobook(args: argparse.Namespace) -> int:
         return installed
     command = [str(VENV_PYTHON), "-m", "src.audiobook_request"]
     if args.status:
-        if args.author or args.after or args.no_deliver or args.no_start:
+        if args.author or args.after or args.no_deliver or args.no_start or args.series or args.series_required:
             print("Request flags cannot be used with --status", file=sys.stderr)
             return 2
         return run_venv([*command, "status", *([args.title] if args.title else [])])
@@ -69,9 +69,11 @@ def command_audiobook(args: argparse.Namespace) -> int:
         print("An audiobook title is required (or use --status)", file=sys.stderr)
         return 2
     command += ["request", args.title]
-    for option, value in (("--author", args.author), ("--after", args.after)):
+    for option, value in (("--author", args.author), ("--after", args.after), ("--series", args.series)):
         if value:
             command.extend((option, value))
+    for name in args.series_required or []:
+        command.extend(("--series-required", name))
     if args.no_deliver:
         command.append("--no-deliver")
     if args.no_start:
@@ -385,6 +387,8 @@ def main(argv: list[str]) -> int:
     p_book.add_argument("--status", action="store_true", help="Show all jobs or one job by ID")
     p_book.add_argument("--author", default=None, help="Author, to disambiguate the title")
     p_book.add_argument("--after", default=None, help="Earlier book in the same series whose voices this book reuses")
+    p_book.add_argument("--series", default=None, help="Series this book belongs to; a published parent becomes its voice contract")
+    p_book.add_argument("--series-required", action="append", default=None, help="Character the series contract requires in every volume (repeatable)")
     p_book.add_argument("--no-deliver", action="store_true", help="Publish the verified M4B without iCloud or Books delivery")
     p_book.add_argument("--no-start", action="store_true", help="Record the request without starting its detached worker")
     p_book.set_defaults(func=command_audiobook)

@@ -499,6 +499,10 @@ def _work(config: dict[str, Path], job: dict) -> dict:
     probe = report.as_dict()
     write_json(project / "audiobook_verification.json", probe)
     published = publish(m4b, project / COVER_NAME, publication)
+    # A render can run for many hours, so a contract recorded on the job while it
+    # was producing (its series and required characters) must be re-read here
+    # rather than taken from the copy this worker loaded when it started.
+    job = {**load_job(config, job["job_id"]), "worker_pid": job.get("worker_pid"), "worker_host": job.get("worker_host")}
     job = save_job(config, job, state="published", probe=probe, published=published)
     if job.get("series"):
         # a published series parent becomes the voice contract its sequels inherit

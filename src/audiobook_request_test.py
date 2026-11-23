@@ -266,3 +266,18 @@ def test_load_job_retries_a_transient_lookup_then_fails_closed() -> None:
             req.read_json = real_read
         assert recovered["job_id"] == path.stem
         assert calls["n"] == 2
+
+
+# ##################################################################
+# test a contract recorded mid-render is honoured at publish time
+# A render runs for hours. The series contract can be recorded on the job while
+# it is producing, so publishing must re-read the job instead of trusting the
+# copy the worker loaded when it started, or the registry never gets written.
+def test_publish_reads_the_contract_recorded_during_the_render() -> None:
+    import inspect
+
+    source = inspect.getsource(req._work)
+    publish_at = source.index("published = publish(")
+    reload_at = source.index("load_job(config, job[\"job_id\"])")
+    assert reload_at > publish_at, "the job must be re-read after publishing, before the series step"
+    assert source.index('if job.get("series"):') > reload_at, "the series step must read the reloaded job"

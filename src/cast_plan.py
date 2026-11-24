@@ -326,12 +326,36 @@ def band_conflict(age_band: str, approx_age: str | None) -> int | None:
     return None if low <= age <= high else age
 
 
+def _repair_response_identity_keys(raw: dict, known: set[str]) -> dict:
+    """Repair only an unambiguous one-key model typo; never merge identities."""
+    import difflib
+
+    characters = raw.get("characters")
+    if not isinstance(characters, dict):
+        return raw
+    missing = known - set(characters)
+    extra = set(characters) - known
+    if len(missing) != 1 or len(extra) != 1:
+        return raw
+    wanted = next(iter(missing))
+    emitted = next(iter(extra))
+    matches = difflib.get_close_matches(emitted, [wanted], n=1, cutoff=0.8)
+    if not matches:
+        return raw
+    repaired = dict(characters)
+    repaired[wanted] = repaired.pop(emitted)
+    return {**raw, "characters": repaired}
+
+
 def normalize_plan(raw: dict, known: set[str], rows: list[dict]) -> dict:
     """Typed, bounded plan from the model response; identity set must match.
 
     A response that omits requested identities or invents unknown ones is a
     malformed answer, not an all-unknown plan: nothing is silently degraded.
+    A single unambiguous near-match key is repaired without changing the
+    character's evidence or allowing an existing identity to be overwritten.
     """
+    raw = _repair_response_identity_keys(raw, known)
     characters_in = raw.get("characters") if isinstance(raw.get("characters"), dict) else {}
     missing = sorted(known - set(characters_in))
     extra = sorted(set(characters_in) - known)

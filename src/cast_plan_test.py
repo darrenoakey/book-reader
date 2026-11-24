@@ -21,6 +21,7 @@ from src.cast_plan import (
     SIDECAR_VOICES,
     build_cast_plan,
     load_plan,
+    normalize_plan,
     plan_is_stale,
 )
 from src.kokoro_voices import map_characters_to_voices
@@ -135,6 +136,35 @@ def _write_project(tmp_path: Path, characters: dict) -> Path:
     project.mkdir(parents=True)
     (project / "characters.json").write_text(json.dumps(characters, indent=2), encoding="utf-8")
     return project
+
+
+# ##################################################################
+# response identity typo boundary
+# canonical character IDs remain authoritative: a model may misspell a key,
+# but only one unambiguous near-match can be repaired, never two identities.
+def test_response_identity_typo_is_repaired_without_merging() -> None:
+    raw = {
+        "characters": {
+            "felen": {"gender": "female", "age_band": "adult", "accent": "unknown", "vocal_size": "medium"},
+            "narrator": {"gender": "unknown", "age_band": "unknown", "accent": "unknown", "vocal_size": "medium"},
+        },
+        "cohorts": [],
+    }
+    plan = normalize_plan(raw, {"felena", "narrator"}, [{"id": "felena", "name": "Felena"}, {"id": "narrator", "name": "Narrator"}])
+    assert plan["characters"]["felena"]["gender"] == "female"
+    assert "felen" not in plan["characters"]
+
+
+def test_response_identity_collision_fails_closed() -> None:
+    raw = {
+        "characters": {
+            "felena": {"gender": "female", "age_band": "adult", "accent": "unknown", "vocal_size": "medium"},
+            "felen": {"gender": "female", "age_band": "adult", "accent": "unknown", "vocal_size": "medium"},
+        },
+        "cohorts": [],
+    }
+    with pytest.raises(ValueError, match="identity mismatch"):
+        normalize_plan(raw, {"felena"}, [{"id": "felena", "name": "Felena"}])
 
 
 # ##################################################################

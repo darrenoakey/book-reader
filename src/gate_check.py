@@ -148,6 +148,7 @@ RECOVERY_TESTS = (
     "src/source_extend_test.py",
     "src/noveliser_import_test.py",
     "src/cast_plan_test.py",
+    "src/narrator_voice_test.py",
     # audiobook production consumes data_recovery through the pipeline, cover,
     # verification and publish steps, so a recovery change must re-run them.
     "src/audiobook_cover_test.py",
@@ -317,6 +318,15 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "src/epub_extract.py": ("src/epub_extract_test.py", "src/audiobook_cover_test.py", "src/movie_resolution_test.py"),
     "src/epub_extract_test.py": ("src/epub_extract_test.py",),
     "src/m4b_assemble.py": ("src/m4b_assemble_test.py", "src/audiobook_verify_test.py"),
+    # the durable narrator voice policy: describes the narrator for the voices
+    # step, constrains the cast-plan narrator row, and is consulted per request
+    "src/narrator_voice.py": (
+        "src/narrator_voice_test.py", "src/voice_description_test.py", "src/cast_plan_test.py",
+        "src/series_voices_test.py", "src/audiobook_request_test.py",
+    ),
+    "src/narrator_voice_test.py": ("src/narrator_voice_test.py",),
+    # the detached real-synthesis proof is exercised by the policy's own suite
+    "src/narrator_voice_proof.py": ("src/narrator_voice_test.py",),
     # the shared media-binary resolver every rendering module executes
     "src/media_tools.py": ("src/media_tools_test.py", "src/audio_synth_test.py", "src/m4b_assemble_test.py", "src/audiobook_verify_test.py", "src/audiobook_request_test.py", "src/hour_continue_test.py", "src/movie_assemble_test.py"),
     "src/media_tools_test.py": ("src/media_tools_test.py",),
@@ -334,6 +344,7 @@ MOVIE_PATHS.update({
     "src/casting_llm.py", "src/casting_llm_test.py", "src/kokoro_f0_table.py", "src/kokoro_f0_table_test.py",
     "src/voice_assets.py", "src/voice_assets_test.py", "src/voice_clone.py", "src/tts_engine.py", "src/state.py", "src/kokoro_voices.py",
     "src/media_tools.py", "src/media_tools_test.py",
+    "src/narrator_voice.py", "src/narrator_voice_test.py", "src/narrator_voice_proof.py",
 })
 
 # Casting recordings contain only real backend responses; changes re-run their consumers.

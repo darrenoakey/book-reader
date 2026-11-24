@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "router": {
+    "primary": {
+      "url": "http://10.0.0.42:11436/v1",
+      "ping_host": "10.0.0.42",
+      "model": "qwen3.6:35b-a3b",
+      "style": "openai",
+      "num_ctx": 262144,
+      "think": false,
+      "expected_identity": null
+    },
+    "backup": {
+      "url": "http://127.0.0.1:11434",
+      "ping_host": "127.0.0.1",
+      "model": "qwen3:8b",
+      "style": "ollama",
+      "num_ctx": 40960,
+      "think": false,
+      "expected_identity": "Darrens-MacBook-Pro"
+    }
+  },
+  "routes_used": [
+    "qwen3:8b"
+  ],
+  "request": {
+    "prompt": "You are designing a voice for an audiobook character. Output a concise (60-100 word) voice description suitable for TTS voice cloning.\n\nAudiobook character voice for TTS cloning.\n\nCAST PLAN CONSTRAINTS (authoritative — the description MUST match all of these;\nuse \"unknown\" fields as freedom, never invent a value for them):\nGender: female\nAge: older (about 68)\nAccent: French-accented English\nVocal size: unknown\nMust sound clearly distinct from: june, theo\nEstablished facts: Madame Berger, 68, Lyon hotelier all her life, French-accented English.; Born and raised in Lyon.\n\nCharacter id: mme_berger\nBio: An American architect, June, flies from Chicago to Lyon for a restoration project. She stays American-accented throughout. The locals — hotelier Madame Berger and her nephew Théo, both born and raised in Lyon — speak English with French accents. Madame Berger, 68, Lyon hotelier all her life, French-accented English.\n\nCover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.\n\nOutput the voice description text only. No JSON, no preamble.\n\nYour previous reply was:\nA mature female voice, aged approximately sixty-eight, speaking English with a distinct, refined French accent. The tone is warm, authoritative, and slightly raspy, reflecting decades of hospitality management in Lyon. Her pitch is medium-low, conveying grounded confidence and gentle sternness. The pace is deliberate and measured, with precise enunciation that highlights her non-native speech patterns. There is a subtle, elegant warmth in her timbre, suggesting experience and quiet dignity. This voice must remain clearly.\n\nIt contradicted the casting plan:\n- description has no 'older' age cue\n\nRewrite the voice description so it satisfies EVERY constraint exactly (state the correct gender, age band and accent explicitly, including a literal age cue for 'older'). Output the voice description text only.",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "response": "An older female voice, aged approximately 68, speaking English with a distinct, refined French accent. The tone is warm, authoritative, and slightly raspy, reflecting decades of hospitality management in Lyon. Her pitch is medium-low, conveying grounded confidence and gentle sternness. The pace is deliberate and measured, with precise enunciation that highlights her non-native speech patterns. There is a subtle, elegant warmth in her timbre, suggesting experience and quiet dignity."
+}

@@ -152,14 +152,12 @@ def test_inherited_descriptions_matches_plan() -> None:
         characters = {"narrator": {}, "menolly": {}, "brand": {}}
         plan = {"characters": {"menolly": {"gender": "female", "age_band": "teen"}}}
         inherited = inherited_descriptions(child, characters, plan)
-        # narrator has no plan profile so its parent description passes unchanged;
-        # menolly's matches its plan profile exactly
-        assert inherited == {
-            "narrator": {"description": PARENT_CAST["narrator"]},
-            "menolly": {"description": PARENT_CAST["menolly"]},
-        }
+        # menolly's parent description matches its plan profile exactly and is
+        # reused; the narrator is the reading voice, so it is never inherited
+        # from the parent's performance — the narrator policy supplies it
+        assert inherited == {"menolly": {"description": PARENT_CAST["menolly"]}}
         report = json.loads((child / "series_voices_report.json").read_text(encoding="utf-8"))
-        assert report["inherited"] == ["menolly", "narrator"]
+        assert report["inherited"] == ["menolly"]
         assert report["parent"] == str(parent.resolve())
 
 

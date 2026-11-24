@@ -259,6 +259,11 @@ def inherited_descriptions(project: Path, characters: dict, plan: dict | None) -
         entry = parent_voices.get(char_id)
         if not isinstance(entry, dict) or not entry.get("description"):
             continue
+        if char_id == "narrator":
+            # the narrator is the reading voice, configured rather than inherited
+            # from the earlier book's performance; resolve_for_project already
+            # consulted this parent, so the inherited clip would be stale art
+            continue
         profile = profiles.get(char_id)
         problems = description_violations(entry["description"], profile) if profile else []
         if problems:

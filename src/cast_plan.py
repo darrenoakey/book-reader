@@ -554,6 +554,21 @@ def validate_plan(plan: dict) -> list[str]:
             problems.append(f"{char_id} has invalid gender/age_band")
         if entry["vocal_size"] not in VOCAL_SIZES:
             problems.append(f"{char_id} has invalid vocal_size")
+    for char_id in NARRATOR_IDS:
+        entry = characters.get(char_id)
+        if entry is None:
+            continue
+        if (entry["gender"], entry["age_band"], entry["accent"], entry["vocal_size"]) != (
+            "unknown",
+            "unknown",
+            "unknown",
+            "rich",
+        ):
+            problems.append(
+                f"{char_id} carries story demographics instead of the configured reading-voice profile"
+            )
+        if any(char_id in cohort.get("members", []) for cohort in plan.get("cohorts", [])):
+            problems.append(f"{char_id} must not belong to an accent cohort")
     return problems
 
 
@@ -574,6 +589,41 @@ def plan_is_stale(project: Path, characters: dict, contexts: dict[str, str] | No
         contexts = _load_contexts(project, characters)
     story = source_story_context(project) or str(plan.get("story_context") or "")
     return plan.get("fingerprint") != plan_fingerprint(characters, contexts, story)
+
+
+# ##################################################################
+# narrator profile enforcement
+# The narrator is the reading voice, so its profile is the narrator policy's,
+# never a booking of the book's mood or of a cast member's demographics. Applied
+# to every plan after normalization (fresh or inherited through a series parent)
+# so a description check can never reject the configured narrator over a profile
+# the model made up.
+NARRATOR_IDS = ("narrator",)
+
+
+def apply_narrator_profile(plan: dict) -> dict:
+    """Force the narrator row to the reading-voice profile the policy supplies."""
+    characters = plan.get("characters", {})
+    for char_id in NARRATOR_IDS:
+        entry = characters.get(char_id)
+        if entry is None:
+            continue
+        entry["gender"] = "unknown"
+        entry["age_band"] = "unknown"
+        entry["approx_age"] = None
+        entry["accent"] = "unknown"
+        entry["vocal_size"] = "rich"
+        entry["distinct_from"] = [other for other in entry.get("distinct_from", []) if other != char_id]
+        entry["accent_source"] = "individual"
+        entry["evidence"] = [
+            {"fact": "narrator voice is configured, not inferred from the story", "source": "setting"}
+        ]
+        # the narrator is never a cohort member: an accent cohort would otherwise
+        # overwrite the reading voice's neutral profile
+    for cohort in plan.get("cohorts", []):
+        cohort["members"] = [member for member in cohort.get("members", []) if member not in NARRATOR_IDS]
+    plan["cohorts"] = [cohort for cohort in plan.get("cohorts", []) if len(cohort.get("members", [])) >= 2]
+    return plan
 
 
 def plan_missing_characters(project: Path, characters: dict) -> list[str]:
@@ -631,6 +681,7 @@ async def build_cast_plan(
     raw = parse_plan(raw_text)
     known = set(characters)
     plan = normalize_plan(raw, known, cast_input(characters, contexts))
+    apply_narrator_profile(plan)
     resolve_cohort_accents(plan)
     problems = validate_plan(plan)
     if problems:

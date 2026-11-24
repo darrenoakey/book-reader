@@ -233,6 +233,35 @@ def resolve_request(config: dict[str, Path], title: str, author: str | None) -> 
 
 
 # ##################################################################
+# narrator choice
+# An explicit request override is validated here so an unsupported voice fails
+# at request time instead of after an expensive render.
+def narrator_voice_choice(value: str | None) -> str | None:
+    if value is None:
+        return None
+    from src.narrator_voice import normalize
+
+    return normalize(value)
+
+
+def _record_narrator_choice(project: Path, job: dict) -> None:
+    """Persist the job's narrator choice beside the production.
+
+    The project file is the durable record every later step (and any re-run)
+    reads, so the narrator cannot drift between the voices step and assembly.
+    """
+    from src import narrator_voice
+
+    choice = job.get("narrator_voice") or narrator_voice.series_override(project) or narrator_voice.configured_default()
+    path = project / narrator_voice.PROJECT_FILE
+    text = narrator_voice.normalize(choice)
+    if path.is_file() and path.read_text(encoding="utf-8").strip() == text:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n", encoding="utf-8")
+
+
+# ##################################################################
 # request
 # create (or return) the job for one book and make sure a worker owns it
 def request(
@@ -244,6 +273,7 @@ def request(
     config_path: Path = CONFIG_PATH,
     series: str | None = None,
     series_required_characters: list[str] | None = None,
+    narrator_voice: str | None = None,
 ) -> dict:
     config = settings(config_path)
     existing = exact_job(config, title, author)
@@ -279,6 +309,11 @@ def request(
                     job = save_job(config, job, source_stat=identity)
             if parent_id is not None and job.get("series_parent_job") != parent_id:
                 raise ValueError(f"job {work_id} already has series parent {job.get('series_parent_job')}")
+            if narrator_voice is not None and job.get("narrator_voice") != narrator_voice_choice(narrator_voice):
+                raise ValueError(
+                    f"job {work_id} was requested with narrator voice {job.get('narrator_voice')!r}; "
+                    "a recast needs a new job rather than mixing narrators in one production"
+                )
             if series is not None:
                 if job.get("series") not in (None, series):
                     raise ValueError(f"job {work_id} already belongs to series {job.get('series')!r}")
@@ -305,6 +340,9 @@ def request(
                     "series": series,
                     "series_required_characters": list(series_required_characters or []),
                     "deliver": deliver,
+                    "narrator_voice": (
+                        narrator_voice_choice(narrator_voice) if narrator_voice is not None else None
+                    ),
                     "project": str(config["productions_root"] / project_slug(source)),
                     "publication": str(config["delivery_root"] / publication_name(found["title"], book_author)),
                     "state": "queued",
@@ -530,6 +568,7 @@ def _work(config: dict[str, Path], job: dict) -> dict:
     if sha256_file(source) != job["source_sha256"]:
         raise ValueError(f"{source} changed since it was requested")
     bind_request(project, source, job["source_sha256"], parent_project)
+    _record_narrator_choice(project, job)
     if parent_project is not None:
         from src.series_voices import set_series_parent
         from src.tts_engine import engine_name
@@ -685,6 +724,10 @@ def main(argv: list[str]) -> int:
     p_request.add_argument("--no-start", action="store_true", help="record the job without starting the worker")
     p_request.add_argument("--series", help="series this book belongs to; a published parent becomes its voice contract")
     p_request.add_argument(
+        "--narrator-voice",
+        help="explicit narrator voice for this book (default: the configured deep male narrator)",
+    )
+    p_request.add_argument(
         "--series-required",
         action="append",
         default=None,
@@ -705,6 +748,7 @@ def main(argv: list[str]) -> int:
             start=not args.no_start,
             series=args.series,
             series_required_characters=args.series_required,
+            narrator_voice=args.narrator_voice,
         )
         print(json.dumps(result, indent=2))
         return 0 if result["status"] == "accepted" else 2

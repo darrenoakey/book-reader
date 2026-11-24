@@ -110,7 +110,11 @@ async def _validated_description(char_id: str, prompt: str, plan: dict | None, c
 
 
 async def _voice_description_for_one(
-    char_id: str, info: dict, plan: dict | None = None, cache_root: Path | str | None = None
+    char_id: str,
+    info: dict,
+    plan: dict | None = None,
+    cache_root: Path | str | None = None,
+    project: Path | None = None,
 ) -> tuple[str, dict]:
     bio = info.get("bio") or info.get("description") or ""
     is_narrator = char_id == "narrator"
@@ -139,6 +143,17 @@ Bio: {bio}
 Cover: gender, age, accent/dialect, pitch, timbre, pace, emotion, distinctive vocal traits. Be specific and vivid. State the character's gender, age and accent explicitly when the cast plan gives them. Never derive pitch, accent or timbre from race or ethnicity.
 
 Output the voice description text only. No JSON, no preamble."""
+    if is_narrator:
+        # the narrator is a standing preference (deep male unless this book or
+        # series explicitly overrides), not a bio-derived guess: its description
+        # comes from the narrator policy so every future audiobook narrates
+        # consistently and the contract is checkable
+        from src import narrator_voice
+
+        choice = (
+            narrator_voice.resolve_for_project(project) if project is not None else narrator_voice.resolve()
+        )
+        return char_id, {"description": narrator_voice.description(choice)}
     text = await _validated_description(char_id, prompt, plan, cache_root)
     if not text:
         raise ValueError(f"empty voice description for {char_id}")
@@ -150,11 +165,17 @@ Output the voice description text only. No JSON, no preamble."""
 # per-character parallel calls (batched JSON triggers refusal), each one
 # constrained by the same persisted whole-cast plan
 async def generate_all_voice_descriptions(
-    characters: dict, plan: dict | None = None, cache_root: Path | str | None = None
+    characters: dict,
+    plan: dict | None = None,
+    cache_root: Path | str | None = None,
+    project: Path | None = None,
 ) -> dict:
     print(f"  voice descriptions: {len(characters)} parallel sonnet calls")
     results = await asyncio.gather(
-        *(_voice_description_for_one(cid, characters[cid], plan, cache_root) for cid in sorted(characters))
+        *(
+            _voice_description_for_one(cid, characters[cid], plan, cache_root, project)
+            for cid in sorted(characters)
+        )
     )
     return {cid: desc for cid, desc in results}
 
@@ -204,7 +225,7 @@ async def generate_voices(output_dir: Path, cache_root: Path | str | None = None
 
     inherited = inherited_descriptions(output_dir, characters, plan)
     fresh = {cid: info for cid, info in characters.items() if cid not in inherited}
-    voices = {**await generate_all_voice_descriptions(fresh, plan, cache_root), **inherited}
+    voices = {**await generate_all_voice_descriptions(fresh, plan, cache_root, output_dir), **inherited}
     voices = {cid: voices[cid] for cid in sorted(voices)}
     voices_path.write_text(json.dumps(voices, indent=2), encoding="utf-8")
     write_plan_sidecar(output_dir, plan["fingerprint"], SIDECAR_VOICES)

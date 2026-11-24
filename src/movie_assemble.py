@@ -29,6 +29,7 @@ import tempfile
 from pathlib import Path
 
 from src.audio_synth import concat_wavs, wav_duration
+from src.media_tools import ffmpeg, ffprobe
 from src.movie_resolution import (
     DEFAULT_RESOLUTION,
     SUPPORTED_RESOLUTIONS,
@@ -102,7 +103,7 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 def probe_duration(path: Path) -> float:
     out = _run(
         [
-            "ffprobe",
+            ffprobe(),
             "-v",
             "error",
             "-show_entries",
@@ -121,7 +122,7 @@ def probe_duration(path: Path) -> float:
 def probe_resolution(path: Path) -> tuple[int, int]:
     out = _run(
         [
-            "ffprobe",
+            ffprobe(),
             "-v",
             "error",
             "-select_streams",
@@ -152,7 +153,7 @@ def movie_has_resolution(output_dir: Path, resolution: int) -> bool:
 def probe_frames(path: Path) -> int:
     out = _run(
         [
-            "ffprobe",
+            ffprobe(),
             "-v",
             "error",
             "-count_frames",
@@ -211,7 +212,7 @@ def _prescaled(image: Path, cache_dir: Path, resolution: int) -> Path:
             f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase:flags=lanczos,"
             f"crop={target_width}:{target_height}"
         )
-        _run(["ffmpeg", "-y", "-i", str(image), "-vf", filter_graph, str(scaled)])
+        _run([ffmpeg(), "-y", "-i", str(image), "-vf", filter_graph, str(scaled)])
     return scaled
 
 
@@ -295,7 +296,7 @@ def render_segment(
     scaled = _prescaled(image, dest.parent / ".prescaled", resolution)
     _run(
         [
-            "ffmpeg",
+            ffmpeg(),
             "-y",
             "-loop",
             "1",
@@ -431,7 +432,7 @@ def assemble_movie(
         try:
             _run(
                 [
-                    "ffmpeg",
+                    ffmpeg(),
                     "-y",
                     "-f",
                     "concat",
@@ -458,7 +459,7 @@ def assemble_movie(
     movie_path = movie_dir / "movie.mp4"
     _run(
         [
-            "ffmpeg",
+            ffmpeg(),
             "-y",
             "-i",
             str(video_only),

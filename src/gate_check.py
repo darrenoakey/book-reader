@@ -317,6 +317,9 @@ IMPACT: dict[str, tuple[str, ...]] = {
     "src/epub_extract.py": ("src/epub_extract_test.py", "src/audiobook_cover_test.py", "src/movie_resolution_test.py"),
     "src/epub_extract_test.py": ("src/epub_extract_test.py",),
     "src/m4b_assemble.py": ("src/m4b_assemble_test.py", "src/audiobook_verify_test.py"),
+    # the shared media-binary resolver every rendering module executes
+    "src/media_tools.py": ("src/media_tools_test.py", "src/audio_synth_test.py", "src/m4b_assemble_test.py", "src/audiobook_verify_test.py", "src/audiobook_request_test.py", "src/hour_continue_test.py", "src/movie_assemble_test.py"),
+    "src/media_tools_test.py": ("src/media_tools_test.py",),
 }
 
 
@@ -330,6 +333,7 @@ MOVIE_PATHS.update({
     "src/voice_description.py", "src/voice_description_test.py", "src/voice_acoustic.py",
     "src/casting_llm.py", "src/casting_llm_test.py", "src/kokoro_f0_table.py", "src/kokoro_f0_table_test.py",
     "src/voice_assets.py", "src/voice_assets_test.py", "src/voice_clone.py", "src/tts_engine.py", "src/state.py", "src/kokoro_voices.py",
+    "src/media_tools.py", "src/media_tools_test.py",
 })
 
 # Casting recordings contain only real backend responses; changes re-run their consumers.

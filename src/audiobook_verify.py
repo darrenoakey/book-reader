@@ -44,8 +44,7 @@ from typing import Any
 
 from PIL import Image
 
-FFMPEG = "ffmpeg"
-FFPROBE = "ffprobe"
+from src.media_tools import ffmpeg, ffprobe
 
 MANIFEST_NAME = "audiobook_assembly.json"
 SCHEMA = 1
@@ -80,7 +79,7 @@ def canonical_digest(payload: Mapping[str, Any]) -> str:
 # one ffprobe pass over format, streams and chapters; never raises on a bad file
 def probe_m4b(path: Path, *, timeout: float = 120.0) -> dict[str, Any]:
     cmd = [
-        FFPROBE,
+        ffprobe(),
         "-v",
         "error",
         "-print_format",
@@ -115,7 +114,7 @@ def probe_m4b(path: Path, *, timeout: float = 120.0) -> dict[str, Any]:
 # decode every audio packet to the null muxer and record how far it got
 def decode_audio(path: Path, *, timeout: float = 1800.0) -> dict[str, Any]:
     cmd = [
-        FFMPEG,
+        ffmpeg(),
         "-nostdin",
         "-v",
         "error",
@@ -157,7 +156,7 @@ def decode_audio(path: Path, *, timeout: float = 1800.0) -> dict[str, Any]:
 # copy the attached picture's packets out verbatim: the exact embedded bitstream
 def extract_cover(path: Path, dest: Path, *, timeout: float = 120.0) -> Path | None:
     cmd = [
-        FFMPEG,
+        ffmpeg(),
         "-nostdin",
         "-v",
         "error",
@@ -328,7 +327,7 @@ def expectation_from_audio(
 
 def _audio_seconds(path: Path, *, timeout: float = 120.0) -> float:
     cmd = [
-        FFPROBE,
+        ffprobe(),
         "-v",
         "error",
         "-show_entries",

@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 
 from src import tts_engine
+from src.media_tools import ffmpeg, ffprobe
 
 PAUSE_BETWEEN_CHAPTERS_SEC = 3.0
 PAUSE_AFTER_CHIME_SEC = 0.5
@@ -47,7 +48,7 @@ def generate_chime(output_path: Path) -> None:
     if output_path.exists():
         return
     cmd = [
-        "ffmpeg",
+        ffmpeg(),
         "-y",
         "-f",
         "lavfi",
@@ -112,7 +113,7 @@ def generate_all_announcements(output_dir: Path, title: str, chapter_files: list
 # get duration of audio file in seconds using ffprobe
 def get_audio_duration(audio_path: Path) -> float:
     cmd = [
-        "ffprobe",
+        ffprobe(),
         "-v",
         "error",
         "-show_entries",
@@ -132,7 +133,7 @@ def get_audio_duration(audio_path: Path) -> float:
 # create a silent audio file of specified duration
 def generate_silence(duration_sec: float, output_path: Path, sample_rate: int = SAMPLE_RATE) -> None:
     cmd = [
-        "ffmpeg",
+        ffmpeg(),
         "-y",
         "-f",
         "lavfi",
@@ -159,7 +160,7 @@ def concatenate_audio_files(audio_files: list[Path], output_path: Path) -> None:
         list_file = Path(f.name)
     try:
         cmd = [
-            "ffmpeg",
+            ffmpeg(),
             "-y",
             "-f",
             "concat",
@@ -278,7 +279,7 @@ def assemble_m4b(
         metadata_path = work_dir / "metadata.txt"
         write_chapter_metadata(chapter_info, metadata_path)
         cmd = [
-            "ffmpeg",
+            ffmpeg(),
             "-y",
             "-i",
             str(full_audio_path),

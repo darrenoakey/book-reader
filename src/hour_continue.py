@@ -21,6 +21,7 @@ from src.hour_runner import (
     source_chapters,
     source_fingerprint,
 )
+from src.media_tools import ffmpeg, ffprobe
 from src.movie_assemble import probe_duration, probe_resolution
 from src.movie_resolution import movie_dimensions
 
@@ -131,7 +132,7 @@ def require_free_disk(project: Path) -> None:
 # decode a real movie frame and prove it contains visible pixels, rather than trusting container metadata alone.
 def extract_nonblank_frame(movie: Path, seconds: float, destination: Path) -> None:
     result = subprocess.run(
-        ["ffmpeg", "-y", "-ss", f"{seconds:.3f}", "-i", str(movie), "-frames:v", "1", str(destination)],
+        [ffmpeg(), "-y", "-ss", f"{seconds:.3f}", "-i", str(movie), "-frames:v", "1", str(destination)],
         capture_output=True,
         text=True,
         check=False,
@@ -156,7 +157,7 @@ def qa_movie(movie: Path) -> dict:
     if probe_resolution(movie) != movie_dimensions(480):
         raise RuntimeError(f"movie resolution is not 854x480: {probe_resolution(movie)}")
     probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", str(movie)],
+        [ffprobe(), "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", str(movie)],
         capture_output=True,
         text=True,
         check=False,
@@ -169,7 +170,7 @@ def qa_movie(movie: Path) -> dict:
     qa_dir = movie.parent / "qa"
     qa_dir.mkdir(exist_ok=True)
     decode = subprocess.run(
-        ["ffmpeg", "-v", "error", "-xerror", "-i", str(movie), "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"],
+        [ffmpeg(), "-v", "error", "-xerror", "-i", str(movie), "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"],
         capture_output=True,
         text=True,
         check=False,

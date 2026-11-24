@@ -43,6 +43,7 @@ from src.audiobook_library import (
     tokens,
 )
 from src.books_delivery import deliver_to_books, find_delivered_asset, sha256_file
+from src.media_tools import child_path, ffprobe
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "local" / "config.toml"
@@ -345,6 +346,7 @@ def spawn_worker(config: dict[str, Path], job: dict, config_path: Path = CONFIG_
             stdout=stream,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env={**os.environ, "PATH": child_path()},
         )
     state = "queued" if job["state"] == "failed" else job["state"]
     return save_job(config, job, worker_pid=process.pid, worker_host=os.uname().nodename, worker_log=str(log), state=state, error=None)
@@ -372,7 +374,7 @@ def bind_request(project: Path, source: Path, source_sha256: str, series_parent:
 # real ffprobe evidence that the audiobook is complete and well-formed
 def probe_m4b(m4b: Path) -> dict:
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", "-show_chapters", str(m4b)],
+        [ffprobe(), "-v", "error", "-print_format", "json", "-show_format", "-show_streams", "-show_chapters", str(m4b)],
         check=True, capture_output=True, text=True, timeout=120,
     )
     info = json.loads(result.stdout)

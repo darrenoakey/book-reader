@@ -12,6 +12,7 @@ from src.data_recovery import (
     bounded,
     is_data_error,
 )
+from src.media_tools import ffmpeg
 
 SAMPLE_RATE = 24000
 
@@ -29,7 +30,7 @@ def concat_wavs(line_paths: list[Path], output_path: Path) -> None:
         list_file = Path(f.name)
     try:
         cmd = [
-            "ffmpeg",
+            ffmpeg(),
             "-y",
             "-f",
             "concat",

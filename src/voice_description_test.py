@@ -1,10 +1,35 @@
+import asyncio
 import json
 import tempfile
 from pathlib import Path
 
-from src.voice_description import generate_voices_sync
+from src.voice_description import _validated_description, generate_voices_sync
 
 RECORDINGS = Path(__file__).parent / "testdata" / "casting-recordings"
+
+
+# ##################################################################
+# test bounded repair carries exact age cue
+# a missing middle_aged cue must be named in the single repair request and the
+# result still has to pass deterministic validation; invalid output fails closed.
+def test_bounded_description_repairs_middle_aged_age_cue(monkeypatch) -> None:
+    prompts = []
+
+    async def answer(prompt: str, root=None) -> str:
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return "A male British voice with a deep, steady delivery."
+        return "A middle-aged male British voice with a deep, steady delivery."
+
+    monkeypatch.setattr("src.voice_description.query_sonnet", answer)
+    plan = {"characters": {"master_oldive": {
+        "gender": "male", "age_band": "middle_aged",
+        "accent": "British English (Southern English)", "vocal_size": "medium",
+    }}}
+    text = asyncio.run(_validated_description("master_oldive", "Design the voice.", plan, None))
+    assert "middle-aged" in text
+    assert len(prompts) == 2
+    assert "middle_aged" in prompts[1]
 
 
 # ##################################################################

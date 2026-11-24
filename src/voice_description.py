@@ -96,7 +96,8 @@ async def _validated_description(char_id: str, prompt: str, plan: dict | None, c
         + "\n\nIt contradicted the casting plan:\n"
         + "\n".join(f"- {v}" for v in violations)
         + "\n\nRewrite the voice description so it satisfies EVERY constraint exactly "
-        "(state the correct gender, age band and accent explicitly). Output the voice "
+        "(state the correct gender, age band and accent explicitly, including a literal "
+        f"age cue for {profile.get('age_band', 'unknown')!r}). Output the voice "
         "description text only."
     )
     text2 = self_description(await query_sonnet(repair, cache_root))

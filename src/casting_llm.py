@@ -81,7 +81,7 @@ def ask_cached(
     temperature: float = 0.2,
     max_tokens: int = 4096,
     root: Path | str | None = None,
-    max_attempts: int = 3,
+    max_attempts: int | None = None,
 ) -> str:
     if root is None:
         return llm.ask_sync(
@@ -121,7 +121,7 @@ async def ask_cached_async(
     temperature: float = 0.2,
     max_tokens: int = 4096,
     root: Path | str | None = None,
-    max_attempts: int = 3,
+    max_attempts: int | None = None,
 ) -> str:
     loop = asyncio.get_running_loop()
     async with llm._semaphore():

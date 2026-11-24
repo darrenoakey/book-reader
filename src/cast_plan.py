@@ -261,8 +261,6 @@ Output ONLY valid JSON, no markdown:
 }}"""
 
 
-# ##################################################################
-# parsing / normalization
 def _norm_choice(value, allowed: tuple[str, ...], default: str) -> str:
     text = str(value or "").strip().lower()
     return text if text in allowed else default
@@ -394,6 +392,63 @@ def normalize_plan(raw: dict, known: set[str], rows: list[dict]) -> dict:
 # Casts that fit in 8192 keep exactly that request (and their recordings).
 def plan_max_tokens(cast_size: int) -> int:
     return max(8192, 1000 * cast_size)
+
+
+# ##################################################################
+# parsing / normalization
+# Native schema mode constrains live model output to valid JSON. Recorded
+# legacy answers remain replayable; malformed legacy bytes are not accepted.
+CAST_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "characters": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "gender": {"type": "string", "enum": list(GENDERS)},
+                    "age_band": {"type": "string", "enum": list(AGE_BANDS)},
+                    "approx_age": {"type": ["string", "null"]},
+                    "accent": {"type": "string"},
+                    "vocal_size": {"type": "string", "enum": list(VOCAL_SIZES)},
+                    "distinct_from": {"type": "array", "items": {"type": "string"}},
+                    "accent_source": {"type": "string", "enum": ["individual", "cohort"]},
+                    "evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "fact": {"type": "string"},
+                                "source": {"type": "string", "enum": list(SOURCES)},
+                            },
+                            "required": ["fact", "source"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["gender", "age_band", "approx_age", "accent", "vocal_size", "distinct_from", "accent_source", "evidence"],
+                "additionalProperties": False,
+            },
+        },
+        "cohorts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "kind": {"type": "string", "enum": list(COHORT_KINDS)},
+                    "members": {"type": "array", "items": {"type": "string"}},
+                    "accent": {"type": "string"},
+                    "basis": {"type": "string"},
+                },
+                "required": ["id", "kind", "members", "accent", "basis"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["characters", "cohorts"],
+    "additionalProperties": False,
+}
 
 
 def parse_plan(text: str) -> dict:
@@ -542,7 +597,13 @@ async def build_cast_plan(
             f"cast plan prompt {len(prompt)} chars exceeds bound {MAX_PROMPT_CHARS}; "
             "reduce source context"
         )
-    raw_text = (await ask(prompt, temperature=0.2, max_tokens=plan_max_tokens(len(characters)), root=cache_root)).strip()
+    raw_text = (await ask(
+        prompt,
+        temperature=0.2,
+        max_tokens=plan_max_tokens(len(characters)),
+        root=cache_root,
+        response_schema=CAST_PLAN_SCHEMA if cache_root is None else None,
+    )).strip()
     raw = parse_plan(raw_text)
     known = set(characters)
     plan = normalize_plan(raw, known, cast_input(characters, contexts))

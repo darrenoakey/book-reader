@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from src.cast_plan import (
+    CAST_PLAN_SCHEMA,
     PLAN_NAME,
     SIDECAR_KOKORO,
     SIDECAR_VOICES,
@@ -134,6 +135,40 @@ def _write_project(tmp_path: Path, characters: dict) -> Path:
     project.mkdir(parents=True)
     (project / "characters.json").write_text(json.dumps(characters, indent=2), encoding="utf-8")
     return project
+
+
+# ##################################################################
+# live schema boundary
+# native structured output is required for the live whole-cast request; legacy
+# recordings still exercise the same deterministic validation and persistence.
+def test_live_cast_plan_uses_native_json_schema(monkeypatch, tmp_path: Path) -> None:
+    project = _write_project(tmp_path, CHARACTERS)
+    captured = {}
+
+    async def answer(prompt: str, **kwargs) -> str:
+        captured.update(kwargs)
+        return json.dumps({
+            "characters": {
+                cid: {
+                    "gender": "unknown",
+                    "age_band": "unknown",
+                    "approx_age": None,
+                    "accent": "unknown",
+                    "vocal_size": "unknown",
+                    "distinct_from": [],
+                    "accent_source": "individual",
+                    "evidence": [],
+                }
+                for cid in CHARACTERS
+            },
+            "cohorts": [],
+        })
+
+    monkeypatch.setattr("src.cast_plan.ask", answer)
+    plan = asyncio.run(build_cast_plan(project, CHARACTERS, story_context=PREMISE))
+    assert set(plan["characters"]) == set(CHARACTERS)
+    assert captured["response_schema"] == CAST_PLAN_SCHEMA
+    assert captured["root"] is None
 
 
 # ##################################################################

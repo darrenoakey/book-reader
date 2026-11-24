@@ -82,10 +82,12 @@ def ask_cached(
     max_tokens: int = 4096,
     root: Path | str | None = None,
     max_attempts: int | None = None,
+    response_schema: dict | None = None,
 ) -> str:
     if root is None:
         return llm.ask_sync(
-            prompt, temperature=temperature, max_tokens=max_tokens, max_attempts=max_attempts
+            prompt, temperature=temperature, max_tokens=max_tokens, max_attempts=max_attempts,
+            response_schema=response_schema,
         )
     path = Path(root) / f"{_key(prompt, temperature, max_tokens)}.json"
     entry = _read_entry(path)
@@ -97,6 +99,7 @@ def ask_cached(
         temperature=temperature,
         max_tokens=max_tokens,
         max_attempts=max_attempts,
+        response_schema=response_schema,
         routing_events=routing_events,
     )
     _write_entry(
@@ -122,12 +125,14 @@ async def ask_cached_async(
     max_tokens: int = 4096,
     root: Path | str | None = None,
     max_attempts: int | None = None,
+    response_schema: dict | None = None,
 ) -> str:
     loop = asyncio.get_running_loop()
     async with llm._semaphore():
         return await loop.run_in_executor(
             None,
             lambda: ask_cached(
-                prompt, temperature=temperature, max_tokens=max_tokens, root=root, max_attempts=max_attempts
+                prompt, temperature=temperature, max_tokens=max_tokens, root=root, max_attempts=max_attempts,
+                response_schema=response_schema,
             ),
         )

@@ -12,6 +12,7 @@ from src.data_recovery import (
 from src.llm import ask
 
 STAGE = "characters"
+RAW_CAST_NAME = "characters.raw.json"
 CHAPTER_WINDOW = 15000
 DEFAULT_NARRATOR = {"name": "Narrator", "bio": "A clear, neutral audiobook narrator."}
 
@@ -295,6 +296,9 @@ Each group = same person. IDs not in any group stay as singles."""
     return apply_dedup_groups(characters, groups, ledger)
 
 
+MAX_DEDUP_GROUP = 4  # a person may appear under a few spellings; more is a bad answer
+
+
 # ##################################################################
 # apply dedup groups
 # merges only well-formed, unambiguous groups of known ids; malformed, unknown or overlapping groups are quarantined and never guessed at
@@ -324,6 +328,16 @@ def apply_dedup_groups(characters: dict, groups: list, ledger: RecoveryLedger | 
                 {"unknown": [bounded(u, 80) for u in unknown]},
             )
         if len(valid_ids) < 2:
+            continue
+        if len(valid_ids) > MAX_DEDUP_GROUP:
+            _warn(
+                ledger,
+                f"dedup-group-{group_index}",
+                "dedup_group_too_broad",
+                f"dedup group names {len(valid_ids)} identities; a same-person group that large is "
+                "an over-broad answer that would swallow distinct characters, so it is not merged",
+                {"group": [bounded(g, 80) for g in valid_ids]},
+            )
             continue
         if any(g in claimed for g in valid_ids):
             _warn(
@@ -467,6 +481,13 @@ async def analyze_characters(output_dir: Path, title: str, author: str) -> Path:
     all_chars = [r for r in results if r is not None]
     merged = merge_character_info(all_chars, ledger)
     print(f"Raw merge: {len(merged)} characters")
+    # Persist the pre-dedup cast BEFORE any merge decision: dedup is a model
+    # judgement, and a destructive one must never be the only surviving record
+    # of the chapter analysis (Dragonsinger lost every protagonist when an
+    # over-broad group swallowed them). The raw file is evidence, not an input.
+    (output_dir / RAW_CAST_NAME).write_text(
+        json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     print("Deduplicating with Sonnet...")
     deduplicated = await deduplicate_characters(merged, ledger)
     print(f"After dedup: {len(deduplicated)} characters")

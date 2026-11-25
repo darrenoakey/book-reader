@@ -2,7 +2,9 @@ import tempfile
 from pathlib import Path
 
 from src.character_analysis import (
+    MAX_DEDUP_GROUP,
     analyze_characters_sync,
+    apply_dedup_groups,
     merge_character_info,
     parse_json_response,
 )
@@ -75,3 +77,44 @@ John lowered his large frame into the chair, which creaked under his weight. He 
         assert "bio" in chars["narrator"]
         char_ids = [k for k in chars if k != "narrator"]
         assert len(char_ids) >= 1
+
+
+# ##################################################################
+# dedup must never swallow distinct characters
+# Dragonsinger's production shipped with 17 of 49 analysed characters because a
+# single over-broad group merged every protagonist into a few ids; one surviving
+# id carried a 17,007-character blob of other people's bios.
+def _cast() -> dict:
+    return {
+        cid: {"name": cid.title(), "bio": f"{cid} speaks.", "look": ""}
+        for cid in ("menolly", "piemur", "sebell", "audiva", "pona", "talmor", "jerint", "morshal", "benis")
+    }
+
+
+def test_over_broad_dedup_group_is_refused_and_keeps_every_character() -> None:
+    cast = _cast()
+    too_wide = [list(cast)]
+    result = apply_dedup_groups(cast, too_wide)
+    # nothing merged: every principal survives with its own bio
+    assert set(result) == set(cast)
+    for cid in cast:
+        assert result[cid]["bio"] == f"{cid} speaks."
+    assert len(too_wide[0]) > MAX_DEDUP_GROUP
+
+
+def test_plausible_dedup_group_still_merges() -> None:
+    cast = {
+        "don_salvara": {"name": "Don Salvara", "bio": "older man", "look": ""},
+        "don_lorenzo_salvara": {"name": "Don Lorenzo Salvara", "bio": "the don", "look": ""},
+        "menolly": {"name": "Menolly", "bio": "girl", "look": ""},
+    }
+    result = apply_dedup_groups(cast, [["don_salvara", "don_lorenzo_salvara"]])
+    assert "don_salvara" not in result
+    assert "don_lorenzo_salvara" in result
+    # the unrelated character is untouched
+    assert result["menolly"]["bio"] == "girl"
+
+
+def test_group_bound_admits_only_small_same_person_groups() -> None:
+    assert MAX_DEDUP_GROUP >= 2
+    assert MAX_DEDUP_GROUP <= 6

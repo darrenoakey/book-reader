@@ -15,6 +15,7 @@ from src.series_voices import (
     normalize_name,
     publish_series,
     registry_root,
+    require_series_cast,
     resolve_series_identities,
     series_parent,
     set_series_parent,
@@ -73,6 +74,60 @@ PARENT_CAST = {
 # ##################################################################
 # test normalize name
 # identity keys are casefolded with whitespace collapsed
+# ##################################################################
+# pre-synthesis series cast gate
+# The series contract must fail in seconds on a fresh cast, not after a render.
+# Dragonsinger rendered in full before failing because Menolly had no voice.
+def test_require_series_cast_passes_when_required_present() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        project = Path(tmp) / "book"
+        project.mkdir()
+        cast = {"menolly": {"name": "Menolly"}, "narrator": {"name": "Narrator"}}
+        verified = require_series_cast(project, cast, ["Menolly"])
+        assert verified == ["menolly"]
+
+
+def test_require_series_cast_fails_closed_when_required_missing() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        project = Path(tmp) / "book"
+        project.mkdir()
+        cast = {"narrator": {"name": "Narrator"}, "silvina": {"name": "Silvina"}}
+        with pytest.raises(ValueError) as caught:
+            require_series_cast(project, cast, ["Menolly"])
+        message = str(caught.value)
+        assert "menolly" in message
+        # the failure names the character, so the operator knows what to fix
+        assert "series contract" in message
+
+
+def test_require_series_cast_names_every_missing_character() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        project = Path(tmp) / "book"
+        project.mkdir()
+        cast = {"narrator": {"name": "Narrator"}}
+        with pytest.raises(ValueError) as caught:
+            require_series_cast(project, cast, ["Menolly", "Piemur"])
+        message = str(caught.value)
+        assert "menolly" in message or "piemur" in message
+
+
+def test_require_series_cast_is_a_no_op_without_a_contract() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        project = Path(tmp) / "book"
+        project.mkdir()
+        assert require_series_cast(project, {"narrator": {"name": "Narrator"}}, None) == []
+
+
+def test_require_series_cast_ignores_id_spelling_and_uses_display_name() -> None:
+    # the contract names people ("Menolly"); a book may key her differently as
+    # long as the display name matches, which is how the publish-time check works
+    with tempfile.TemporaryDirectory() as tmp:
+        project = Path(tmp) / "book"
+        project.mkdir()
+        cast = {"menolly_of_half_circle": {"name": "Menolly"}, "narrator": {"name": "Narrator"}}
+        assert require_series_cast(project, cast, ["Menolly"]) == ["menolly_of_half_circle"]
+
+
 def test_normalize_name() -> None:
     assert normalize_name("  Menolly   Harper ") == "menolly harper"
     assert normalize_name("MENOLLY") == "menolly"

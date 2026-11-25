@@ -582,7 +582,12 @@ def _work(config: dict[str, Path], job: dict) -> dict:
     job = save_job(config, job, state="producing")
     from src.pipeline import run_audiobook_pipeline
 
-    m4b = run_audiobook_pipeline(source, project, display_author=job["author"])
+    m4b = run_audiobook_pipeline(
+        source,
+        project,
+        display_author=job["author"],
+        series_required_characters=job.get("series_required_characters"),
+    )
     from src.audiobook_cover import COVER_NAME
 
     probe = verify_assembled(project, job["title"], job["author"])

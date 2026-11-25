@@ -192,12 +192,22 @@ def run_noveliser_pipeline(
 # run audiobook pipeline
 # audiobook-only production into an explicit project directory: the same
 # extract..m4b steps, an original generated cover, and no storyboard/images/movie.
-def run_audiobook_pipeline(source: Path, output_dir: Path, display_author: str | None = None) -> Path:
+def run_audiobook_pipeline(
+    source: Path,
+    output_dir: Path,
+    display_author: str | None = None,
+    series_required_characters: list[str] | None = None,
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     lock = acquire_lock(output_dir)
     try:
         return _run_pipeline_locked(
-            source, output_dir, DEFAULT_RESOLUTION, audiobook_only=True, display_author=display_author
+            source,
+            output_dir,
+            DEFAULT_RESOLUTION,
+            audiobook_only=True,
+            display_author=display_author,
+            series_required_characters=series_required_characters,
         )
     finally:
         release_lock(lock)
@@ -210,6 +220,7 @@ def _run_pipeline_locked(
     imported: dict | None = None,
     audiobook_only: bool = False,
     display_author: str | None = None,
+    series_required_characters: list[str] | None = None,
 ) -> Path:
     print(f"{Fore.CYAN}Book Reader Pipeline{Style.RESET_ALL}")
     print(f"  Input: {epub_path}")
@@ -246,6 +257,15 @@ def _run_pipeline_locked(
         with _time_step(output_dir, "characters"):
             analyze_characters_sync(output_dir, title, author)
         print_done("Character analysis complete")
+        # the series contract is checked HERE, on the fresh cast, so a missing
+        # required returning character fails in seconds instead of after a
+        # whole render (the existing validator, scoped to the contract)
+        from src.series_voices import require_series_cast
+
+        fresh_cast = json.loads((output_dir / "characters.json").read_text(encoding="utf-8"))
+        verified = require_series_cast(output_dir, fresh_cast, series_required_characters)
+        if verified:
+            print_done(f"Series cast verified before synthesis: {', '.join(verified)}")
         mark_step_complete(output_dir, "characters")
     print_step(3, "Generate voice descriptions")
     if is_step_complete(output_dir, "voices_desc") and not _voices_desc_stale(output_dir):

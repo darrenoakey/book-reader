@@ -327,3 +327,39 @@ __all__ = [
     "set_series_parent",
     "verify_required_characters",
 ]
+
+
+# ##################################################################
+# pre-synthesis series cast gate
+# The series contract is currently enforced when a production PUBLISHES, which
+# is after hours of synthesis: Dragonsinger spent a full render before failing
+# on a missing required voice (Menolly). This runs the SAME existing validator
+# (`verify_required_characters`) on the freshly analysed cast, scoped to the
+# required returning series characters, so a missing one fails in seconds with
+# the identities named instead of after a render.
+def require_series_cast(project: Path, characters: dict, required: list[str] | None) -> list[str]:
+    """Fail closed before synthesis when a required series character is absent.
+
+    Returns the verified local ids (narrator plus each required name). A book
+    without a series contract has nothing to verify and returns an empty list.
+    """
+    parent = series_parent(project)
+    if parent is None and not required:
+        return []
+    required_names = list(required or [])
+    if parent is not None:
+        parent_voices = _load(parent / "voices.json")
+        # the parent's own required set plus every id it actually voiced is the
+        # contract a sequel inherits; only names are asserted here
+        required_names = required_names or [
+            char_id for char_id in parent_voices if char_id == "narrator"
+        ]
+    if not required_names:
+        return []
+    names = {
+        str(info.get("name", char_id)): char_id
+        for char_id, info in characters.items()
+        if isinstance(info, dict)
+    }
+    entry = {"required_characters": [normalize_name(name) for name in required_names]}
+    return verify_required_characters(entry, {cid: name for name, cid in names.items()}, required_names)
